@@ -1,0 +1,35 @@
+# Private settings and credentials
+.env
+.env.*
+
+# Built web UI (shipped in the wheel, not committed)
+src/brushgraft/static/
+web/node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Fixtures the parity tests compare the TypeScript port against (made by scripts/parity_*.py)
+web/.parity/
+
+# Your own files: the website's settings (local/site.json: domain, filing number) and anything else private
+/local/
+
+# Test output
+web/test-results/
+web/playwright-report/
+web/dist/

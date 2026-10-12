@@ -1,0 +1,304 @@
+/*
+ * Design rules
+ * - The interface stays neutral gray: color belongs to the images and region
+ *   numbers. The accent (ink blue) marks only selection, focus and the main action.
+ * - Version numbers and figure captions use the serif face, like figure
+ *   numbers in a paper; the rest of the interface uses the sans face.
+ * - Panels run edge to edge, divided by hairlines; buttons have small radii,
+ *   popovers one step larger.
+ */
+
+:root {
+  --bg: #f1f2f4;
+  --panel: #ffffff;
+  --panel-2: #f7f8f9;
+  --hover: #eef0f2;
+  --well: #dfe1e5;
+  --ink: #1d2125;
+  --ink-2: #565e68;
+  --ink-3: #8a919a;
+  --rule: #e1e4e8;
+  --rule-2: #c8cdd3;
+  --accent: #2c5a8c;
+  --accent-ink: #ffffff;
+  --accent-soft: #e6edf5;
+  --danger: #b3261e;
+  --danger-soft: #fbeceb;
+  --warn: #8f6200;
+  --ok: #1e7b45;
+  --scrim: rgb(20 23 27 / 0.38);
+  --shadow-pop: 0 1px 2px rgb(0 0 0 / 0.06), 0 8px 24px rgb(0 0 0 / 0.12);
+  --checker-a: #e9ebee;
+  --checker-b: #f7f8f9;
+
+  /* Latin faces first so English text never renders in a CJK font; CJK
+     characters fall through to the Chinese faces */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "PingFang SC", "HarmonyOS Sans SC",
+    "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
+  --font-serif: "Iowan Old Style", Charter, "Source Serif 4", "Source Serif Pro", Georgia, "Songti SC", STSong,
+    "Noto Serif CJK SC", "Noto Serif SC", "Source Han Serif SC", SimSun, serif;
+
+  --fs-xs: 11.5px;
+  --fs-s: 12px;
+  --fs-m: 13px;
+  --fs-l: 15px;
+  --r-s: 5px;
+  --r-m: 8px;
+  --bar-h: 40px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #16181b;
+    --panel: #1e2125;
+    --panel-2: #23272c;
+    --hover: #2a2e34;
+    --well: #2c2f34;
+    --ink: #e3e5e8;
+    --ink-2: #a0a7b0;
+    --ink-3: #6f7680;
+    --rule: #2f3338;
+    --rule-2: #464b52;
+    --accent: #8db0d8;
+    --accent-ink: #0f1620;
+    --accent-soft: #233041;
+    --danger: #f08a80;
+    --danger-soft: #3a2422;
+    --warn: #e2b450;
+    --ok: #6cc08b;
+    --scrim: rgb(0 0 0 / 0.5);
+    --shadow-pop: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 28px rgb(0 0 0 / 0.45);
+    --checker-a: #34373c;
+    --checker-b: #3c4046;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #16181b;
+  --panel: #1e2125;
+  --panel-2: #23272c;
+  --hover: #2a2e34;
+  --well: #2c2f34;
+  --ink: #e3e5e8;
+  --ink-2: #a0a7b0;
+  --ink-3: #6f7680;
+  --rule: #2f3338;
+  --rule-2: #464b52;
+  --accent: #8db0d8;
+  --accent-ink: #0f1620;
+  --accent-soft: #233041;
+  --danger: #f08a80;
+  --danger-soft: #3a2422;
+  --warn: #e2b450;
+  --ok: #6cc08b;
+  --scrim: rgb(0 0 0 / 0.5);
+  --shadow-pop: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 28px rgb(0 0 0 / 0.45);
+  --checker-a: #34373c;
+  --checker-b: #3c4046;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: var(--fs-m) / 1.5 var(--font-sans);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+/* Buttons: secondary with a thin border by default */
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 10px;
+  border: 1px solid var(--rule-2);
+  border-radius: var(--r-s);
+  background: var(--panel);
+  cursor: pointer;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+/* Hover styles only where hovering exists, so taps don't leave a tint */
+@media (hover: hover) {
+  button:hover:not(:disabled) {
+    background: var(--hover);
+  }
+
+  button.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 88%, var(--ink));
+  }
+
+  button.quiet:hover:not(:disabled) {
+    background: var(--hover);
+    color: var(--ink);
+  }
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+button.quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-2);
+}
+
+button.icon {
+  width: 28px;
+  padding: 0;
+}
+
+button.danger {
+  color: var(--danger);
+}
+
+button[aria-pressed="true"],
+button.on {
+  border-color: transparent;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  min-height: 30px;
+  padding: 4px 8px;
+  border: 1px solid var(--rule-2);
+  border-radius: var(--r-s);
+  background: var(--panel);
+}
+
+textarea {
+  display: block;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--ink-3);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+input[type="checkbox"],
+input[type="range"] {
+  width: auto;
+  min-height: 0;
+  padding: 0;
+  box-shadow: none;
+  accent-color: var(--accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+kbd {
+  font: inherit;
+  font-size: 10.5px;
+  line-height: 1;
+  color: inherit;
+  opacity: 0.6;
+}
+
+.serif {
+  font-family: var(--font-serif);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 6px;
+  background: var(--rule-2) padding-box;
+}
+
+/* Touch: bigger targets, 16px inputs so iOS doesn't zoom on focus, no key hints */
+@media (pointer: coarse) {
+  button {
+    min-height: 36px;
+  }
+
+  button.icon {
+    width: 36px;
+  }
+
+  input,
+  select,
+  textarea {
+    min-height: 38px;
+    font-size: 16px;
+  }
+
+  kbd {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

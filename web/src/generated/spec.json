@@ -1,0 +1,259 @@
+{
+  "version": "0.1.0",
+  "promptbrush_version": "0.1.0",
+  "models": [
+    {
+      "name": "gpt-image-2.5-sunburst",
+      "seconds": "40–90s",
+      "size": "exact",
+      "aligned": true,
+      "mask": false,
+      "note": "best quality; keeps the most of the original in edits"
+    },
+    {
+      "name": "gpt-image-2.5-flare",
+      "seconds": "25–45s",
+      "size": "exact",
+      "aligned": true,
+      "mask": false,
+      "note": "the default"
+    },
+    {
+      "name": "gpt-image-2",
+      "seconds": "20–40s",
+      "size": "aspect",
+      "aligned": true,
+      "mask": false,
+      "note": "~1.57 MP; most lenient moderation"
+    },
+    {
+      "name": "gpt-image-2-vip",
+      "seconds": "30–75s",
+      "size": "exact",
+      "aligned": true,
+      "mask": true,
+      "note": "most sizes rendered exactly; up to 4K"
+    },
+    {
+      "name": "gpt-image-1.5",
+      "seconds": "15–30s",
+      "size": "aspect",
+      "aligned": true,
+      "mask": false,
+      "note": "~1.57 MP"
+    },
+    {
+      "name": "gemini-nano-banana-2.1",
+      "seconds": "15–30s",
+      "size": "fixed",
+      "aligned": false,
+      "mask": false,
+      "note": ""
+    },
+    {
+      "name": "gemini-3-pro-image",
+      "seconds": "25–45s",
+      "size": "fixed",
+      "aligned": false,
+      "mask": false,
+      "note": "also known as Nano Banana Pro"
+    },
+    {
+      "name": "gemini-3.1-flash-image",
+      "seconds": "10–20s",
+      "size": "fixed",
+      "aligned": false,
+      "mask": false,
+      "note": "fastest"
+    },
+    {
+      "name": "jimeng-4.5",
+      "seconds": "40–55s",
+      "size": "aspect",
+      "aligned": true,
+      "mask": false,
+      "note": "~4.15 MP; adds an \"AI\" watermark in a corner"
+    }
+  ],
+  "default_model": "gpt-image-2.5-flare",
+  "lenient_model": "gpt-image-2",
+  "size_presets": [
+    "1024x1024",
+    "1536x1024",
+    "1024x1536",
+    "1600x1200",
+    "1200x1600",
+    "2048x1152",
+    "1152x2048",
+    "3840x2160",
+    "auto"
+  ],
+  "default_size": "1600x1200",
+  "default_base_url": "https://api.openai.com/v1",
+  "region_colors": [
+    "#ff3b30",
+    "#007aff",
+    "#34c759",
+    "#ff9500",
+    "#af52de",
+    "#ff2d55",
+    "#00c7be",
+    "#ffcc00"
+  ],
+  "max_regions": 20,
+  "max_shapes": 200,
+  "max_prompt": 30000,
+  "max_instruction": 30000,
+  "max_full_prompt": 40000,
+  "sizes": {
+    "pattern": "^(auto|[1-9]\\d*x[1-9]\\d*)$",
+    "multiple": 16,
+    "max_edge": 3840,
+    "min_pixels": 655360,
+    "max_pixels": 8294400,
+    "max_aspect": 3.0,
+    "strict_prefix": "gpt-image-2.5"
+  },
+  "http": {
+    "max_retries": 5,
+    "retry_backoff": 2.0,
+    "max_retry_after": 60,
+    "retry_status": [
+      429,
+      500,
+      502,
+      503,
+      504,
+      520,
+      521,
+      522,
+      523,
+      524,
+      525,
+      526,
+      527
+    ],
+    "connect_timeout": 15,
+    "timeout_generate": 300,
+    "timeout_edit": 360,
+    "timeout_download": 120,
+    "max_parallel": 4,
+    "moderation_codes": [
+      "content_policy_violation",
+      "moderation_blocked"
+    ],
+    "no_image": "no_image"
+  },
+  "prompt": {
+    "circled": "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳",
+    "text": {
+      "en": {
+        "ref": "reference image {k}",
+        "sep": ", ",
+        "gen_refs": "The attached images are, in order, {refs}.",
+        "edit_refs": "Image 1 is the image to edit; the other images are, in order, {refs}.",
+        "intro": "Image 1 is the image to edit. Image 2 is the same image with colored, numbered outlines drawn around the areas to change; the outlines only mark where to make changes.",
+        "region_refs": "Images 3 onward are, in order, {refs}.",
+        "lead": "Make the following changes to image 1:",
+        "region": "Area {k} ({color}): {text}",
+        "region_default": "follow the overall request",
+        "overall": "Overall: {text}",
+        "outro": "Change only the outlined areas and keep everything else exactly as it is. The output must not contain any outlines, numbers or other annotations.",
+        "outro_overall": "Apart from the overall request, change only the outlined areas and keep everything else exactly as it is. The output must not contain any outlines, numbers or other annotations."
+      },
+      "zh": {
+        "ref": "参考图 {k}",
+        "sep": "、",
+        "gen_refs": "以下几张图依次是{refs}。",
+        "edit_refs": "第 1 张图是要修改的原图，其余依次是{refs}。",
+        "intro": "第 1 张图是要修改的原图；第 2 张图是在原图上用彩色线条圈出、并标了编号的修改位置，线条仅用于指示位置。",
+        "region_refs": "第 3 张图起依次是{refs}。",
+        "lead": "请在第 1 张图的基础上完成以下修改：",
+        "region": "{circled} 号圈（{color}）内：{text}",
+        "region_default": "按整体要求修改",
+        "overall": "整体要求：{text}",
+        "outro": "只修改圈出的区域，其余内容保持不变；输出的图片中不要出现任何线条、编号或标注。",
+        "outro_overall": "除整体要求外，只修改圈出的区域，其余内容保持不变；输出的图片中不要出现任何线条、编号或标注。"
+      }
+    },
+    "colors": {
+      "en": [
+        "red",
+        "blue",
+        "green",
+        "orange",
+        "purple",
+        "pink",
+        "teal",
+        "yellow"
+      ],
+      "zh": [
+        "红色",
+        "蓝色",
+        "绿色",
+        "橙色",
+        "紫色",
+        "粉色",
+        "青色",
+        "黄色"
+      ]
+    }
+  },
+  "notes": {
+    "spill_grown": "spill_grown",
+    "spill_too_large": "spill_too_large",
+    "aspect_mismatch": "aspect_mismatch",
+    "reframed": "reframed",
+    "paste_failed": "paste_failed",
+    "overall_change": "overall_change"
+  },
+  "archive": {
+    "format": "brushgraft-project",
+    "version": 2,
+    "max_nodes": 5000,
+    "max_file_bytes": 104857600,
+    "max_total_bytes": 1073741824,
+    "assets_format": "brushgraft-assets",
+    "assets_version": 1,
+    "max_assets": 5000
+  },
+  "imaging": {
+    "aspect_tolerance": 0.02,
+    "annot_gap": 1,
+    "echo_min_share": 0.15,
+    "spill_scale": 4,
+    "spill_min_delta": 12.0,
+    "spill_drift_factor": 3.5,
+    "spill_near": 16,
+    "bridge_radii": 8,
+    "spill_min_patch": 384,
+    "spill_patch_share": 0.02,
+    "spill_max_growth": 6.0,
+    "spill_max_share": 0.4,
+    "spill_escalate": 4,
+    "spill_note_growth": 0.1,
+    "align_margin": 120,
+    "align_min_corr": 0.5,
+    "tone_max_gain": 0.15,
+    "tone_max_offset": 30.0,
+    "tone_min_span": 80,
+    "tone_fade": 40,
+    "tone_keep": 60,
+    "api_max_bytes": 8388608,
+    "ref_max_pixels": 2359296,
+    "overall_delta": 20.0,
+    "overall_share": 0.2,
+    "register_coarse": 384,
+    "register_reach": 0.02,
+    "register_tile": 32,
+    "register_max_tiles": 400,
+    "register_min_shift": 0.5,
+    "register_max_spread": 0.75,
+    "register_near": 256,
+    "piece_blur": 1.5,
+    "piece_weak": 24,
+    "piece_core": 96,
+    "piece_zone": 40,
+    "max_coord": 100000
+  }
+}
