@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  # Run it by hand from the Actions tab (e.g. to refresh the README badge)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e external/promptbrush -e . --group dev
+      - run: ruff check .
+      # Tests run fully offline: outside connections are blocked and fail the
+      # test, and no API key is needed or read
+      - run: python -m pytest
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e external/promptbrush -e . --group dev
+        working-directory: ${{ github.workspace }}
+      # The browser build shares its constants and texts with Python through one generated file
+      - name: The shared spec is up to date
+        run: python ../scripts/export_spec.py --check
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - run: npm run build:browser
+      - run: node check-size.mjs
+      # The TypeScript image code is compared with Python's on the same inputs
+      - run: python ../scripts/parity_fixtures.py
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - name: Browser tests (the website build and the local server build)
+        run: npm run test:e2e
+        env:
+          BG_PYTHON: python
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-results
+          path: web/test-results
+          retention-days: 7
+      - name: The website build ships as an artifact
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: site
+          path: web/dist
+          retention-days: 14
+
+  # The README's path: make install, then make run
+  quickstart:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: make install
+      - name: make run serves the web UI
+        shell: bash
+        run: |
+          make run ARGS="--no-browser --port 7788 --dir $RUNNER_TEMP/bg" > run.log 2>&1 &
+          for i in $(seq 1 40); do grep -q "token=" run.log 2>/dev/null && break; sleep 1; done
+          cat run.log
+          token=$(grep -o 'token=[^ ]*' run.log | head -1 | cut -d= -f2)
+          test -n "$token"
+          curl -fsS "http://127.0.0.1:7788/?token=$token" | grep -q "<title>"
+
+  package:
+    needs: [backend, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: npm --prefix web ci && npm --prefix web run build
+      - run: python -m pip install build && python -m build
+      # the wheel must include the web UI
+      - run: unzip -l dist/*.whl | grep -q "brushgraft/static/index.html"

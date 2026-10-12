@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brushgraft"
+dynamic = ["version"]
+description = "A local image version-tree editor: mark regions in the browser and edit them with prompts, one version at a time"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "zeroherolin" }]
+requires-python = ">=3.10"
+dependencies = [
+    "promptbrush>=0.1,<0.2",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pillow>=10.1",
+    "numpy>=1.26",
+    "python-multipart>=0.0.9",
+]
+keywords = ["image-generation", "image-editing", "gpt-image", "inpainting"]
+classifiers = [
+    "Environment :: Web Environment",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: Editors",
+]
+
+[project.urls]
+Homepage = "https://github.com/zeroherolin/brushgraft"
+
+[project.scripts]
+brushgraft = "brushgraft.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "httpx2>=2", "ruff>=0.6"]
+
+[tool.hatch.version]
+path = "src/brushgraft/__init__.py"
+
+[tool.hatch.build]
+# The built web UI isn't committed, but ships in the sdist and wheel
+artifacts = ["src/brushgraft/static/"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brushgraft"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/external", "/web/node_modules", "/.github"]
+
+# During development promptbrush comes from the submodule (automatic with uv;
+# for pip see the README)
+[tool.uv.sources]
+promptbrush = { path = "external/promptbrush", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["external", "web"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]

@@ -1,0 +1,9 @@
+# Copy to .env in the workspace (default ~/brushgraft) and fill in, or enter the
+# values under Settings in the web UI. Environment variables of the same name win
+# over .env; promptbrush's PROMPTBRUSH_API_KEY / PROMPTBRUSH_BASE_URL work too.
+
+# Required: API key
+BRUSHGRAFT_API_KEY=
+
+# Optional: OpenAI-compatible base URL (up to /v1), default https://api.openai.com/v1
+# BRUSHGRAFT_BASE_URL=https://your-provider.example.com/v1

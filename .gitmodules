@@ -1,0 +1,4 @@
+[submodule "external/promptbrush"]
+	path = external/promptbrush
+	url = https://github.com/zeroherolin/promptbrush.git
+	branch = main
