@@ -13,6 +13,7 @@ export const en = {
   "app.tokenRequired": "An access token is required. Open the link printed in the terminal when brushgraft started.",
   "app.unreachable": "Can't reach the brushgraft server ({error}). Check that it is still running in the terminal, then reload the page.",
   "app.startFailed": "brushgraft couldn't start: {error}",
+  "app.resizeSide": "Resize the version tree",
   "app.firstProject": "My first project",
   "app.untitledProject": "Untitled project",
   "common.ok": "OK",
@@ -59,6 +60,14 @@ export const en = {
   "queue.waiting": "waiting {time}",
   "queue.took": "took {time}",
   "queue.raw": "Raw response",
+  "job.label": "Job",
+  "job.close": "Close",
+  "job.progress": (p: P) => `${p.done} of ${p.n} done` + (Number(p.failed) ? `, ${p.failed} failed` : ""),
+  "job.errors": "What went wrong",
+  "job.log": "Log",
+  "job.noLogYet": "Nothing logged yet.",
+  "job.noLog": "No log for this request: logs last only until the server restarts or the page reloads.",
+  "job.backTo": "Back to {fig}",
 
   // -- version tree ----------------------------------------------------------
   "tree.title": "Versions",
@@ -176,6 +185,10 @@ export const en = {
   "canvas.madeWithTitle": "Show the regions this version was made with",
   "canvas.madeWithLabel": "Show the regions this version was made with",
   "canvas.madeWithTip": "Outlined: the regions changed in {fig} to make this version. Draw to start a new edit.",
+  "canvas.jobTip": "Outlined: the regions of this edit. The result shows here when it's ready.",
+  "canvas.jobFailedTip": "This edit didn't go through. Outlined: its regions.",
+  "canvas.jobNew": "Generating a new image",
+  "canvas.jobNewFailed": "The new image wasn't made",
   "canvas.viewingAlt": " (showing the {alt}, not adopted)",
   "canvas.altMergedName": "pasted-back result",
   "canvas.altRawName": "whole output",
@@ -249,6 +262,8 @@ export const en = {
   "sheet.summaryNew": "New image: write a prompt",
   "sheet.summaryRegions": (p: P) => `Edit ${p.fig}: ${p.n} ${plural(p.n, "region", "regions")}`,
   "sheet.summaryEdit": "Edit {fig}: mark a region or describe a change",
+  "sheet.summaryJob": "{status}: {text}",
+  "sheet.view": "View",
 
   // -- version details -------------------------------------------------------
   "info.title": "Version details",

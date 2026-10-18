@@ -702,3 +702,77 @@ test("small things: Starred only, a custom size, undo keeps the region selected,
   await page.keyboard.press(" ");
   await expect(row.locator("button.star")).toHaveAttribute("aria-pressed", "true");
 });
+
+test("a job still generating opens from the tree: the original with its regions, and what it asked for", async ({ page }) => {
+  await setUp(page, "slow");
+  await saveKey(page);
+  await importPhoto(page);
+  await markRegion(page, [400, 250, 800, 600]);
+  await page.locator(".regions textarea").first().fill("leather chair");
+  await page.keyboard.press("Control+Enter");
+
+  // while it generates: the original with the job's region, and the job's details beside it
+  await page.locator(".tree li.pending button.select").click();
+  const panel = page.getByRole("complementary", { name: "Job" });
+  await expect(panel.locator(".state")).toHaveText(/Queued|Generating/);
+  await expect(panel.locator(".made")).toContainText("leather chair");
+  await expect(panel.locator("dl")).toContainText("slow");
+  await expect(page.locator(".caption .job-state")).toHaveText(/Queued|Generating/);
+  await expect(page.locator(".tip")).toContainText("regions of this edit");
+  await expect(page.getByRole("button", { name: "Rectangle" })).toBeDisabled(); // nothing is edited here
+  // when it's done, its result shows
+  await expect(page.locator(".tree .row")).toHaveCount(2, { timeout: 20_000 });
+  await expect(panel).toHaveCount(0);
+  await expect(page.locator(".tree .row").nth(1).locator("button.select")).toHaveAttribute("aria-current", "true");
+
+  // a new image has no original to show: the canvas says what is coming
+  await page.getByRole("tab", { name: "New image" }).click();
+  await page.locator("#prompt").fill("a lighthouse at dusk");
+  await page.keyboard.press("Control+Enter");
+  await page.locator(".tree li.pending button.select").click();
+  await expect(page.locator(".welcome .lead")).toHaveText("Generating a new image");
+  await expect(page.locator(".welcome .job-prompt")).toHaveText("a lighthouse at dusk");
+  await expect(panel.locator(".made")).toContainText("a lighthouse at dusk");
+  await expect(page.locator(".tree .row")).toHaveCount(3, { timeout: 20_000 });
+  await expect(page.locator(".tree .row").nth(2).locator("button.select")).toHaveAttribute("aria-current", "true");
+});
+
+test("a failed job opens from the tree: the whole explanation, the service's answer and the log", async ({ page }) => {
+  await setUp(page, "fail-451");
+  await saveKey(page);
+  await importPhoto(page);
+  await page.locator("#prompt").fill("make it nicer");
+  await page.keyboard.press("Control+Enter");
+  const panel = page.getByRole("complementary", { name: "Job" });
+  const failed = page.locator(".tree li.pending.failed");
+  await expect(failed).toContainText("Blocked by content moderation (HTTP 451)", { timeout: 20_000 });
+  await expect(failed).not.toContainText("Rephrase"); // one line: what went wrong; the rest is a click away
+  await failed.locator("button.select").click();
+  await expect(panel.locator(".state")).toHaveText("Failed");
+  await expect(panel.locator(".errors")).toContainText("Rephrase the prompt");
+  await panel.locator(".raw summary").click();
+  await expect(panel.locator(".raw code")).toContainText("HTTP 451");
+  await expect(panel.locator(".log")).toContainText("HTTP 451");
+  await page.keyboard.press("Escape");
+  await expect(panel).toHaveCount(0);
+  await failed.locator("button.select").click();
+  await panel.getByRole("button", { name: "Remove" }).click();
+  await expect(failed).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
+});
+
+test("the version tree's column is as wide as its edge is dragged", async ({ page }) => {
+  await setUp(page);
+  await saveKey(page);
+  const side = page.locator(".side");
+  const before = (await side.boundingBox())!.width;
+  const grip = page.getByRole("separator", { name: "Resize the version tree" });
+  const box = (await grip.boundingBox())!;
+  await drag(page, [[box.x + 4, box.y + 200], [box.x + 124, box.y + 200]]);
+  await expect.poll(async () => Math.round((await side.boundingBox())!.width)).toBe(Math.round(before + 120));
+  await grip.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect.poll(async () => Math.round((await side.boundingBox())!.width)).toBe(Math.round(before + 100));
+  await page.reload();
+  await expect.poll(async () => Math.round((await page.locator(".side").boundingBox())!.width)).toBe(Math.round(before + 100));
+});

@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { app, describeJob, jobErrorText } from "../lib/app.svelte";
+  import { app, describeJob } from "../lib/app.svelte";
   import { t } from "../lib/i18n.svelte";
   import { elapsed } from "../lib/format";
   import type { Job } from "../lib/types";
+  import JobErrors from "./JobErrors.svelte";
 
   let now = $state(Date.now() / 1000);
   const timer = setInterval(() => (now = Date.now() / 1000), 1000);
@@ -19,9 +20,11 @@
   );
 
 
+  // a finished job's first result; one still generating, or failed, shows the job itself
   function open(job: Job) {
     const result = Object.values(app.nodes).find((n) => n.job_id === job.id);
     if (result) app.select(result.id);
+    else if (job.status !== "done") app.openJob(job);
     else if (job.parent_id && app.nodes[job.parent_id]) app.select(job.parent_id);
     app.queueOpen = false;
   }
@@ -59,15 +62,9 @@
             {/each}
           </ol>
         {/if}
-        {#each job.errors as err, i (i)}
-          <p class="error">{jobErrorText(err, job.model, app.config?.lenient_model)}</p>
-          {#if typeof err === "object" && err.detail && err.code !== "image_unreachable"}
-            <details class="raw">
-              <summary>{t("queue.raw")}</summary>
-              <code>{err.detail}</code>
-            </details>
-          {/if}
-        {/each}
+        {#if job.errors.length}
+          <div class="errors"><JobErrors {job} /></div>
+        {/if}
       </li>
     {/each}
   </ol>
@@ -178,35 +175,12 @@
     color: var(--warn);
   }
 
-  .logs .error,
-  .error {
+  .logs .error {
     color: var(--danger);
   }
 
-  .raw {
-    margin-top: -4px;
-    color: var(--ink-3);
-  }
-
-  .raw summary {
-    cursor: pointer;
-    width: fit-content;
-  }
-
-  .raw code {
-    display: block;
-    margin-top: 2px;
-    max-height: 8em;
-    overflow: auto;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    user-select: text;
-  }
-
-  .error,
-  .raw {
-    margin: 0 10px 6px calc(5.6em + 20px); /* under the title, past the status column */
-    font-size: var(--fs-s);
-    overflow-wrap: anywhere;
+  /* under the title, past the status column */
+  .errors {
+    margin: 0 10px 6px calc(5.6em + 20px);
   }
 </style>

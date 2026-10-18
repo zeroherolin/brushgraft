@@ -1,10 +1,11 @@
 <script lang="ts">
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import ChevronUp from "@lucide/svelte/icons/chevron-up";
-  import { app } from "../lib/app.svelte";
+  import { app, describeJob } from "../lib/app.svelte";
   import { fig } from "../lib/format";
   import { t } from "../lib/i18n.svelte";
   import Composer from "./Composer.svelte";
+  import JobPanel from "./JobPanel.svelte";
   import NodeInfo from "./NodeInfo.svelte";
 
   let infoOpen = $state(false);
@@ -12,6 +13,8 @@
   const editing = $derived(app.mode === "edit" && !!app.selected);
   const regions = $derived(app.draft.regions.length);
   const summary = $derived.by(() => {
+    const job = app.viewedJob;
+    if (job) return t("sheet.summaryJob", { status: t(`status.${job.status}`), text: describeJob(job) });
     if (!editing) return app.draft.prompt.trim() || t("sheet.summaryNew");
     const ver = app.versions[app.selected!.id];
     if (regions) return t("sheet.summaryRegions", { fig: fig(ver), n: regions });
@@ -24,13 +27,15 @@
   <div class="sheet" role="dialog" aria-modal="true" aria-label={t("composer.label")}>
     <div class="sheet-head">
       <span class="grip" aria-hidden="true"></span>
-      {#if app.selected}
+      {#if app.selected && !app.viewedJob}
         <button class="quiet" aria-pressed={infoOpen} onclick={() => (infoOpen = !infoOpen)}>{t("sheet.details")}</button>
       {/if}
       <span class="spacer"></span>
       <button class="quiet icon" aria-label={t("sheet.collapse")} onclick={() => (app.sheetOpen = false)}><ChevronDown size={18} /></button>
     </div>
-    {#if infoOpen && app.selected}
+    {#if app.viewedJob}
+      <JobPanel job={app.viewedJob} variant="sheet" />
+    {:else if infoOpen && app.selected}
       <div class="info"><NodeInfo node={app.selected} open /></div>
     {:else}
       <Composer variant="sheet" />
@@ -42,7 +47,7 @@
       <ChevronUp size={16} />
       <span class="text">{summary}</span>
     </button>
-    <button class="primary" onclick={() => (app.sheetOpen = true)}>{editing ? t("sheet.edit") : t("sheet.write")}</button>
+    <button class="primary" onclick={() => (app.sheetOpen = true)}>{app.viewedJob ? t("sheet.view") : editing ? t("sheet.edit") : t("sheet.write")}</button>
   </div>
 {/if}
 

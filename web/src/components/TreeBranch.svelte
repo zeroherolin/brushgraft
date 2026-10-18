@@ -71,7 +71,7 @@
           <span class="text">
             <span class="line1">
               <span class="ver serif" title={app.versions[node.id]}>{shortVersion(app.versions[node.id])}</span>
-              <span class="title" class:muted={v > 1}>{v > 1 ? t("tree.variant", { k: v }) : app.caption(node)}</span>
+              <span class="title" class:muted={v > 1} title={app.caption(node)}>{v > 1 ? t("tree.variant", { k: v }) : app.caption(node)}</span>
             </span>
             <span class="meta">
               <span class="model">{job ? shortModel(job.model) : t("tree.imported", { w: node.width, h: node.height })}</span>
@@ -113,33 +113,40 @@
     </li>
   {/each}
 
+  <!-- Jobs still generating, or failed: a row each, opened like a version to see all of it -->
   {#each pending as job (job.id)}
     {@const failed = job.status === "failed"}
     <li class="pending" class:failed>
-      <span class="twisty" aria-hidden="true"></span>
-      <span class="thumb placeholder" aria-hidden="true">
-        {#if !failed}<span class="spinner"></span>{/if}
-      </span>
-      <span class="text">
-        <span class="title">{describeJob(job)}</span>
-        {#if failed}
-          <span class="meta error" title={app.jobError(job)}>{app.jobError(job)}</span>
-          <span class="inline-actions">
-            <button class="quiet" onclick={() => app.reuseJob(job)}>{t("tree.retry")}</button>
-            <button class="quiet" onclick={() => app.dismissJob(job)}>{t("tree.dismiss")}</button>
+      <div class="jobrow" class:selected={app.jobId === job.id}>
+        <span class="twisty" aria-hidden="true"></span>
+        <button class="select" aria-current={app.jobId === job.id} title={describeJob(job)} onclick={() => app.openJob(job)}>
+          <span class="thumb placeholder" aria-hidden="true">
+            {#if !failed}<span class="spinner"></span>{/if}
           </span>
-        {:else}
-          <span class="meta">
-            {t("tree.pendingMeta", {
-              status: t(`status.${job.status}`),
-              time: elapsed(now - job.created_at),
-              model: shortModel(job.model),
-              done: job.done,
-              n: job.n,
-            })}
+          <span class="text">
+            <span class="title">{describeJob(job)}</span>
+            {#if failed}
+              <span class="meta error" title={app.jobError(job)}>{app.jobError(job, true)}</span>
+            {:else}
+              <span class="meta">
+                {t("tree.pendingMeta", {
+                  status: t(`status.${job.status}`),
+                  time: elapsed(now - job.created_at),
+                  model: shortModel(job.model),
+                  done: job.done,
+                  n: job.n,
+                })}
+              </span>
+            {/if}
           </span>
-        {/if}
-      </span>
+        </button>
+      </div>
+      {#if failed}
+        <span class="inline-actions">
+          <button class="quiet" onclick={() => app.reuseJob(job)}>{t("tree.retry")}</button>
+          <button class="quiet" onclick={() => app.dismissJob(job)}>{t("tree.dismiss")}</button>
+        </span>
+      {/if}
     </li>
   {/each}
 </ul>
@@ -181,7 +188,9 @@
     border-left-color: var(--ink-3);
   }
 
-  .row {
+  /* a version's row, and a job's (".jobrow", so that counting versions doesn't count jobs) */
+  .row,
+  .jobrow {
     --row-bg: var(--panel);
     position: relative;
     display: flex;
@@ -189,12 +198,14 @@
     border-radius: var(--r-s);
   }
 
-  .row:hover {
+  .row:hover,
+  .jobrow:hover {
     --row-bg: var(--hover);
     background: var(--row-bg);
   }
 
-  .row.selected {
+  .row.selected,
+  .jobrow.selected {
     --row-bg: var(--accent-soft);
     background: var(--row-bg);
   }
@@ -403,20 +414,8 @@
     }
   }
 
-  .pending {
-    display: flex;
-    align-items: flex-start;
-    gap: 9px;
-    padding: 4px 4px 4px 0;
-  }
-
-  .pending .twisty {
-    margin-right: -9px;
-  }
-
   .pending .text {
     flex: 1;
-    padding-top: 2px;
   }
 
   .placeholder {
@@ -431,10 +430,11 @@
     border-color: color-mix(in srgb, var(--danger) 50%, var(--rule-2));
   }
 
+  /* under the row's text: past the twisty, the thumbnail and the gap */
   .inline-actions {
     display: flex;
     gap: 2px;
-    margin: 2px 0 0 -10px;
+    margin: 0 0 4px calc(18px + 40px + 9px - 8px);
   }
 
   .spinner {

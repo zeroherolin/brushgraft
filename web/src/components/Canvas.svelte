@@ -26,7 +26,7 @@
   import ZoomOut from "@lucide/svelte/icons/zoom-out";
   import { onMount, tick, untrack, type Component } from "svelte";
   import { backend } from "../lib/backend";
-  import { app, BRUSH_MAX, BRUSH_MIN, selectsInImage, type SelectMode, type Tool } from "../lib/app.svelte";
+  import { app, BRUSH_MAX, BRUSH_MIN, describeJob, selectsInImage, type SelectMode, type Tool } from "../lib/app.svelte";
   import { dialogs } from "../lib/dialogs.svelte";
   import { forControl } from "../lib/keys";
   import { fig, zoomText } from "../lib/format";
@@ -83,8 +83,10 @@
   const pointers = new Map<number, Point>();
 
   const node = $derived(app.selected);
-  const editing = $derived(app.mode === "edit" && !!node);
-  const comparing = $derived(app.compare && !!app.parentNode && !!node);
+  // a job opened from the tree: its parent shows with the job's regions, and nothing is edited
+  const viewing = $derived(app.viewedJob);
+  const editing = $derived(app.mode === "edit" && !!node && !viewing);
+  const comparing = $derived(app.compare && !!app.parentNode && !!node && !viewing);
   // When pasted back, the "other" image is the one this version didn't adopt:
   // the pasted result or the model's whole output
   const usingRaw = $derived(!!node?.raw_image && node.image === node.raw_image);
@@ -99,9 +101,16 @@
   const altName = $derived(usingRaw ? t("canvas.altMergedName") : t("canvas.altRawName"));
   const shownSha = $derived(node ? (app.showAlt && altSha ? altSha : node.image) : null);
   const narrow = $derived(app.layout === "narrow");
-  // The regions this version was made with, outlined until a new edit is drawn
+  // The regions this version was made with, outlined until a new edit is drawn; for a job on screen,
+  // its own regions, drawn on the image it was sent with
   const madeWith = $derived(
-    app.showMadeWith && !comparing && !app.showAlt && !app.draft.regions.length && !drawing && !poly ? app.madeWithRegions : [],
+    viewing
+      ? node && viewing.parent_id === node.id
+        ? viewing.regions
+        : []
+      : app.showMadeWith && !comparing && !app.showAlt && !app.draft.regions.length && !drawing && !poly
+        ? app.madeWithRegions
+        : [],
   );
   const coarse = matchMedia("(pointer: coarse)").matches;
 
@@ -233,7 +242,7 @@
   }
 
   $effect(() => {
-    void [editing, comparing, altSha, app.parentNode?.id, app.madeWithRegions.length, app.layout, i18n.lang, app.compare];
+    void [editing, comparing, altSha, app.parentNode?.id, app.madeWithRegions.length, app.layout, i18n.lang, app.compare, viewing];
     untrack(() => void fitToolbar(true));
   });
 
@@ -1212,6 +1221,7 @@
   });
 
   const tip = $derived.by((): string => {
+    if (viewing) return node && madeWith.length ? t(viewing.status === "failed" ? "canvas.jobFailedTip" : "canvas.jobTip") : "";
     if (!node || comparing) return "";
     if (madeWith.length && editing) return t("canvas.madeWithTip", { fig: fig(app.parentNode ? app.versions[app.parentNode.id] : "") });
     if (!editing) return "";
@@ -1366,7 +1376,7 @@
     {#if fitLevel >= 6}<span class="row-break" aria-hidden="true"></span>{/if}
     <span class="spacer"></span>
     <!-- Phones have no room for it; the outlines go away as soon as you draw -->
-    {#if app.madeWithRegions.length && !narrow}
+    {#if app.madeWithRegions.length && !narrow && !viewing}
       <button
         aria-pressed={app.showMadeWith && !comparing}
         disabled={comparing}
@@ -1380,12 +1390,12 @@
         <ScanEye size={15} />{#if app.layout === "wide" && fitLevel < 3}<span>{t("canvas.madeWith")}</span>{/if}
       </button>
     {/if}
-    {#if app.parentNode}
+    {#if app.parentNode && !viewing}
       <button aria-pressed={app.compare} onclick={() => (app.compare = !app.compare)} title={t("canvas.compareTitle")} aria-label={t("canvas.compareLabel")}>
         <Columns2 size={15} />{#if !narrow && fitLevel < 3}<span>{t("canvas.compare")}</span>{/if}
       </button>
     {/if}
-    {#if altSha}
+    {#if altSha && !viewing}
       <button
         aria-pressed={app.showAlt}
         onclick={() => (app.showAlt = !app.showAlt)}
@@ -1428,7 +1438,12 @@
     oncontextmenu={(e) => e.preventDefault()}
   >
     <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px"></canvas>
-    {#if !node}
+    {#if viewing && !node}
+      <div class="welcome">
+        <p class="lead serif">{viewing.status === "failed" ? t("canvas.jobNewFailed") : t("canvas.jobNew")}</p>
+        <p class="job-prompt">{describeJob(viewing)}</p>
+      </div>
+    {:else if !node}
       <div class="welcome">
         {#if app.nodeCount}
           <p class="lead serif">{t("canvas.pickTitle")}</p>
@@ -1511,7 +1526,21 @@
     </div>
   {/if}
 
-  {#if node}
+  {#if viewing}
+    <footer class="caption">
+      <p class="figure">
+        <span class="num job-state {viewing.status}">{t(`status.${viewing.status}`)}</span>
+        <span class="text" title={describeJob(viewing)}>{describeJob(viewing)}</span>
+      </p>
+      <span class="caption-actions">
+        {#if viewing.status === "failed"}
+          <button class="quiet icon delete" title={t("tree.dismiss")} aria-label={t("tree.dismiss")} onclick={() => app.dismissJob(viewing)}>
+            <Trash2 size={15} />
+          </button>
+        {/if}
+      </span>
+    </footer>
+  {:else if node}
     <footer class="caption">
       <p class="figure">
         <span class="num serif">{fig(version)}</span>
@@ -2014,6 +2043,31 @@
   .path button[aria-current="true"] {
     color: var(--ink);
     font-weight: 600;
+  }
+
+  .job-state {
+    flex: none;
+    font-size: var(--fs-s);
+    font-weight: 600;
+  }
+
+  .job-state.running,
+  .job-state.queued {
+    color: var(--warn);
+  }
+
+  .job-state.failed {
+    color: var(--danger);
+  }
+
+  .job-prompt {
+    max-width: 36em;
+    color: var(--ink-2);
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
 
   .caption-actions {

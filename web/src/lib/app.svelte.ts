@@ -32,7 +32,10 @@ export interface Draft {
 }
 
 const NEW_DRAFT = "__new__";
-const LOG_LIMIT = 80;
+const LOG_LIMIT = 200;
+/** the version tree's column: narrower and the titles are gone, wider and the canvas is */
+const SIDE_MIN = 220;
+const SIDE_MAX = 520;
 const MAX_REFS = 8;
 const UNDO_LIMIT = 100;
 const TOOLS: Tool[] = ["select", "rect", "ellipse", "lasso", "polygon", "brush", "eraser"];
@@ -119,12 +122,17 @@ export function errorText(e: unknown): string {
  * code) and what to do, then what the service said when that adds something. The raw text stays
  * in ``error.detail``.
  */
-export function jobErrorText(error: JobError | string | undefined, model: string, lenient = ""): string {
+export function jobErrorText(error: JobError | string | undefined, model: string, lenient = "", brief = false): string {
   if (!error) return t("jobError.unknown", { code: "—" });
   if (typeof error === "string") return error; // stored before errors had codes
   const { kind, code, service } = describeJobError(error);
   const key = kind === "moderated" && lenient && model !== lenient ? "jobError.moderatedTry" : (`jobError.${kind}` as Key);
   let text = t(key, { code, model: lenient });
+  if (brief) {
+    // the first sentence says what went wrong, and its code; what to do follows
+    const first = text.match(/^[\s\S]*?(?:。|\.(?=\s|$))/)?.[0] ?? text;
+    return `${error.variant ? `[${error.variant}] ` : ""}${first.replace(/[。.]$/, "")}`;
+  }
   if (kind === "image_unreachable" && error.detail) text += ` ${error.detail}`;
   if (service) text += `${i18n.lang === "zh" ? "" : " "}${t("jobError.service", { text: service })}`;
   return error.variant ? `[${error.variant}] ${text}` : text;
@@ -158,6 +166,9 @@ class AppState {
   site = $state<{ icp: string; url: string } | null>(null);
 
   selectedId = $state<string | null>(null);
+  /** a job still generating, or failed, opened from the tree: its parent shows, with its regions,
+   *  and the panel shows the job instead of the next edit */
+  jobId = $state<string | null>(null);
   mode = $state<Mode>("generate");
   drafts = $state<Record<string, Draft>>({ [NEW_DRAFT]: emptyDraft() });
   selectedRegion = $state(-1);
@@ -213,6 +224,8 @@ class AppState {
 
   // -- derived --------------------------------------------------------------
   selected = $derived(this.selectedId ? (this.nodes[this.selectedId] ?? null) : null);
+  /** the job opened from the tree, while it is still there to see (not done, not dismissed) */
+  viewedJob = $derived(this.jobId && this.jobs[this.jobId]?.status !== "done" ? (this.jobs[this.jobId] ?? null) : null);
   draftKey = $derived(this.mode === "edit" && this.selectedId ? this.selectedId : NEW_DRAFT);
   draft = $derived(this.drafts[this.draftKey] ?? emptyDraft());
   project = $derived(this.projects.find((p) => p.id === this.projectId) ?? null);
@@ -298,6 +311,14 @@ class AppState {
   /** the asset library, newest first: images every project can use as references */
   assets = $state<Asset[]>([]);
   assetById = $derived(Object.fromEntries(this.assets.map((a) => [a.id, a])));
+  /** the version tree's column, in px (dragged by its edge) */
+  sideWidth = $state(Math.max(SIDE_MIN, Math.min(SIDE_MAX, loadPref("sideWidth", 276))));
+
+  setSideWidth(width: number): void {
+    this.sideWidth = Math.round(Math.max(SIDE_MIN, Math.min(SIDE_MAX, width)));
+    savePref("sideWidth", this.sideWidth);
+  }
+
   /** the library's panel under the version tree: open, and its height in px */
   libraryOpen = $state(loadPref("libraryOpen", true));
   libraryHeight = $state(loadPref("libraryHeight", 260));
@@ -351,8 +372,9 @@ class AppState {
   }
 
   /** the latest error of a job, in the UI language */
-  jobError(job: Job): string {
-    return jobErrorText(job.errors.at(-1), job.model, this.config?.lenient_model);
+  /** the latest error of a job, in the UI language; ``brief``: what went wrong only, for one line */
+  jobError(job: Job, brief = false): string {
+    return jobErrorText(job.errors.at(-1), job.model, this.config?.lenient_model, brief);
   }
 
   modelInfo(name: string): ModelInfo | undefined {
@@ -474,12 +496,13 @@ class AppState {
     // job's, say, that failed a moment ago): it waits for that one to go
     if (this.toast?.error && !job.failed) this.#queued = () => this.notify(text);
     else this.notify(text, job.failed > 0);
-    // Still editing the version this job started from (not on "New image"): show the result,
-    // unless the next edit is already under way there (don't pull the user away from it)
+    // Watching this job, or still editing the version it started from (not on "New image"): show
+    // the result, unless the next edit is already under way there (don't pull the user away from it)
     const next = this.drafts[job.parent_id ?? NEW_DRAFT];
     const busy = this.polygonOpen || this.gestureOpen;
     const here = this.selectedId === job.parent_id && this.draftKey === (job.parent_id ?? NEW_DRAFT);
-    if (results.length && here && !this.compare && isEmpty(next) && !busy) {
+    const watching = this.jobId === job.id;
+    if (results.length && (watching || (here && !this.compare && isEmpty(next) && !busy))) {
       this.select(results[0].id);
     }
   }
@@ -488,6 +511,7 @@ class AppState {
     this.projectId = id;
     savePref("project", id);
     this.selectedId = null;
+    this.jobId = null;
     this.selectedRegion = -1;
     this.mode = "generate";
     this.logs = {};
@@ -605,11 +629,33 @@ class AppState {
 
   // -- selection and drafts -------------------------------------------------
   select(id: string | null): void {
+    this.jobId = null;
     this.selectedId = id;
     this.selectedRegion = -1;
     this.showAlt = false;
     this.setMode(id ? "edit" : "generate");
     if (this.layout !== "wide") this.treeOpen = false;
+  }
+
+  /** Show a job that is still generating, or failed: what it asked for, how far it got, why it failed. */
+  openJob(job: Job): void {
+    this.select(job.parent_id && this.nodes[job.parent_id] ? job.parent_id : null);
+    this.jobId = job.id;
+    if (this.layout === "narrow") this.sheetOpen = false;
+    // the lines logged before this page connected are on the server (for as long as it runs)
+    if (!this.logs[job.id]?.length) {
+      backend
+        .logs(job.id)
+        .then((lines) => {
+          if (lines.length && !this.logs[job.id]?.length) this.logs[job.id] = lines.slice(-LOG_LIMIT);
+        })
+        .catch(() => {});
+    }
+  }
+
+  /** back from a job to the version it was made from (or to nothing) */
+  closeJob(): void {
+    this.jobId = null;
   }
 
   setMode(mode: Mode): void {
@@ -1013,7 +1059,7 @@ class AppState {
 
   // -- actions --------------------------------------------------------------
   async submit(): Promise<void> {
-    if (this.blocker) return; // the shortcut doesn't go through the button's disabled state
+    if (this.blocker || this.viewedJob) return; // the shortcut doesn't go through the button's disabled state
     const editing = this.mode === "edit" && this.selected;
     const key = this.draftKey;
     const draft = $state.snapshot(this.editable) as Draft;
@@ -1177,6 +1223,7 @@ class AppState {
     try {
       await backend.deleteJob(job.id);
       delete this.jobs[job.id];
+      if (this.jobId === job.id) this.jobId = null;
     } catch (e) {
       this.notify(errorText(e), true);
     }

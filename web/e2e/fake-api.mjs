@@ -44,7 +44,7 @@ createServer(async (req, res) => {
   if (url.pathname === "/v1/images/generations") {
     const b = JSON.parse((await body(req)).toString());
     log.push({ op: "generate", model: b.model, prompt: b.prompt, auth: req.headers.authorization });
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, b.model === "slow" ? 2000 : 300));
     return answer(res, b.model, png(256, 192, (x, y) => [(60 + x * 0.6) % 256, (90 + y) % 256, 140]));
   }
   if (url.pathname === "/v1/images/edits") {

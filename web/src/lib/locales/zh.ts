@@ -12,6 +12,7 @@ export const zh: { [K in keyof typeof en]: string | ((p: P) => string) } = {
   "app.tokenRequired": "需要访问令牌。请使用启动 brushgraft 时终端里打印的链接打开。",
   "app.unreachable": "连接不到 brushgraft 服务（{error}）。请确认终端里的 brushgraft 仍在运行，然后刷新页面。",
   "app.startFailed": "brushgraft 无法启动：{error}",
+  "app.resizeSide": "调整版本树宽度",
   "app.firstProject": "我的第一个项目",
   "app.untitledProject": "未命名项目",
   "common.ok": "确定",
@@ -57,6 +58,14 @@ export const zh: { [K in keyof typeof en]: string | ((p: P) => string) } = {
   "queue.waiting": "已等 {time}",
   "queue.took": "用时 {time}",
   "queue.raw": "原始响应",
+  "job.label": "任务",
+  "job.close": "关闭",
+  "job.progress": (p: P) => `已完成 ${p.done}/${p.n} 张` + (Number(p.failed) ? `，失败 ${p.failed} 张` : ""),
+  "job.errors": "失败原因",
+  "job.log": "日志",
+  "job.noLogYet": "还没有日志。",
+  "job.noLog": "没有这次请求的日志：日志只保留到服务重启或页面刷新之前。",
+  "job.backTo": "回到{fig}",
 
   // -- 版本树 ------------------------------------------------------------------
   "tree.title": "版本",
@@ -174,6 +183,10 @@ export const zh: { [K in keyof typeof en]: string | ((p: P) => string) } = {
   "canvas.madeWithTitle": "显示这一版修改时用的选区",
   "canvas.madeWithLabel": "显示这一版修改时用的选区",
   "canvas.madeWithTip": "图上标出的是这一版在 {fig} 上改动的选区；直接圈选即可开始新的修改。",
+  "canvas.jobTip": "标出的是这次修改的选区；生成完成后会在这里显示结果。",
+  "canvas.jobFailedTip": "这次修改没有成功；标出的是它的选区。",
+  "canvas.jobNew": "正在生成新图",
+  "canvas.jobNewFailed": "新图没有生成成功",
   "canvas.viewingAlt": "（正在查看{alt}，未采用）",
   "canvas.altMergedName": "贴回结果",
   "canvas.altRawName": "整张输出",
@@ -247,6 +260,8 @@ export const zh: { [K in keyof typeof en]: string | ((p: P) => string) } = {
   "sheet.summaryNew": "生成新图：写一段提示词",
   "sheet.summaryRegions": "修改{fig}：{n} 个选区",
   "sheet.summaryEdit": "修改{fig}：圈选或写要求",
+  "sheet.summaryJob": "{status}：{text}",
+  "sheet.view": "查看",
 
   // -- 版本详情 ----------------------------------------------------------------
   "info.title": "版本详情",

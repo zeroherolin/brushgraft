@@ -9,6 +9,7 @@
   import Composer from "./components/Composer.svelte";
   import DialogHost from "./components/DialogHost.svelte";
   import Drawer from "./components/Drawer.svelte";
+  import JobPanel from "./components/JobPanel.svelte";
   import MobileSheet from "./components/MobileSheet.svelte";
   import Settings from "./components/Settings.svelte";
   import StatusBar from "./components/StatusBar.svelte";
@@ -69,7 +70,7 @@
     if (forControl(e)) return;
     const key = e.key.toLowerCase();
     // the regions are shown and can be changed (Compare hides them)
-    const editing = app.mode === "edit" && !!app.selected && !(app.compare && app.parentNode);
+    const editing = app.mode === "edit" && !!app.selected && !(app.compare && app.parentNode) && !app.viewedJob;
     if (mod && editing && e.altKey && e.code === "KeyZ") {
       // Photoshop's step backward and forward: ⌥⌘Z, ⇧⌥⌘Z
       e.preventDefault();
@@ -100,6 +101,8 @@
       app.persistPrefs();
     } else if ((e.key === "Delete" || e.key === "Backspace") && editing && app.selectedRegion >= 0) {
       app.removeRegion(app.selectedRegion);
+    } else if (e.key === "Escape" && app.viewedJob) {
+      app.closeJob();
     } else if (e.key === "Escape") {
       app.selectedRegion = -1;
     } else if (e.key.startsWith("Arrow") && editing && app.selectedRegion >= 0) {
@@ -169,6 +172,31 @@
   }
 
   const hasFiles = (e: DragEvent) => e.dataTransfer?.types.includes("Files") ?? false;
+
+  // -- the version tree's width, by its right edge -----------------------------------
+  function sideResizeStart(e: PointerEvent) {
+    const grip = e.currentTarget as HTMLElement;
+    const start = e.clientX;
+    const from = app.sideWidth;
+    grip.setPointerCapture(e.pointerId);
+    const move = (ev: PointerEvent) => app.setSideWidth(from + ev.clientX - start);
+    const up = () => {
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", up);
+      grip.removeEventListener("pointercancel", up);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up);
+    grip.addEventListener("pointercancel", up);
+  }
+
+  function sideResizeKey(e: KeyboardEvent) {
+    const step = e.shiftKey ? 60 : 20;
+    if (e.key === "ArrowRight") app.setSideWidth(app.sideWidth + step);
+    else if (e.key === "ArrowLeft") app.setSideWidth(app.sideWidth - step);
+    else return;
+    e.preventDefault();
+  }
 </script>
 
 <svelte:window
@@ -213,16 +241,32 @@
     {#if !app.online}
       <div class="offline" role="status">{t("app.offline")}</div>
     {/if}
-    <div class="body">
+    <div class="body" style:--side="{app.sideWidth}px">
       {#if app.layout === "wide"}
         <div class="side">
           <Tree />
           <AssetLibrary />
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+          <div
+            class="side-grip"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label={t("app.resizeSide")}
+            aria-valuenow={app.sideWidth}
+            tabindex="0"
+            onpointerdown={sideResizeStart}
+            onkeydown={sideResizeKey}
+            ondblclick={() => app.setSideWidth(276)}
+          ></div>
         </div>
       {/if}
       <Canvas />
       {#if app.layout !== "narrow"}
-        <Composer />
+        {#if app.viewedJob}
+          <JobPanel job={app.viewedJob} />
+        {:else}
+          <Composer />
+        {/if}
       {/if}
     </div>
     {#if app.layout !== "narrow"}
@@ -271,16 +315,44 @@
   .body {
     flex: 1;
     display: grid;
-    grid-template-columns: 276px minmax(0, 1fr) 332px;
+    /* the tree is as wide as it was dragged, leaving the canvas at least about 430px */
+    grid-template-columns: min(var(--side, 276px), calc(100vw - 760px)) minmax(0, 1fr) 332px;
     grid-template-rows: minmax(0, 1fr);
     min-height: 0;
   }
 
   /* the version tree, and the asset library under it */
   .side {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;
+  }
+
+  /* the column's right edge: drag (or arrow keys) to widen the tree; a double-click resets it */
+  .side-grip {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: -4px;
+    width: 8px;
+    cursor: col-resize;
+    z-index: 3;
+  }
+
+  .side-grip:hover::after,
+  .side-grip:focus-visible::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 3px;
+    width: 2px;
+    background: var(--accent);
+  }
+
+  .side-grip:focus-visible {
+    outline: none;
   }
 
   .side > :global(nav) {
