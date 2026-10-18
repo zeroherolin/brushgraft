@@ -2,7 +2,8 @@ import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ImageOps } from "../../imaging/client";
 import { merge, normalizeUpload, prepare, thumbnail } from "../../imaging/ops";
-import type { Job, ServerEvent, TreeNode } from "../../types";
+import { describeJobError } from "../../joberror";
+import type { Job, JobError, ServerEvent, TreeNode } from "../../types";
 import { makePng, scenePng, b64, jsonResponse } from "../../../test/images";
 import { decodePng } from "../../../test/png";
 import { testCodec } from "../../../test/codec";
@@ -146,7 +147,9 @@ describe("generating", () => {
     s.replies.push(...Array(5).fill(new TypeError("Failed to fetch")));
     const job = await s.runner.submit(base(projectId));
     const done = await waitDone(s, job.id);
-    expect((done.errors[0] as { detail: string }).detail).toMatch(/allows requests from web pages/);
+    // the raw text is kept; the UI explains it (CORS, the address, the connection)
+    expect(done.errors[0]).toMatchObject({ code: "network", detail: "Failed to fetch" });
+    expect(describeJobError(done.errors[0] as JobError).kind).toBe("fetch");
   });
 
   it("names the address when the API gave a url this page can't download", async () => {

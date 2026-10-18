@@ -154,4 +154,12 @@ describe("testConnection", () => {
     await expect(testConnection("k", "https://x/v1", scripted(json("bad key", 401)).options)).rejects.toMatchObject({ status: 401 });
     await expect(testConnection("k", "https://x/v1", scripted(new TypeError("Failed to fetch")).options)).rejects.toBeInstanceOf(NetworkError);
   });
+
+  it("doesn't take a web page for the API (a base URL without /v1 answers 200 with the site)", async () => {
+    const page = new Response("<!doctype html><html><head>", { status: 200, headers: { "Content-Type": "text/html" } });
+    await expect(testConnection("k", "https://x", scripted(page).options)).rejects.toMatchObject({
+      name: "ImageAPIError",
+      message: expect.stringMatching(/^Response is not valid JSON: <!doctype html>/),
+    });
+  });
 });

@@ -17,6 +17,7 @@ export class ImageAPIError extends Error {
     readonly code = "",
   ) {
     super(message);
+    this.name = "ImageAPIError";
   }
 
   /** content moderation blocked the image: HTTP 451 (relays), or an error code saying so (OpenAI: 400 moderation_blocked) */
@@ -33,7 +34,9 @@ function errorCode(body: unknown): string {
 }
 
 /** The request never got an answer: the connection failed, was refused (CORS included) or timed out. */
-export class NetworkError extends Error {}
+export class NetworkError extends Error {
+  override name = "NetworkError";
+}
 
 export interface Generation {
   images: Uint8Array[];
@@ -94,7 +97,7 @@ async function requestWithRetry(url: string, init: RequestInit, readTimeout: num
       return new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
     } catch (e) {
       if (o.signal?.aborted) throw e;
-      last = e;
+      last = timeout.signal.aborted ? new Error(`Timed out after ${H.connect_timeout + readTimeout}s`) : e;
       if (attempt < H.max_retries) {
         const wait = H.retry_backoff ** attempt;
         const kind = timeout.signal.aborted ? "Timeout" : "Connection error";
@@ -267,5 +270,11 @@ export async function testConnection(apiKey: string, baseUrl: string, o: Partial
   } catch (e) {
     throw new NetworkError(e instanceof Error ? e.message : String(e));
   }
-  if (!resp.ok) throw new ImageAPIError(`HTTP ${resp.status}: ${brief(await resp.text().catch(() => ""))}`, resp.status);
+  const text = await resp.text().catch(() => "");
+  if (!resp.ok) throw new ImageAPIError(`HTTP ${resp.status}: ${brief(text)}`, resp.status);
+  try {
+    JSON.parse(text);
+  } catch {
+    throw new ImageAPIError(`Response is not valid JSON: ${brief(text)}`, resp.status);
+  }
 }

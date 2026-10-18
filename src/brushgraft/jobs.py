@@ -214,8 +214,8 @@ class JobRunner:
                                       base_url=req.base_url)
             except pb.ImageAPIError as exc:
                 error = _error(_api_error_code(exc), str(exc), variant)
-            except requests.exceptions.RequestException as exc:
-                error = _error("network", str(exc), variant)
+            except requests.exceptions.RequestException as exc:  # named: a timeout, a proxy...
+                error = _error("network", f"{type(exc).__name__}: {exc}", variant)
             except Exception as exc:  # never let a worker exception vanish
                 error = _error("internal", f"{type(exc).__name__}: {exc}", variant)
 

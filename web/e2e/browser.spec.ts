@@ -143,7 +143,10 @@ test("a prompt near its limit shows a count, one past it says what to shorten, a
   await prompt.fill("猫".repeat(20_000));
   await expect(submit).toBeEnabled();
   await page.keyboard.press("Control+Enter");
-  await expect(page.locator(".toast.error")).toContainText("turned the prompt down as too long", { timeout: 20_000 });
+  const toast = page.locator(".toast.error");
+  await expect(toast).toContainText("longer than this model accepts (HTTP 413)", { timeout: 20_000 });
+  await expect(toast).toContainText("Shorten the instructions");
+  await expect(toast).not.toContainText("input_too_large"); // the raw body stays in the job's details
 });
 
 /** a small picture of one color, as an image file to add */
@@ -222,8 +225,13 @@ test("failures are explained in the interface's language", async ({ page }) => {
   await importPhoto(page);
   await page.locator("#prompt").fill("make it nicer");
   await page.keyboard.press("Control+Enter");
-  await expect(page.locator(".toast.error")).toContainText("content moderation", { timeout: 20_000 });
+  await expect(page.locator(".toast.error")).toContainText("content moderation (HTTP 451)", { timeout: 20_000 });
   await expect(page.locator(".tree .row")).toHaveCount(1);
+  // the Jobs list: the same explanation, and what the service sent under it
+  await page.getByRole("button", { name: "Jobs" }).click();
+  await expect(page.locator(".queue .error").first()).toContainText("Rephrase the prompt");
+  await page.locator(".queue .raw summary").first().click();
+  await expect(page.locator(".queue .raw code").first()).toContainText("HTTP 451");
 });
 
 test("a result that comes as a url is downloaded by the page", async ({ page }) => {

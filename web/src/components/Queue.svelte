@@ -61,6 +61,12 @@
         {/if}
         {#each job.errors as err, i (i)}
           <p class="error">{jobErrorText(err, job.model, app.config?.lenient_model)}</p>
+          {#if typeof err === "object" && err.detail && err.code !== "image_unreachable"}
+            <details class="raw">
+              <summary>{t("queue.raw")}</summary>
+              <code>{err.detail}</code>
+            </details>
+          {/if}
         {/each}
       </li>
     {/each}
@@ -177,9 +183,30 @@
     color: var(--danger);
   }
 
-  .error {
-    margin: 0 10px 6px calc(3.2em + 20px);
+  .raw {
+    margin-top: -4px;
+    color: var(--ink-3);
+  }
+
+  .raw summary {
+    cursor: pointer;
+    width: fit-content;
+  }
+
+  .raw code {
+    display: block;
+    margin-top: 2px;
+    max-height: 8em;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+  }
+
+  .error,
+  .raw {
+    margin: 0 10px 6px calc(5.6em + 20px); /* under the title, past the status column */
     font-size: var(--fs-s);
-    word-break: break-all;
+    overflow-wrap: anywhere;
   }
 </style>

@@ -145,6 +145,7 @@ Any web page can send requests to `127.0.0.1`, and every image costs money, so t
 
 ## Notes
 
+- A failed request says what went wrong, its code (the HTTP status, or brushgraft's own) and what to do. The Jobs list keeps the service's raw answer under it, for a report to your provider.
 - A request retried after a timeout or a gateway 524 may be billed for every attempt (at most five), since the service may have finished the earlier ones.
 - Ctrl+C waits for requests already sent and saves their results; press it again to give up on them.
 - Images over 4K (about 8.3 MP) are scaled down before sending, and reference images to about 2.4 MP; results are still pasted back at full size.

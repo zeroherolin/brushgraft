@@ -261,7 +261,7 @@ export class JobRunner {
       });
     } catch (e) {
       if (e instanceof ImageAPIError) err = error(apiErrorCode(e), e.message, variant);
-      else if (e instanceof NetworkError) err = error("network", networkDetail(e.message), variant);
+      else if (e instanceof NetworkError) err = error("network", e.message, variant);
       else if (e instanceof ApiError) err = error("api_error", e.message, variant);
       else err = error("internal", `${e instanceof Error ? e.name : "Error"}: ${e instanceof Error ? e.message : e}`, variant);
     }
@@ -323,10 +323,4 @@ export class JobRunner {
 }
 
 /** A browser's "Failed to fetch" says nothing; point at the usual causes. */
-function networkDetail(message: string): string {
-  return /failed to fetch|load failed|networkerror/i.test(message)
-    ? `${message}. Check the address in Settings, your connection, and that the service allows requests from web pages`
-    : message;
-}
-
 export type { Region };

@@ -14,6 +14,7 @@ import { fig } from "./format";
 import { regionBox, shapeBox, transformShapes, type Box } from "./geometry";
 import { regionMask } from "./imaging/shapes";
 import { i18n, t, type Key } from "./i18n.svelte";
+import { describeJobError } from "./joberror";
 import { undoKey } from "./platform";
 import { applyTheme, loadPref, savePref, type Theme } from "./prefs";
 import { ASSET_REF, type Asset, type Config, type Job, type JobError, type LogLine, type ModelInfo, type Project, type Region, type ServerEvent, type Shape, type ShapeOp, type TreeNode } from "./types";
@@ -106,23 +107,27 @@ export function errorText(e: unknown): string {
       return t(key, params);
     }
   }
+  // the image API itself (the website's connection test): explained as a job's error is
+  if (e instanceof Error && e.name === "NetworkError") return jobErrorText({ code: "network", detail: e.message, variant: "" }, "");
+  if (e instanceof Error && e.name === "ImageAPIError") return jobErrorText({ code: "api_error", detail: e.message, variant: "" }, "");
   if (e instanceof Error) return e.message;
   return String(e);
 }
 
-/** A job error in the UI language, with the API's own text appended. */
+/**
+ * A job error in the UI language: what went wrong, its code (the HTTP status, or brushgraft's
+ * code) and what to do, then what the service said when that adds something. The raw text stays
+ * in ``error.detail``.
+ */
 export function jobErrorText(error: JobError | string | undefined, model: string, lenient = ""): string {
-  if (!error) return t("jobError.unknown");
+  if (!error) return t("jobError.unknown", { code: "—" });
   if (typeof error === "string") return error; // stored before errors had codes
-  let text: string;
-  if (error.code === "moderated") {
-    text = lenient && model !== lenient ? t("jobError.moderatedTry", { model: lenient }) : t("jobError.moderated");
-  } else {
-    const key = `jobError.${error.code}`;
-    text = i18n.has(key) ? t(key) : error.code;
-  }
-  const variant = error.variant ? `[${error.variant}] ` : "";
-  return `${variant}${text}${error.detail ? ` (${error.detail})` : ""}`;
+  const { kind, code, service } = describeJobError(error);
+  const key = kind === "moderated" && lenient && model !== lenient ? "jobError.moderatedTry" : (`jobError.${kind}` as Key);
+  let text = t(key, { code, model: lenient });
+  if (kind === "image_unreachable" && error.detail) text += ` ${error.detail}`;
+  if (service) text += `${i18n.lang === "zh" ? "" : " "}${t("jobError.service", { text: service })}`;
+  return error.variant ? `[${error.variant}] ${text}` : text;
 }
 
 const undoLabel = () => undoKey;
