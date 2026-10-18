@@ -5,7 +5,8 @@ import { gzipSync } from "node:zlib";
 
 const dir = join(process.cwd(), process.argv[2] ?? "dist/assets");
 const budgets = [
-  [/^index-.*\.js$/, 100, "the page's script"],
+  // both languages' texts are in it: 100 KB until request errors were explained in full (+2.5 KB)
+  [/^index-.*\.js$/, 105, "the page's script"],
   [/^archive-.*\.js$/, 20, "project files and asset packs, loaded when used"],
   [/^worker-.*\.js$/, 30, "the image worker"],
   [/^index-.*\.css$/, 12, "the stylesheet"],
