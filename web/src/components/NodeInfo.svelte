@@ -5,6 +5,7 @@
   import { t } from "../lib/i18n.svelte";
   import { openImage } from "../lib/media";
   import type { TreeNode } from "../lib/types";
+  import JobErrors from "./JobErrors.svelte";
 
   let { node, open = false }: { node: TreeNode; open?: boolean } = $props();
   // Keep the open state here, so updates to the version (a star, a switched
@@ -15,7 +16,8 @@
   const parentVer = $derived(node.parent_id ? app.versions[node.parent_id] : "");
 </script>
 
-<details class="info" bind:open={expanded}>
+<!-- open: shown on its own (the phone sheet's details), under a heading of its own already -->
+<details class="info" class:standalone={open} bind:open={expanded}>
   <summary>{t("info.title")}</summary>
   <dl>
     <dt>{t("info.version")}</dt>
@@ -52,11 +54,16 @@
   {#if node.note}
     <p class="help note">{app.noteText(node.note)}</p>
   {/if}
+  {#if job?.errors.length}
+    <div class="failed">
+      <span class="label">{t("job.errors")}</span>
+      <JobErrors {job} />
+    </div>
+  {/if}
   {#if node.raw_image && node.merged_image}
     {@const usingRaw = node.image === node.raw_image}
-    {@const locked =
-      (app.children[node.id]?.length ?? 0) > 0 ||
-      (app.pendingJobs[node.id] ?? []).some((j) => j.status === "queued" || j.status === "running")}
+    <!-- a job still generating or failed was drawn on the adopted image: its regions must keep fitting -->
+    {@const locked = (app.children[node.id]?.length ?? 0) > 0 || (app.pendingJobs[node.id]?.length ?? 0) > 0}
     <div class="adopt">
       <span class="label" id="adopt-{node.id}">{t("info.adopt")}</span>
       <div class="segmented" role="radiogroup" aria-labelledby="adopt-{node.id}">
@@ -89,6 +96,21 @@
 </details>
 
 <style>
+  .failed {
+    margin: 8px 0 0;
+  }
+
+  .failed .label {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--ink-2);
+    font-size: var(--fs-s);
+  }
+
+  .standalone > summary {
+    display: none;
+  }
+
   .info {
     margin-top: 18px;
     padding-top: 12px;

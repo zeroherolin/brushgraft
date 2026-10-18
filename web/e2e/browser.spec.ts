@@ -62,7 +62,7 @@ async function markRegion(page: Page, [x0, y0, x1, y1]: number[]) {
 test("first run: the key stays in the browser, and connection testing says why it fails", async ({ page }) => {
   await setUp(page);
   const dialog = page.locator("dialog[open]");
-  await expect(dialog).toContainText("stays in this browser");
+  await expect(dialog).toContainText("stored in this browser");
   await expect(dialog).not.toContainText("Workspace");
   await expect(dialog.locator("legend", { hasText: "Your data" })).toBeVisible();
 
@@ -134,7 +134,7 @@ test("a prompt near its limit shows a count, one past it says what to shorten, a
   await expect(prompt).toHaveAttribute("aria-invalid", "true");
   const submit = page.locator(".submit button.primary");
   await expect(submit).toBeDisabled();
-  await expect(page.locator(".submit .hint")).toContainText("shorten what is marked in red");
+  await expect(page.locator(".submit .hint")).toContainText("shorten the fields marked in red");
   await page.keyboard.press("Control+Enter"); // the shortcut is held back too
   await page.waitForTimeout(300);
   expect((await apiLog()).filter((l) => l.prompt?.startsWith("猫"))).toHaveLength(0);
@@ -144,7 +144,7 @@ test("a prompt near its limit shows a count, one past it says what to shorten, a
   await expect(submit).toBeEnabled();
   await page.keyboard.press("Control+Enter");
   const toast = page.locator(".toast.error");
-  await expect(toast).toContainText("longer than this model accepts (HTTP 413)", { timeout: 20_000 });
+  await expect(toast).toContainText("Prompt too long for this model (HTTP 413)", { timeout: 20_000 });
   await expect(toast).toContainText("Shorten the instructions");
   await expect(toast).not.toContainText("input_too_large"); // the raw body stays in the job's details
 });
@@ -169,11 +169,11 @@ test("the asset library: any project uses an asset as a reference; history keeps
   await expect(page.locator(".toast")).toContainText("Added 2 images");
   // the same image again is the asset already there
   await library.locator("input[type=file][multiple]").setInputFiles([{ name: "again.png", mimeType: "image/png", buffer: swatch([200, 30, 30]) }]);
-  await expect(page.locator(".toast")).toContainText("“red hat” is in the asset library already");
+  await expect(page.locator(".toast")).toContainText("“red hat” is already in the asset library");
   await expect(library.locator(".grid li")).toHaveCount(2);
 
   // clicking an asset makes it a reference of the edit being prepared
-  await library.getByRole("button", { name: "red hat: Use as a reference" }).click();
+  await library.getByRole("button", { name: "red hat: Use as reference image" }).click();
   await expect(page.locator(".composer .refs")).toContainText("red hat");
   await page.locator("#prompt").fill("give her the hat of reference image 1");
   let sent = (await apiLog()).length;
@@ -188,10 +188,10 @@ test("the asset library: any project uses an asset as a reference; history keeps
   await page.locator("dialog[open] input").fill("Second");
   await page.locator("dialog[open] button[type=submit]").click();
   await expect(page.locator(".tree .row")).toHaveCount(0);
-  await library.getByRole("button", { name: "More for “blue coat”" }).click();
-  await page.getByRole("menuitem", { name: "Add to this project as a version" }).click();
+  await library.getByRole("button", { name: "Options for “blue coat”" }).click();
+  await page.getByRole("menuitem", { name: "Add to current project" }).click();
   await expect(page.locator(".tree .row")).toHaveCount(1);
-  await library.getByRole("button", { name: "red hat: Use as a reference" }).click();
+  await library.getByRole("button", { name: "red hat: Use as reference image" }).click();
   await page.locator("#prompt").fill("the hat of reference image 1");
   sent = (await apiLog()).length;
   await page.keyboard.press("Control+Enter");
@@ -201,7 +201,7 @@ test("the asset library: any project uses an asset as a reference; history keeps
 
   // deleting the asset leaves what was made with it as it was
   await library.locator(".grid li").filter({ hasText: "red hat" }).hover();
-  await library.getByRole("button", { name: "More for “red hat”" }).click();
+  await library.getByRole("button", { name: "Options for “red hat”" }).click();
   await page.getByRole("menuitem", { name: "Delete…" }).click();
   await page.locator("dialog[open] button[type=submit]").click();
   await expect(library.locator(".grid li")).toHaveCount(1);
@@ -212,8 +212,8 @@ test("the asset library: any project uses an asset as a reference; history keeps
 
   // the library as a pack: out, and back in, skipping what is there
   const download = page.waitForEvent("download");
-  await library.getByRole("button", { name: "Asset library actions" }).click();
-  await page.getByRole("menuitem", { name: "Export the asset library…" }).click();
+  await library.getByRole("button", { name: "Asset library options" }).click();
+  await page.getByRole("menuitem", { name: "Export asset library…" }).click();
   const pack = await (await download).path();
   await library.locator("input[type=file][accept*=zip]").setInputFiles(pack);
   await expect(page.locator(".toast")).toContainText("Added 0 images to the asset library; 1 already there");
@@ -229,7 +229,7 @@ test("failures are explained in the interface's language", async ({ page }) => {
   await expect(page.locator(".tree .row")).toHaveCount(1);
   // the Jobs list: the same explanation, and what the service sent under it
   await page.getByRole("button", { name: "Jobs" }).click();
-  await expect(page.locator(".queue .error").first()).toContainText("Rephrase the prompt");
+  await expect(page.locator(".queue .error").first()).toContainText("Revise the prompt");
   await page.locator(".queue .raw summary").first().click();
   await expect(page.locator(".queue .raw code").first()).toContainText("HTTP 451");
 });
@@ -253,7 +253,7 @@ test("export gives a zip without the key, and importing it makes a new project",
 
   await page.locator("header .picker").click();
   const download = page.waitForEvent("download");
-  await page.getByRole("menuitem", { name: "Export current project" }).click();
+  await page.getByRole("menuitem", { name: "Export project" }).click();
   const file = await (await download).path();
   const files = unzipSync(new Uint8Array(readFileSync(file)));
   const manifest = JSON.parse(strFromU8(files["project.json"]));
@@ -263,7 +263,7 @@ test("export gives a zip without the key, and importing it makes a new project",
 
   await page.locator("header .picker").click();
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("menuitem", { name: "Import a project" }).click();
+  await page.getByRole("menuitem", { name: "Import project" }).click();
   await (await chooser).setFiles(file);
   await expect(page.locator(".tree .row")).toHaveCount(2);
   await page.waitForTimeout(150);
@@ -276,9 +276,9 @@ test("a file that isn't a project is refused with a reason, and nothing is added
   await saveKey(page);
   await page.locator("header .picker").click();
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("menuitem", { name: "Import a project" }).click();
+  await page.getByRole("menuitem", { name: "Import project" }).click();
   await (await chooser).setFiles({ name: "x.zip", mimeType: "application/zip", buffer: Buffer.from("not a zip") });
-  await expect(page.locator(".toast.error")).toContainText("isn't a brushgraft project file");
+  await expect(page.locator(".toast.error")).toContainText("Not a brushgraft project file");
   await page.waitForTimeout(150);
   await page.locator("header .picker").click();
   await expect(page.getByRole("menuitemradio")).toHaveCount(1);
@@ -720,6 +720,7 @@ test("a job still generating opens from the tree: the original with its regions,
   await expect(page.locator(".caption .job-state")).toHaveText(/Queued|Generating/);
   await expect(page.locator(".tip")).toContainText("regions of this edit");
   await expect(page.getByRole("button", { name: "Rectangle" })).toBeDisabled(); // nothing is edited here
+  await expect(page.locator(".tree .row").first().locator("button.select")).toHaveAttribute("aria-current", "false");
   // when it's done, its result shows
   await expect(page.locator(".tree .row")).toHaveCount(2, { timeout: 20_000 });
   await expect(panel).toHaveCount(0);
@@ -730,7 +731,7 @@ test("a job still generating opens from the tree: the original with its regions,
   await page.locator("#prompt").fill("a lighthouse at dusk");
   await page.keyboard.press("Control+Enter");
   await page.locator(".tree li.pending button.select").click();
-  await expect(page.locator(".welcome .lead")).toHaveText("Generating a new image");
+  await expect(page.locator(".welcome .lead")).toHaveText("Generating new image…");
   await expect(page.locator(".welcome .job-prompt")).toHaveText("a lighthouse at dusk");
   await expect(panel.locator(".made")).toContainText("a lighthouse at dusk");
   await expect(page.locator(".tree .row")).toHaveCount(3, { timeout: 20_000 });
@@ -746,13 +747,14 @@ test("a failed job opens from the tree: the whole explanation, the service's ans
   const panel = page.getByRole("complementary", { name: "Job" });
   const failed = page.locator(".tree li.pending.failed");
   await expect(failed).toContainText("Blocked by content moderation (HTTP 451)", { timeout: 20_000 });
-  await expect(failed).not.toContainText("Rephrase"); // one line: what went wrong; the rest is a click away
+  await expect(failed).not.toContainText("Revise"); // one line: what went wrong; the rest is a click away
   await failed.locator("button.select").click();
   await expect(panel.locator(".state")).toHaveText("Failed");
-  await expect(panel.locator(".errors")).toContainText("Rephrase the prompt");
+  await expect(panel.locator(".errors")).toContainText("Revise the prompt");
   await panel.locator(".raw summary").click();
   await expect(panel.locator(".raw code")).toContainText("HTTP 451");
   await expect(panel.locator(".log")).toContainText("HTTP 451");
+  await expect(panel.locator(".log li").first()).toContainText("Requesting fail-451");
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
   await failed.locator("button.select").click();
@@ -766,7 +768,7 @@ test("the version tree's column is as wide as its edge is dragged", async ({ pag
   await saveKey(page);
   const side = page.locator(".side");
   const before = (await side.boundingBox())!.width;
-  const grip = page.getByRole("separator", { name: "Resize the version tree" });
+  const grip = page.getByRole("separator", { name: "Resize version tree" });
   const box = (await grip.boundingBox())!;
   await drag(page, [[box.x + 4, box.y + 200], [box.x + 124, box.y + 200]]);
   await expect.poll(async () => Math.round((await side.boundingBox())!.width)).toBe(Math.round(before + 120));
@@ -775,4 +777,23 @@ test("the version tree's column is as wide as its edge is dragged", async ({ pag
   await expect.poll(async () => Math.round((await side.boundingBox())!.width)).toBe(Math.round(before + 100));
   await page.reload();
   await expect.poll(async () => Math.round((await page.locator(".side").boundingBox())!.width)).toBe(Math.round(before + 100));
+});
+
+test("watching one job, another finishing under the same version doesn't take the view away", async ({ page }) => {
+  await setUp(page, "slow");
+  await saveKey(page);
+  await importPhoto(page);
+  await page.locator("#prompt").fill("make it warmer");
+  await page.keyboard.press("Control+Enter"); // slow: 2 s
+  await page.locator("#custom-model").fill("quick");
+  await page.locator("#prompt").fill("make it cooler");
+  await page.keyboard.press("Control+Enter"); // 0.3 s
+  await page.locator(".tree li.pending button.select", { hasText: "make it warmer" }).click();
+  const panel = page.getByRole("complementary", { name: "Job" });
+  await expect(panel.locator(".made")).toContainText("make it warmer");
+  await expect(page.locator(".tree .row")).toHaveCount(2, { timeout: 20_000 }); // the quick one is done
+  await expect(panel.locator(".made")).toContainText("make it warmer"); // still watching the slow one
+  await expect(page.locator(".tree .row")).toHaveCount(3, { timeout: 20_000 });
+  await expect(panel).toHaveCount(0);
+  await expect(page.locator(".caption .text")).toHaveText("make it warmer"); // and its result shows
 });

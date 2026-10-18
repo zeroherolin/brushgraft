@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, brushStep, type Layout } from "./lib/app.svelte";
+  import { app, brushStep, SIDE_DEFAULT, SIDE_MAX, SIDE_MIN, type Layout } from "./lib/app.svelte";
   import { dialogs } from "./lib/dialogs.svelte";
   import { forControl, typingIn } from "./lib/keys";
   import { t } from "./lib/i18n.svelte";
@@ -94,7 +94,7 @@
       return;
     }
     if (e.shiftKey && !e.key.startsWith("Arrow")) return;
-    if (key === "c" && app.parentNode) {
+    if (key === "c" && app.parentNode && !app.viewedJob) {
       app.compare = !app.compare;
     } else if (key === "[" || key === "]") {
       app.brushSize = brushStep(app.brushSize, key === "]" ? 1 : -1);
@@ -110,6 +110,9 @@
       const step = e.shiftKey ? 10 : 1;
       const d: Record<string, [number, number]> = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
       app.nudge(...d[e.key]);
+    } else if (e.key.startsWith("Arrow") && !e.shiftKey && app.viewedJob) {
+      // a job's row sits under the version it was made from: up goes back there
+      if (e.key === "ArrowUp" || e.key === "ArrowLeft") app.closeJob();
     } else if (e.key.startsWith("Arrow") && !e.shiftKey) {
       navigate(e.key);
     } else {
@@ -174,10 +177,13 @@
   const hasFiles = (e: DragEvent) => e.dataTransfer?.types.includes("Files") ?? false;
 
   // -- the version tree's width, by its right edge -----------------------------------
+  let windowWidth = $state(window.innerWidth);
+  const sideShown = $derived(Math.max(SIDE_MIN, Math.min(app.sideWidth, windowWidth - 760)));
+
   function sideResizeStart(e: PointerEvent) {
     const grip = e.currentTarget as HTMLElement;
     const start = e.clientX;
-    const from = app.sideWidth;
+    const from = sideShown;
     grip.setPointerCapture(e.pointerId);
     const move = (ev: PointerEvent) => app.setSideWidth(from + ev.clientX - start);
     const up = () => {
@@ -192,14 +198,15 @@
 
   function sideResizeKey(e: KeyboardEvent) {
     const step = e.shiftKey ? 60 : 20;
-    if (e.key === "ArrowRight") app.setSideWidth(app.sideWidth + step);
-    else if (e.key === "ArrowLeft") app.setSideWidth(app.sideWidth - step);
+    if (e.key === "ArrowRight") app.setSideWidth(sideShown + step);
+    else if (e.key === "ArrowLeft") app.setSideWidth(sideShown - step);
     else return;
     e.preventDefault();
   }
 </script>
 
 <svelte:window
+  bind:innerWidth={windowWidth}
   onkeydown={onKeydown}
   onpaste={onPaste}
   ondragenter={(e) => {
@@ -252,11 +259,13 @@
             role="separator"
             aria-orientation="vertical"
             aria-label={t("app.resizeSide")}
-            aria-valuenow={app.sideWidth}
+            aria-valuenow={sideShown}
+            aria-valuemin={SIDE_MIN}
+            aria-valuemax={Math.max(SIDE_MIN, Math.min(SIDE_MAX, windowWidth - 760))}
             tabindex="0"
             onpointerdown={sideResizeStart}
             onkeydown={sideResizeKey}
-            ondblclick={() => app.setSideWidth(276)}
+            ondblclick={() => app.setSideWidth(SIDE_DEFAULT)}
           ></div>
         </div>
       {/if}
@@ -337,6 +346,7 @@
     right: -4px;
     width: 8px;
     cursor: col-resize;
+    touch-action: none; /* a drag on a touch screen resizes; it doesn't scroll */
     z-index: 3;
   }
 

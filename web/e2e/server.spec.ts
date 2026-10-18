@@ -63,7 +63,7 @@ test("server mode: an edit is pasted back, and a project round-trips through a z
   await page.locator("dialog[open] input").press("Enter");
   await page.locator("header .picker").click();
   const download = page.waitForEvent("download");
-  await page.getByRole("menuitem", { name: "Export current project" }).click();
+  await page.getByRole("menuitem", { name: "Export project" }).click();
   expect((await download).suggestedFilename()).toBe("brushgraft-小猫_测试.zip");
   const file = await (await download).path();
   const manifest = JSON.parse(strFromU8(unzipSync(new Uint8Array(readFileSync(file)))["project.json"]));
@@ -72,7 +72,7 @@ test("server mode: an edit is pasted back, and a project round-trips through a z
 
   await page.locator("header .picker").click();
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("menuitem", { name: "Import a project" }).click();
+  await page.getByRole("menuitem", { name: "Import project" }).click();
   await (await chooser).setFiles(file);
   await expect(page.locator(".toast")).toContainText("Imported");
   await expect(page.locator(".tree .row")).toHaveCount(2);
@@ -123,7 +123,7 @@ test("server mode: the asset library works as in the browser build", async ({ pa
   await library.locator("input[type=file][multiple]").setInputFiles({ name: "green scarf.png", mimeType: "image/png", buffer: PNG.sync.write(swatch) });
   await expect(library.locator(".grid li")).toHaveCount(1);
   await page.locator(".tree .row").first().locator(".select").click();
-  await library.getByRole("button", { name: "green scarf: Use as a reference" }).click();
+  await library.getByRole("button", { name: "green scarf: Use as reference image" }).click();
   await expect(page.locator(".composer .refs")).toContainText("green scarf");
   await page.locator("#prompt").fill("add the scarf of reference image 1");
   await page.keyboard.press("Control+Enter");
@@ -137,7 +137,7 @@ test("server mode: the asset library works as in the browser build", async ({ pa
     .not.toBeNull();
   const assets = await page.evaluate(async () => (await fetch("/api/assets")).json());
   await library.locator(".grid li").hover();
-  await library.getByRole("button", { name: "More for “green scarf”" }).click();
+  await library.getByRole("button", { name: "Options for “green scarf”" }).click();
   await page.getByRole("menuitem", { name: "Delete…" }).click();
   await page.locator("dialog[open] button[type=submit]").click();
   await expect(library.locator(".grid li")).toHaveCount(0);

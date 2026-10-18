@@ -1223,7 +1223,7 @@
   const tip = $derived.by((): string => {
     if (viewing) return node && madeWith.length ? t(viewing.status === "failed" ? "canvas.jobFailedTip" : "canvas.jobTip") : "";
     if (!node || comparing) return "";
-    if (madeWith.length && editing) return t("canvas.madeWithTip", { fig: fig(app.parentNode ? app.versions[app.parentNode.id] : "") });
+    if (madeWith.length && editing) return t("canvas.madeWithTip");
     if (!editing) return "";
     if (app.tool === "polygon" && (poly || !app.draft.regions.length)) return t(coarse ? "canvas.tipPolygonTouch" : "canvas.tipPolygon");
     if (app.tool === "select" && handleBox && !coarse) return t("canvas.tipTransform", { alt: altKey });

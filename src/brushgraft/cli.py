@@ -134,8 +134,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"brushgraft: {exc}")
     store = Store(home)
     if recovered := store.recover_interrupted():
-        print(f"{recovered} job(s) didn't finish last time and were marked "
-              "as interrupted", file=sys.stderr)
+        print(f"{recovered} unfinished job(s) from the last run marked as interrupted",
+              file=sys.stderr)
     store.collect_garbage()
     settings = Settings((args.env_file or home / ".env").expanduser())
     token = load_or_create_token(home)
@@ -153,8 +153,7 @@ def main(argv: list[str] | None = None) -> None:
     if network_url:
         print(f"  network    {network_url}")
     if not settings.api_key:
-        print(f"  No API key yet: add it in the web UI's Settings, "
-              f"or write it to {settings.env_file}")
+        print(f"  API key not set: add it in Settings in the web UI, or in {settings.env_file}")
     print("Press Ctrl+C to quit", flush=True)
 
     server = _Server(uvicorn.Config(app, log_level="warning",
@@ -172,8 +171,8 @@ def main(argv: list[str] | None = None) -> None:
     if active := app.state.runner.active:
         # Requests already sent are most likely billed: their results get saved first, with
         # the workspace still locked (a second instance would mark the jobs interrupted)
-        print(f"Waiting for {active} request(s) in flight to finish and be "
-              "saved... (press Ctrl+C again to give up)", file=sys.stderr, flush=True)
+        print(f"Waiting for {active} request(s) in progress to finish and be saved… "
+              "(press Ctrl+C again to discard them)", file=sys.stderr, flush=True)
         try:
             app.state.runner.wait()
         except KeyboardInterrupt:

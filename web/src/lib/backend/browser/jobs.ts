@@ -322,5 +322,4 @@ export class JobRunner {
   }
 }
 
-/** A browser's "Failed to fetch" says nothing; point at the usual causes. */
 export type { Region };

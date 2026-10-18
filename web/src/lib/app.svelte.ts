@@ -34,8 +34,13 @@ export interface Draft {
 const NEW_DRAFT = "__new__";
 const LOG_LIMIT = 200;
 /** the version tree's column: narrower and the titles are gone, wider and the canvas is */
-const SIDE_MIN = 220;
-const SIDE_MAX = 520;
+export const SIDE_MIN = 220;
+export const SIDE_MAX = 520;
+export const SIDE_DEFAULT = 276;
+/** the widest the tree can be in this window: the canvas keeps at least about 430px */
+export const sideRoom = () => (typeof window === "undefined" ? SIDE_MAX : window.innerWidth - 760);
+const clampSide = (width: unknown) =>
+  typeof width === "number" && Number.isFinite(width) ? Math.round(Math.max(SIDE_MIN, Math.min(SIDE_MAX, width))) : SIDE_DEFAULT;
 const MAX_REFS = 8;
 const UNDO_LIMIT = 100;
 const TOOLS: Tool[] = ["select", "rect", "ellipse", "lasso", "polygon", "brush", "eraser"];
@@ -123,7 +128,7 @@ export function errorText(e: unknown): string {
  * in ``error.detail``.
  */
 export function jobErrorText(error: JobError | string | undefined, model: string, lenient = "", brief = false): string {
-  if (!error) return t("jobError.unknown", { code: "—" });
+  if (!error) return brief ? t("jobError.unknown", { code: "—" }).replace(/[。.]$/, "") : t("jobError.unknown", { code: "—" });
   if (typeof error === "string") return error; // stored before errors had codes
   const { kind, code, service } = describeJobError(error);
   const key = kind === "moderated" && lenient && model !== lenient ? "jobError.moderatedTry" : (`jobError.${kind}` as Key);
@@ -312,10 +317,10 @@ class AppState {
   assets = $state<Asset[]>([]);
   assetById = $derived(Object.fromEntries(this.assets.map((a) => [a.id, a])));
   /** the version tree's column, in px (dragged by its edge) */
-  sideWidth = $state(Math.max(SIDE_MIN, Math.min(SIDE_MAX, loadPref("sideWidth", 276))));
+  sideWidth = $state(clampSide(loadPref("sideWidth", SIDE_DEFAULT)));
 
   setSideWidth(width: number): void {
-    this.sideWidth = Math.round(Math.max(SIDE_MIN, Math.min(SIDE_MAX, width)));
+    this.sideWidth = clampSide(Math.min(width, sideRoom()));
     savePref("sideWidth", this.sideWidth);
   }
 
@@ -455,7 +460,8 @@ class AppState {
 
   #apply(ev: ServerEvent): void {
     if (ev.type === "log") {
-      const list = (this.logs[ev.job_id] ??= []);
+      this.logs[ev.job_id] ??= [];
+      const list = this.logs[ev.job_id]; // the stored proxy: ??= returns the plain array
       list.push({ t: ev.t, level: ev.level, msg: ev.msg });
       if (list.length > LOG_LIMIT) list.splice(0, list.length - LOG_LIMIT);
       return;
@@ -500,10 +506,11 @@ class AppState {
     // the result, unless the next edit is already under way there (don't pull the user away from it)
     const next = this.drafts[job.parent_id ?? NEW_DRAFT];
     const busy = this.polygonOpen || this.gestureOpen;
-    const here = this.selectedId === job.parent_id && this.draftKey === (job.parent_id ?? NEW_DRAFT);
+    const here = !this.jobId && this.selectedId === job.parent_id && this.draftKey === (job.parent_id ?? NEW_DRAFT);
     const watching = this.jobId === job.id;
     if (results.length && (watching || (here && !this.compare && isEmpty(next) && !busy))) {
       this.select(results[0].id);
+      if (watching && this.layout === "narrow") this.sheetOpen = false; // the result, not the next edit's panel
     }
   }
 
@@ -642,15 +649,19 @@ class AppState {
     this.select(job.parent_id && this.nodes[job.parent_id] ? job.parent_id : null);
     this.jobId = job.id;
     if (this.layout === "narrow") this.sheetOpen = false;
-    // the lines logged before this page connected are on the server (for as long as it runs)
-    if (!this.logs[job.id]?.length) {
-      backend
-        .logs(job.id)
-        .then((lines) => {
-          if (lines.length && !this.logs[job.id]?.length) this.logs[job.id] = lines.slice(-LOG_LIMIT);
-        })
-        .catch(() => {});
-    }
+    // the lines logged before this page connected (or by another tab) are on the server, for as
+    // long as it runs: those first, then the live ones that came after them
+    const id = job.id;
+    backend
+      .logs(id)
+      .then((stored) => {
+        if (!stored.length) return;
+        const key = (l: LogLine) => `${l.t}|${l.msg}`;
+        const seen = new Set(stored.map(key));
+        const live = (this.logs[id] ?? []).filter((l) => !seen.has(key(l)));
+        this.logs[id] = [...stored, ...live].sort((a, b) => a.t - b.t).slice(-LOG_LIMIT);
+      })
+      .catch(() => {});
   }
 
   /** back from a job to the version it was made from (or to nothing) */
@@ -665,7 +676,8 @@ class AppState {
 
   /** the current draft, stored in drafts so it can be modified in place */
   get editable(): Draft {
-    return (this.drafts[this.draftKey] ??= emptyDraft());
+    this.drafts[this.draftKey] ??= emptyDraft();
+    return this.drafts[this.draftKey]; // the stored proxy, which changes show through
   }
 
   // -- regions: every change can be undone (and redone) ------------------------
@@ -844,6 +856,7 @@ class AppState {
 
   /** Use a version (its id) or an asset ("asset:" + its id) as a reference in the current draft, or stop. */
   toggleRef(ref: string): void {
+    if (this.viewedJob) this.closeJob();
     const draft = this.editable;
     const i = draft.refs.indexOf(ref);
     if (i < 0 && this.mode === "edit" && ref === this.selectedId) {
@@ -1225,7 +1238,8 @@ class AppState {
       delete this.jobs[job.id];
       if (this.jobId === job.id) this.jobId = null;
     } catch (e) {
-      this.notify(errorText(e), true);
+      if (e instanceof ApiError && e.code === "not_found") delete this.jobs[job.id]; // gone already
+      else this.notify(errorText(e), true);
     }
   }
 

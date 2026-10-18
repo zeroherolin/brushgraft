@@ -24,7 +24,7 @@
 
 {#if app.sheetOpen}
   <div class="scrim" role="presentation" onclick={() => (app.sheetOpen = false)}></div>
-  <div class="sheet" role="dialog" aria-modal="true" aria-label={t("composer.label")}>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label={app.viewedJob ? t("job.label") : t("composer.label")}>
     <div class="sheet-head">
       <span class="grip" aria-hidden="true"></span>
       {#if app.selected && !app.viewedJob}

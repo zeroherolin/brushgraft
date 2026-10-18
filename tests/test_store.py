@@ -206,6 +206,10 @@ class TestTree:
             store.update_node(node["id"], use_raw=True)
         assert exc.value.code == "has_successors"
         store.record_attempt(job["id"], ok=False)
+        with pytest.raises(UserError) as exc:  # and a failed one, still there to retry
+            store.update_node(node["id"], use_raw=True)
+        assert exc.value.code == "has_successors"
+        store.delete_job(job["id"])
         store.update_node(node["id"], use_raw=True)
         store.add_node(project_id=p, image=merged, parent_id=node["id"])
         with pytest.raises(UserError) as exc:

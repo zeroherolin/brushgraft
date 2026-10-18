@@ -403,13 +403,13 @@ export class BrowserStore {
         if (!(node.raw_image && node.merged_image)) {
           throw userError("no_alternative", "This version wasn't pasted back, so there is nothing to switch to");
         }
-        // Later versions (finished or still generating) were made from the adopted image;
-        // swapping it would break that link.
+        // Later versions, and jobs still generating or failed (to retry), were made from the
+        // adopted image: swapping it would break that link, and their regions would no longer fit
         const children = await done(nodes.index("parent_id").count(id));
         const jobs = await done<JobRow[]>(tx.objectStore("jobs").index("project_id").getAll(node.project_id));
-        const active = jobs.some((j) => j.parent_id === id && ACTIVE.has(j.status));
+        const active = jobs.some((j) => j.parent_id === id && j.status !== "done");
         if (children || active) {
-          throw userError("has_successors", "This version already has later versions, so its adopted image can no longer change");
+          throw userError("has_successors", "This version has later versions or unfinished jobs; its image can no longer change");
         }
         node.image = p.useRaw ? node.raw_image : node.merged_image;
         const info = await done<ImageRow | undefined>(tx.objectStore("images").get(node.image));

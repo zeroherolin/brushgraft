@@ -105,7 +105,7 @@ Environment variables win over `.env`. promptbrush's `PROMPTBRUSH_*` variables w
 1. Drop, paste or import an image, or switch to New image to start from a prompt.
 2. Mark regions on the canvas, write an instruction for each, and press <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + <kbd>Enter</kbd>. Each new shape makes a new region (a brush stroke that starts in the selected region adds to it, as Photoshop's Quick Selection brush does); to change the selected one instead, hold <kbd>Shift</kbd> (add), <kbd>Alt</kbd>/<kbd>⌥</kbd> (subtract) or both (intersect), or pick the mode beside the tools. Tools with a small triangle have a second variant: right-click or press and hold.
 3. The regions clear once sent, so the next edit of the same version starts fresh (Restore draft in the notice brings them back). Results appear in the tree; select any version to keep editing from it.
-4. Each result shows what it was made with: Run again for more variants, or Reuse settings to adjust. If the paste-back isn't right, switch to the model's whole output under Version details.
+4. Each result shows what it was made with: Run again for more variants, or Reuse settings to adjust. If the paste-back isn't right, switch to the model's whole output under Version details. A job still generating, or failed, opens from its row in the tree, with its request, log and error.
 5. To delete a version and everything made from it, use the trash icon under the canvas or on its row in the tree.
 
 The text brushgraft wraps around your instructions follows the UI language, so write instructions in that language.
@@ -137,7 +137,7 @@ The asset library moves the same way, from the **⋯** menu of its panel: **Expo
 
 ## Data and security
 
-**On the website**, your projects and asset library live in this browser's IndexedDB and your key in its local storage (or session storage if you turn off "Remember the key on this device"). The site is static files: it has no server side to send them to, and its Content-Security-Policy only lets the page talk to itself, to `https:` services and to a service on this computer (`localhost`, `127.0.0.1`). Clearing the site's data deletes projects and the asset library, so export what you care about; Settings can also ask the browser to keep the data (storage persistence).
+**On the website**, your projects and asset library live in this browser's IndexedDB and your key in its local storage (or session storage if you turn off "Remember key on this device"). The site is static files: it has no server side to send them to, and its Content-Security-Policy only lets the page talk to itself, to `https:` services and to a service on this computer (`localhost`, `127.0.0.1`). Clearing the site's data deletes projects and the asset library, so export what you care about; Settings can also ask the browser to keep the data (storage persistence).
 
 **On your computer**, everything lives in the workspace: `brushgraft.sqlite3` holds projects, version trees and the asset library, `images/` holds every image named by its SHA-256, and `thumbs/` is a disposable cache. Copy the directory to back it up. Only one brushgraft can use a workspace at a time.
 
@@ -145,9 +145,9 @@ Any web page can send requests to `127.0.0.1`, and every image costs money, so t
 
 ## Notes
 
-- A failed request says what went wrong, its code (the HTTP status, or brushgraft's own) and what to do. The Jobs list keeps the service's raw answer under it, for a report to your provider.
+- A failed request says what went wrong, its code (the HTTP status, or brushgraft's own) and what to do. The job's details (and the Jobs list) keep the service's raw answer, for a report to your provider.
 - A request retried after a timeout or a gateway 524 may be billed for every attempt (at most five), since the service may have finished the earlier ones.
-- Ctrl+C waits for requests already sent and saves their results; press it again to give up on them.
+- Ctrl+C waits for requests already sent and saves their results; press it again to discard them.
 - Images over 4K (about 8.3 MP) are scaled down before sending, and reference images to about 2.4 MP; results are still pasted back at full size.
 - The overall request and each region's instruction can have up to 30,000 characters, and everything sent together up to 40,000; a counter appears as you near the limit. Models allow less: measured, gpt-image-2 takes about 17,000 Chinese or 39,000 English characters, Gemini models more than 60,000. When a model turns a prompt down as too long, the error says so.
 - On the website, results above about 36 MP are kept as the model's whole output instead of being pasted back, so a phone doesn't run out of memory.

@@ -48,13 +48,16 @@
     for (const n of branches) if (!app.lineageIds.has(n.id)) collapsed.add(n.id);
   }
 
-  // Expand ancestors that hide the selected version, and scroll it into view
+  // Expand ancestors that hide the selected version, and scroll it into view; for a job on screen,
+  // the version it was made from opens too, to show the job's row under it
   $effect(() => {
     const id = app.selectedId;
-    if (!id) return;
-    for (const node of app.lineage.slice(0, -1)) collapsed.delete(node.id);
+    const job = app.jobId;
+    if (!id && !job) return;
+    for (const node of job ? app.lineage : app.lineage.slice(0, -1)) collapsed.delete(node.id);
     requestAnimationFrame(() => {
-      document.querySelector(`[data-node="${id}"]`)?.scrollIntoView({ block: "nearest" });
+      const row = job ? `[data-job="${job}"]` : `[data-node="${id}"]`;
+      document.querySelector(row)?.scrollIntoView({ block: "nearest" });
     });
   });
 </script>

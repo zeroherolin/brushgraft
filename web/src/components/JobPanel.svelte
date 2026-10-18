@@ -82,6 +82,7 @@
     </section>
   </div>
 
+  {#if parent || !active}
   <div class="submit">
     {#if parent}
       <button onclick={() => app.select(parent.id)}>{t("job.backTo", { fig: fig(app.versions[parent.id]) })}</button>
@@ -90,6 +91,7 @@
       <button class="danger" onclick={() => app.dismissJob(job)}>{t("tree.dismiss")}</button>
     {/if}
   </div>
+  {/if}
 </aside>
 
 <style>

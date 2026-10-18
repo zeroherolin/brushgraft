@@ -46,6 +46,11 @@ class I18n {
     return this.lang === "zh" ? (zhModelNotes[name] ?? english) : english;
   }
 
+  /** A model's measured time, "25–45s", in the UI language ("25–45 秒"). */
+  modelSeconds(english: string): string {
+    return this.lang === "zh" ? english.replace(/s$/, " 秒") : english;
+  }
+
   get locale(): string {
     return this.lang === "zh" ? "zh-CN" : "en";
   }

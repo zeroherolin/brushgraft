@@ -26,16 +26,18 @@ const SERVICE_MAX = 120;
 
 function byStatus(status: number, body: string): Kind {
   if (status === 401) return "auth";
-  if (status === 402) return "payment";
+  // OpenAI answers 429 insufficient_quota when the credit is gone: no wait will help
+  if (status === 402 || (status === 429 && /insufficient_quota|exceeded your current quota|billing|余额|额度/i.test(body))) return "payment";
   if (status === 403) return "forbidden";
-  if (status === 404) return "notFound";
+  if (status === 404 || status === 405) return "notFound"; // 405: an address that isn't the images API
+  if (status === 408) return "timeout";
   if (status === 413) return "tooLong";
   if (status === 429) return "rateLimited";
   if (status === 451) return "moderated";
   if (status === 524) return "timeout524";
   if (status >= 520 && status <= 527) return "cloudflare";
   // the usual relay (one-api / new-api) when no upstream serves the model right now
-  if (status === 503 && /no available channel/i.test(body)) return "noChannel";
+  if (status === 503 && /no available channel|无可用渠道|没有可用.{0,6}渠道/i.test(body)) return "noChannel";
   if (status === 502 || status === 503 || status === 504) return "unavailable";
   if (status >= 500) return "server";
   if (status >= 400) return "badRequest";
@@ -46,7 +48,7 @@ function byStatus(status: number, body: string): Kind {
 function networkKind(detail: string): Kind {
   if (/timed? ?out|timeout|aborted without reason|operation was aborted/i.test(detail)) return "timeout";
   if (/failed to resolve|name or service not known|nodename nor servname|getaddrinfo|ENOTFOUND|name resolution/i.test(detail)) return "dns";
-  if (/\bSSL|certificate|TLS/i.test(detail)) return "tls";
+  if (/\bSSL|certificate|\bTLS\b/i.test(detail)) return "tls";
   if (/proxy/i.test(detail)) return "proxy";
   if (/failed to fetch|load failed|networkerror when attempting/i.test(detail)) return "fetch";
   return "connect";
@@ -82,8 +84,9 @@ function messageIn(body: string, depth = 0): string {
       }
       return found;
     } catch {
-      // cut short when it was stored: take the first message by hand
-      const m = text.match(/"message"\s*:\s*"((?:[^"\\]|\\.)+)"/);
+      // cut short when it was stored, or written the Python way ({'message': '...'}): take the
+      // first message by hand
+      const m = text.match(/"message"\s*:\s*"((?:[^"\\]|\\.)+)"/) ?? text.match(/'message'\s*:\s*'((?:[^'\\]|\\.)+)'/);
       return m ? unescape(m[1]) : "";
     }
   }

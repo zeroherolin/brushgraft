@@ -200,8 +200,8 @@
       {/if}
       <p class="help indent">
         {#if model}{@const note = i18n.modelNote(model.name, model.note)}{note
-            ? t("composer.modelHelp", { seconds: model.seconds, note })
-            : model.seconds}{:else}{t("composer.unknownModel")}{/if}
+            ? t("composer.modelHelp", { seconds: i18n.modelSeconds(model.seconds), note })
+            : i18n.modelSeconds(model.seconds)}{:else}{t("composer.unknownModel")}{/if}
       </p>
 
       {#if !editing}

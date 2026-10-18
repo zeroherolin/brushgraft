@@ -97,6 +97,15 @@ describe("versions", () => {
     expect(await code(store.updateNode(child.id, { useRaw: true }))).toBe("has_successors");
   });
 
+  it("keeps the image a failed job was drawn on until that job is removed", async () => {
+    const { child, p } = await tree();
+    const job = await store.createJob(jobFor(p.id, child.id));
+    await store.recordAttempt(job.id, { ok: false });
+    expect(await code(store.updateNode(child.id, { useRaw: true }))).toBe("has_successors");
+    await store.deleteJob(job.id);
+    expect((await store.updateNode(child.id, { useRaw: true })).raw_image).toBeTruthy();
+  });
+
   it("refuses a job prepared from an image the version no longer uses", async () => {
     // the switch came while the request was being prepared, before the job existed to stop it
     const { child, p, img, other } = await tree();

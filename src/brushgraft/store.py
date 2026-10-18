@@ -450,18 +450,19 @@ class Store:
                                 "This version wasn't pasted back, so there is "
                                 "nothing to switch to")
             with self._lock:
-                # Later versions (finished or still generating) were made from
-                # the adopted image; swapping it would break that link.
+                # Later versions, and jobs still generating or failed (to retry), were made
+                # from the adopted image: swapping it would break that link, and their regions
+                # would no longer fit
                 children = self._db.execute(
                     "SELECT COUNT(*) FROM nodes WHERE parent_id = ?",
                     (node_id,)).fetchone()[0]
                 active = self._db.execute(
                     "SELECT COUNT(*) FROM jobs WHERE parent_id = ? "
-                    "AND status IN ('queued', 'running')", (node_id,)).fetchone()[0]
+                    "AND status != 'done'", (node_id,)).fetchone()[0]
                 if children or active:
                     raise UserError("has_successors",
-                                    "This version already has later versions, so "
-                                    "its adopted image can no longer change")
+                                    "This version has later versions or unfinished jobs; "
+                                    "its image can no longer change")
                 self._db.execute(
                     "UPDATE nodes SET image = ? WHERE id = ?",
                     (node["raw_image"] if use_raw else node["merged_image"],

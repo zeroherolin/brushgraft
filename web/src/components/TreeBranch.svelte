@@ -51,7 +51,7 @@
       <div
         class="row"
         data-node={node.id}
-        class:selected={app.selectedId === node.id}
+        class:selected={app.selectedId === node.id && !app.viewedJob}
         class:on-path={app.lineageIds.has(node.id)}
       >
         {#if kids}
@@ -66,7 +66,7 @@
         {:else}
           <span class="twisty" aria-hidden="true"></span>
         {/if}
-        <button class="select" aria-current={app.selectedId === node.id} onclick={() => app.select(node.id)}>
+        <button class="select" aria-current={app.selectedId === node.id && !app.viewedJob} onclick={() => app.select(node.id)}>
           <img class="thumb" {@attach thumb(node.image)} alt="" loading="lazy" decoding="async" width="40" height="40" />
           <span class="text">
             <span class="line1">
@@ -117,7 +117,7 @@
   {#each pending as job (job.id)}
     {@const failed = job.status === "failed"}
     <li class="pending" class:failed>
-      <div class="jobrow" class:selected={app.jobId === job.id}>
+      <div class="jobrow" data-job={job.id} class:selected={app.jobId === job.id}>
         <span class="twisty" aria-hidden="true"></span>
         <button class="select" aria-current={app.jobId === job.id} title={describeJob(job)} onclick={() => app.openJob(job)}>
           <span class="thumb placeholder" aria-hidden="true">

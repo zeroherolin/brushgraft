@@ -30,6 +30,19 @@ describe("errors from the image API", () => {
     });
   });
 
+  it("tells credit that ran out from a rate limit, and reads the address statuses", () => {
+    const quota = api('HTTP 429: {"error":{"message":"You exceeded your current quota, please check your plan.","code":"insufficient_quota"}}');
+    expect(quota).toEqual({ kind: "payment", code: "HTTP 429", service: "You exceeded your current quota, please check your plan." });
+    expect(api('HTTP 429: {"error":{"message":"Rate limit reached"}}').kind).toBe("rateLimited");
+    expect(api("HTTP 405: Method Not Allowed").kind).toBe("notFound");
+    expect(api("HTTP 408: Request Timeout").kind).toBe("timeout");
+    expect(api('HTTP 503: {"error":{"message":"当前分组无可用渠道"}}').kind).toBe("noChannel");
+  });
+
+  it("reads a message written the Python way", () => {
+    expect(api("API returned an error: {'message': 'model overloaded', 'type': 'server_error'}").service).toBe("model overloaded");
+  });
+
   it("passes on what the service said when it explains the refusal, without its request id", () => {
     const d = api('HTTP 400: {"error":{"message":"Invalid size \'1000x1000\' (request id: abc123)","type":"invalid_request_error"}}');
     expect(d).toEqual({ kind: "badRequest", code: "HTTP 400", service: "Invalid size '1000x1000'" });
@@ -83,6 +96,7 @@ describe("network failures", () => {
     expect(net("ConnectionError: ('Connection aborted.', TimeoutError('The write operation timed out'))").kind).toBe("timeout");
     expect(net("ConnectionError: Failed to resolve 'api.exmaple.com' ([Errno 8] nodename nor servname provided)").kind).toBe("dns");
     expect(net("SSLError: HTTPSConnectionPool(host='x', port=443): Max retries exceeded (Caused by SSLError(SSLEOFError(8, 'EOF')))").kind).toBe("tls");
+    expect(net("ConnectionError: HTTPSConnectionPool(host='images.mytlsgateway.com', port=443): [Errno 61] Connection refused").kind).toBe("connect");
     expect(net("ProxyError: Unable to connect to proxy").kind).toBe("proxy");
     expect(net("ConnectionError: [Errno 61] Connection refused").kind).toBe("connect");
     expect(net("Failed to fetch").kind).toBe("fetch");

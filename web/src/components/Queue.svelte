@@ -23,8 +23,8 @@
   // a finished job's first result; one still generating, or failed, shows the job itself
   function open(job: Job) {
     const result = Object.values(app.nodes).find((n) => n.job_id === job.id);
-    if (result) app.select(result.id);
-    else if (job.status !== "done") app.openJob(job);
+    if (job.status !== "done") app.openJob(job);
+    else if (result) app.select(result.id);
     else if (job.parent_id && app.nodes[job.parent_id]) app.select(job.parent_id);
     app.queueOpen = false;
   }
