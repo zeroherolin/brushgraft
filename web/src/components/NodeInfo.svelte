@@ -83,9 +83,24 @@
   {#if job}
     <details class="sent">
       <summary>{t("info.sent")}</summary>
-      <pre>{job.full_prompt}</pre>
-      {#if job.annot_image}
-        <button class="link" onclick={() => openImage(job.annot_image!)}>{t("info.annotated")}</button>
+      {#if job.requests.length}
+        <!-- an edit sent in parts: close-ups of its regions, and the whole image when needed -->
+        {#each job.requests as r, i (i)}
+          <p class="request">
+            {job.requests.length > 1 ? t("info.requestOf", { k: i + 1, n: job.requests.length }) : ""}{r.box
+              ? t("info.closeUp", { w: r.box[2] - r.box[0], h: r.box[3] - r.box[1], x: r.box[0], y: r.box[1] })
+              : t("info.wholeImage")}
+          </p>
+          <pre>{r.prompt}</pre>
+          {#if r.annot_image}
+            <button class="link" onclick={() => openImage(r.annot_image!)}>{t("info.annotated")}</button>
+          {/if}
+        {/each}
+      {:else}
+        <pre>{job.full_prompt}</pre>
+        {#if job.annot_image}
+          <button class="link" onclick={() => openImage(job.annot_image!)}>{t("info.annotated")}</button>
+        {/if}
       {/if}
     </details>
   {/if}
@@ -175,6 +190,12 @@
     font: inherit;
     font-size: var(--fs-s);
     white-space: pre-wrap;
+  }
+
+  .request {
+    margin: 10px 0 -2px;
+    color: var(--ink-2);
+    font-size: var(--fs-s);
   }
 
   .sent .link {

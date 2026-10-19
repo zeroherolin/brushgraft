@@ -19,7 +19,8 @@ from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageFilter, ImageFont, 
 import promptbrush as pb
 
 from brushgraft.errors import UserError
-from brushgraft.store import NOTE_OVERALL, NOTE_REFRAMED, NOTE_SPILL_GROWN, NOTE_SPILL_TOO_LARGE
+from brushgraft.store import (NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_REFRAMED, NOTE_SPILL_GROWN,
+                              NOTE_SPILL_TOO_LARGE)
 
 # Region colors by index; the web UI uses the same list (see /api/config)
 REGION_COLORS = ("#ff3b30", "#007aff", "#34c759", "#ff9500", "#af52de",
@@ -93,11 +94,12 @@ KEEP_UPLOAD_FORMATS = {"PNG", "JPEG", "WEBP"}
 # region a few hundred pixels across is then too small to edit (measured on a 416x107 box in a
 # 3840x2160 diagram, gpt-image-2: sent whole, left as it was 2 times out of 2; as a 1366x769
 # close-up, fixed 1 of 2; as a 1024x576 one, fixed 4 of 5). The result is pasted back within the
-# close-up, as usual.
+# close-up, as usual. Regions far apart get a close-up each (see zoom_parts).
 ZOOM_CONTEXT = 2.0               # the close-up is at least twice the regions' extent
 ZOOM_MIN_PIXELS = 768 * 768      # and covers at least this many of the image's pixels, for context
 ZOOM_MAX_SHARE = 0.35            # used only when it is at most this share of the image
 ZOOM_OUTPUT_PIXELS = 1536 * 1024  # asked for at least this size, scaled back down: finer detail
+ZOOM_MAX_PARTS = 4               # close-ups per edit at most (each is a request)
 
 
 def region_color(index: int) -> str:
@@ -121,6 +123,43 @@ def zoom_box(size: tuple[int, int], box: tuple[int, int, int, int]
     left = math.floor(min(max((x0 + x1) / 2 - w / 2, 0), width - w))
     top = math.floor(min(max((y0 + y1) / 2 - h / 2, 0), height - h))
     return left, top, left + w, top + h
+
+
+def zoom_parts(size: tuple[int, int], boxes: Sequence[tuple[int, int, int, int] | None]
+               ) -> list[tuple[tuple[int, int, int, int], list[int]]]:
+    """The close-ups to send regions in, given each one's bounding box on an image of ``size``
+    (None for an empty region): [(close-up, the regions' indices)], in the regions' order.
+
+    Regions close together share a close-up: the two whose shared one is smallest are put
+    together, as long as one fits. Regions too large for any are left out, and so are the
+    largest close-ups past ZOOM_MAX_PARTS: those regions go with the whole image.
+    """
+    def union(group: list[int]) -> tuple[int, int, int, int]:
+        bs = [boxes[i] for i in group]
+        return (min(b[0] for b in bs), min(b[1] for b in bs),
+                max(b[2] for b in bs), max(b[3] for b in bs))
+
+    def area(z: tuple[int, int, int, int]) -> int:
+        return (z[2] - z[0]) * (z[3] - z[1])
+
+    groups = [[i] for i, b in enumerate(boxes) if b is not None and zoom_box(size, b)]
+    while True:
+        best = None
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                z = zoom_box(size, union(groups[a] + groups[b]))
+                if z and (best is None or area(z) < best[0]):
+                    best = (area(z), a, b)
+        if best is None:
+            break
+        _, a, b = best
+        groups[a] = sorted(groups[a] + groups[b])
+        del groups[b]
+    parts = [(zoom_box(size, union(g)), g) for g in groups]
+    if len(parts) > ZOOM_MAX_PARTS:
+        kept = sorted(parts, key=lambda p: area(p[0]))[:ZOOM_MAX_PARTS]
+        parts = [p for p in parts if p in kept]
+    return parts
 
 
 def zoom_size(box: tuple[int, int, int, int]) -> str:
@@ -218,8 +257,11 @@ def annotation_badge(size: tuple[int, int]) -> int:
     return max(12, round(max(size) / 70))
 
 
-def annotate(image: Image.Image, regions: Sequence[dict]) -> Image.Image:
-    """Outline each region and number it: the second image sent to the model.
+def annotate(image: Image.Image, regions: Sequence[dict],
+             numbers: Sequence[int] | None = None) -> Image.Image:
+    """Outline each region and number it: the second image sent to the model. ``numbers``
+    gives each region's place among all of an edit's (from 0), when only some are shown: it
+    keeps its number and color.
 
     The outline follows the region's own shape (a lasso around two eyes is two
     rings, a diagonal brush stroke a slanted band, the notch an eraser cut stays
@@ -240,9 +282,10 @@ def annotate(image: Image.Image, regions: Sequence[dict]) -> Image.Image:
     occupied = union_mask(out.size, regions)
     pixels = np.asarray(out).copy()
     badges = []
-    for i, (ring, anchors) in enumerate(annotation_layout(out.size, regions)):
+    for k, (ring, anchors) in enumerate(annotation_layout(out.size, regions)):
         if ring is None:
             continue
+        i = numbers[k] if numbers is not None else k
         color = region_color(i)
         pixels[ring] = tuple(int(color[k:k + 2], 16) for k in (1, 3, 5))
         badges.append((_badge_center(occupied, anchors, badge), color, i))
@@ -1070,9 +1113,21 @@ def paste_back(original: Image.Image, result: Image.Image, mask: Image.Image,
       reaches the area is taken whole, and one in the feathered edge comes
       wholly from one side (see whole_pieces).
     """
+    toned, weights, note = paste_weights(original, result, mask, annotated, overall)
+    if toned is None:
+        return None, note
+    return blend(original, toned, weights), note
+
+
+def paste_weights(original: Image.Image, result: Image.Image, mask: Image.Image,
+                  annotated: Image.Image | None = None, overall: bool = False
+                  ) -> tuple[Image.Image | None, Image.Image | None, str]:
+    """paste_back's work before the blend: (the result with the tone drift undone, the
+    weights it is pasted with (L), the note); (None, None, NOTE_REFRAMED) when the model
+    redrew the scene."""
     size = original.size
     if not aligned(original, result, mask):
-        return None, NOTE_REFRAMED
+        return None, None, NOTE_REFRAMED
     scale = _scale_for(size)
     seed = np.asarray(_small(mask, scale)) > 0
     changed_overall = False
@@ -1120,10 +1175,81 @@ def paste_back(original: Image.Image, result: Image.Image, mask: Image.Image,
     soft = _feather(area_img, radius, band)
     if pieces is not None:
         soft = pieces(soft)
-    mode = "RGBA" if original.has_transparency_data else "RGB"
-    return (Image.composite(result if result.mode == mode else result.convert(mode),
-                            original if original.mode == mode else original.convert(mode), soft),
-            NOTE_OVERALL if changed_overall else note)
+    return result, soft, NOTE_OVERALL if changed_overall else note
+
+
+def blend(base: Image.Image, top: Image.Image, weights: Image.Image) -> Image.Image:
+    """``top`` over ``base`` by ``weights`` (L), in ``base``'s channels (RGB, or RGBA)."""
+    mode = "RGBA" if base.has_transparency_data else "RGB"
+    return Image.composite(top if top.mode == mode else top.convert(mode),
+                           base if base.mode == mode else base.convert(mode), weights)
+
+
+def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = False) -> dict:
+    """Put back the outputs of an edit sent in parts onto the original, ``full``.
+
+    ``pieces`` are (the close-up, or None for the whole image; the output as it came; the mask
+    of its regions and the annotated image, both as sent). Each output is pasted back as
+    paste_back does, the close-ups last: they show their regions in more detail than the whole
+    image's output.
+
+    A close-up shows only part of the image. When the overall request changed all of one (a
+    change of light, say) or one can't be pasted back, the whole image must be sent as well:
+    without its output, this returns {"ask": "overall" or "unusable"}. Otherwise it returns
+    {"merged": the pasted-back image, "raw": the whole output, "note"}, the whole output being
+    the whole image's output with the close-ups pasted in, or else the original with each
+    close-up's output put in its place. When the whole image's output can't be pasted back,
+    "merged" is None: use that output as it came.
+    """
+    mode = "RGBA" if full.has_transparency_data else "RGB"
+    full = full if full.mode == mode else full.convert(mode)
+    whole = None
+    ups = []
+    ask = None
+    for box, output, mask, annotated in sorted(pieces, key=lambda p: p[0] is not None):
+        original = full if box is None else full.crop(box)
+        if not same_aspect(original.size, output.size):
+            if box is None:
+                return {"merged": None, "raw": None, "note": NOTE_ASPECT_MISMATCH}
+            ask = ask or "unusable"
+            continue
+        result = register(original, output, mask)
+        toned, weights, note = paste_weights(original, result, mask, annotated, overall)
+        if box is None:
+            if toned is None:
+                return {"merged": None, "raw": None, "note": note}
+            whole = result, toned, weights, note
+        elif toned is None:
+            ask = ask or "unusable"
+        else:
+            if note == NOTE_OVERALL:
+                ask = "overall"
+            ups.append((box, result, mask, toned, weights, note))
+    if whole is None and ask:
+        return {"ask": ask}
+
+    merged = full.copy() if whole is None else blend(full, whole[1], whole[2])
+    raw = full.copy() if whole is None else whole[0].convert(mode)
+    notes = []
+    for box, result, mask, toned, weights, note in ups:
+        merged.paste(blend(merged.crop(box), toned, weights), box[:2])
+        if whole is None:
+            raw.paste(result, box[:2])
+        else:  # the close-up's regions, in the whole output's tones
+            part = raw.crop(box)
+            raw.paste(blend(part, match_tone(part, result, mask), weights), box[:2])
+        notes.append(note)
+    if whole and whole[3] == NOTE_OVERALL:
+        note = NOTE_OVERALL
+    else:
+        # a close-up's own overall change is drift when the whole image's output has none
+        notes += [whole[3]] if whole else []
+        note = max((n for n in notes if n != NOTE_OVERALL), key=_PART_NOTES.index, default="")
+    return {"merged": merged, "raw": raw, "note": note}
+
+
+# The notes of a version made in parts, weakest first: it shows the strongest
+_PART_NOTES = ("", NOTE_SPILL_GROWN, NOTE_SPILL_TOO_LARGE)
 
 
 # ---------------------------------------------------------------------------

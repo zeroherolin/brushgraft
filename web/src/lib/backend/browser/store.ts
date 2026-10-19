@@ -3,7 +3,7 @@
 // of their bytes, so identical content is kept once.
 
 import { detectExt, sniff, type Ext } from "../../imaging/formats";
-import type { Asset, Job, JobError, Project, Region, TreeNode } from "../../types";
+import type { Asset, Job, JobError, Project, Region, SentRequest, TreeNode } from "../../types";
 import { notFound, userError } from "../errors";
 import { spec } from "../spec";
 
@@ -173,7 +173,9 @@ export class BrowserStore {
         for (const sha of [n.image, n.raw_image, n.merged_image]) if (sha) used.add(sha);
       }
       for (const j of await done<JobRow[]>(tx.objectStore("jobs").getAll())) {
-        for (const sha of [j.mask_image, j.annot_image, ...(j.ref_images ?? [])]) if (sha) used.add(sha);
+        for (const sha of [j.mask_image, j.annot_image, ...(j.ref_images ?? []), ...(j.requests ?? []).map((r) => r.annot_image)]) {
+          if (sha) used.add(sha);
+        }
       }
       for (const a of await done<AssetRow[]>(tx.objectStore("assets").getAll())) used.add(a.image);
       const images = tx.objectStore("images");
@@ -531,6 +533,18 @@ export class BrowserStore {
     });
   }
 
+  /** Record a request a job sent besides those it was made with (the whole image, for an edit sent in close-ups), once. */
+  async addJobRequest(id: string, request: SentRequest): Promise<void> {
+    await this.#tx(["jobs"], "readwrite", async (tx) => {
+      const store = tx.objectStore("jobs");
+      const j = await done<JobRow | undefined>(store.get(id));
+      if (!j) throw notFound("job", id);
+      const requests = j.requests ?? [];
+      if (requests.some((r) => JSON.stringify(r) === JSON.stringify(request))) return;
+      await done(store.put({ ...j, requests: [...requests, request] }));
+    });
+  }
+
   async deleteJob(id: string): Promise<void> {
     await this.#tx(["nodes", "jobs"], "readwrite", async (tx) => {
       const jobs = tx.objectStore("jobs");
@@ -621,10 +635,10 @@ function fillRefImages(tx: IDBTransaction): void {
 function publicJob(row: JobRow): Job {
   const { owner: _owner, ...job } = row;
   void _owner;
-  return job;
+  return { ...job, requests: job.requests ?? [] }; // not there in jobs from before edits were sent in parts
 }
 
-function addUsage(total: Record<string, number> | null, usage: Record<string, number> | null | undefined) {
+export function addUsage(total: Record<string, number> | null, usage: Record<string, number> | null | undefined) {
   if (!usage) return total;
   const out = { ...(total ?? {}) };
   for (const [k, v] of Object.entries(usage)) if (typeof v === "number") out[k] = (out[k] ?? 0) + v;

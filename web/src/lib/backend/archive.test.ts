@@ -29,7 +29,9 @@ async function sample(): Promise<ArchiveContent> {
     ],
     jobs: [{
       id: "j1", parent_id: "n1", kind: "edit", prompt: "p", full_prompt: "fp", regions: [{ shapes: [{ type: "rect", x: 1, y: 2, w: 3, h: 4 }], instruction: "i" }],
-      refs: ["n1", "asset:a1"], ref_images: [sa, sb], model: "m", size: "1536x1024", n: 1, composite: true, mask_image: null, annot_image: null, status: "done", done: 1, failed: 0,
+      refs: ["n1", "asset:a1"], ref_images: [sa, sb], model: "m", size: "1536x1024", n: 1, composite: true, mask_image: null, annot_image: null,
+      requests: [{ prompt: "fp", box: [10, 20, 30, 40], size: "1536x1024", annot_image: sb }, { prompt: "fp", box: null, size: "1536x1024", annot_image: null }],
+      status: "done", done: 1, failed: 0,
       errors: [], usage: { total_tokens: 3 }, created_at: 1, finished_at: 2,
     }],
     images: new Map([[sa, a], [sb, b]]),
@@ -104,6 +106,15 @@ describe("project archive", () => {
     expect(back.jobs[0].ref_images).toEqual([content.nodes[0].image, null]);
   });
 
+  it("reads a file from before edits were sent in parts: no requests", async () => {
+    const content = await sample();
+    const zip = unzipSync(await bytesOf(writeArchive(content)));
+    const manifest = JSON.parse(strFromU8(zip["project.json"]));
+    for (const j of manifest.jobs) delete j.requests;
+    zip["project.json"] = strToU8(JSON.stringify(manifest));
+    expect((await readArchive(zipSync(zip))).jobs[0].requests).toEqual([]);
+  });
+
   it("rejects files that are not projects", async () => {
     await rejects(readArchive(new Uint8Array([1, 2, 3])));
     await rejects(readArchive(zipSync({ "readme.txt": strToU8("hi") })));
@@ -144,6 +155,9 @@ describe("project archive", () => {
       (m) => (m.jobs[0].n = 9),
       (m) => (m.jobs[0].kind = "other"),
       (m) => (m.jobs[0].refs = new Array(9).fill("n1")),
+      (m) => (m.jobs[0].requests[0].box = [1, 2, 3]),
+      (m) => (m.jobs[0].requests[0].annot_image = "xyz"),
+      (m) => (m.jobs[0].requests = new Array(30).fill(m.jobs[0].requests[1])),
       (m) => (m.project.name = 5),
       (m) => (m.nodes = new Array(6000).fill(m.nodes[0])),
     ];

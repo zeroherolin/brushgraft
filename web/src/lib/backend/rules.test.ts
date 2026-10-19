@@ -4,7 +4,7 @@ import { PARITY } from "../../test/png";
 import { ApiError } from "./errors";
 import { compilePrompt } from "./prompts";
 import { checkSize, fitSize } from "./sizes";
-import { zoomBox, zoomSize } from "../imaging/zoom";
+import { zoomBox, zoomParts, zoomSize } from "../imaging/zoom";
 
 const file = `${PARITY}rules/rules.json`;
 const have = existsSync(file);
@@ -13,7 +13,7 @@ const data = have ? JSON.parse(readFileSync(file, "utf8")) : { prompts: [], size
 describe.skipIf(!have)("prompts and size rules match Python's", () => {
   it("compiles every prompt the same", () => {
     for (const c of data.prompts) {
-      const run = () => compilePrompt(c.prompt, c.regions, { hasParent: c.parent, refCount: c.refs, lang: c.lang });
+      const run = () => compilePrompt(c.prompt, c.regions, { hasParent: c.parent, refCount: c.refs, lang: c.lang, numbers: c.numbers });
       if (c.error) {
         let caught: unknown;
         try {
@@ -42,6 +42,12 @@ describe.skipIf(!have)("prompts and size rules match Python's", () => {
       if (zoom) expect(zoomSize(zoom), JSON.stringify(c)).toBe(c.output);
     }
     expect(data.zooms.filter((c: { zoom: unknown }) => c.zoom).length).toBeGreaterThan(5);
+  });
+
+  it("groups regions into the same close-ups", () => {
+    for (const c of data.parts) expect(zoomParts(c.size[0], c.size[1], c.boxes), JSON.stringify(c)).toEqual(c.parts);
+    // some have several close-ups, some none
+    expect(new Set(data.parts.map((c: { parts: unknown[] }) => Math.min(c.parts.length, 2)))).toEqual(new Set([0, 1, 2]));
   });
 
   it("checks sizes the same", () => {

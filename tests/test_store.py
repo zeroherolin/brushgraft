@@ -305,6 +305,18 @@ class TestJobs:
         store.delete_job(done["id"])
         assert [n["id"] for n in store.project_tree(p)["nodes"]] == [root["id"]]
 
+    def test_requests_sent_later_are_recorded_once_and_keep_their_images(self, store):
+        p = store.create_project("p")["id"]
+        sha = store.put_image(make_png(color=(5, 5, 5)))["sha"]
+        close_up = {"prompt": "a", "box": [0, 0, 8, 8], "size": "1024x1024", "annot_image": None}
+        job = store.create_job(**job_fields(p, requests=[close_up]))
+        whole = {"prompt": "b", "box": None, "size": "1536x1024", "annot_image": sha}
+        store.add_job_request(job["id"], whole)
+        store.add_job_request(job["id"], whole)
+        assert store.get_job(job["id"])["requests"] == [close_up, whole]
+        assert store.collect_garbage() == 0
+        store.image_path(sha)
+
     def test_running_job_cannot_be_deleted(self, store):
         p = store.create_project("p")["id"]
         job = store.create_job(**job_fields(p))
@@ -349,7 +361,22 @@ class TestJobs:
         db.close()
         store = Store(home)
         assert store.get_job("j")["ref_images"] == ["a" * 64, None]
+        assert store.get_job("j")["requests"] == []
         assert store.list_assets() == []
+        store.close()
+
+    def test_a_version_2_database_gets_job_requests(self, tmp_path):
+        import sqlite3
+        store = Store(tmp_path)
+        job = store.create_job(**job_fields(store.create_project("p")["id"]))
+        store.close()
+        db = sqlite3.connect(tmp_path / "brushgraft.sqlite3")
+        db.execute("ALTER TABLE jobs DROP COLUMN requests")  # as version 2 made it
+        db.execute("PRAGMA user_version = 2")
+        db.commit()
+        db.close()
+        store = Store(tmp_path)
+        assert store.get_job(job["id"])["requests"] == []
         store.close()
 
     def test_newer_schema_refused(self, tmp_path):

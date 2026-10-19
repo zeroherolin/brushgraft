@@ -2,8 +2,7 @@
 
 import { ApiError } from "../backend/errors";
 import type { Region } from "../types";
-import type { Merged, Prepared } from "./ops";
-import type { Box } from "./zoom";
+import type { Merged, PartsMerged, Piece, Prepared } from "./ops";
 import type { WorkerReply, WorkerRequest } from "./worker";
 
 type Distribute<T> = T extends unknown ? Omit<T, "id"> : never;
@@ -12,7 +11,9 @@ type Distribute<T> = T extends unknown ? Omit<T, "id"> : never;
 export interface ImageOps {
   normalize(data: Uint8Array): Promise<Uint8Array>;
   prepare(parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], zoom?: boolean): Promise<Prepared>;
-  merge(parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean, zoom?: Box): Promise<Merged>;
+  merge(parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean): Promise<Merged>;
+  mergeParts(parent: Uint8Array, pieces: Piece[], overall: boolean): Promise<PartsMerged>;
+  placeParts(parent: Uint8Array, pieces: Pick<Piece, "box" | "result">[]): Promise<Uint8Array>;
   thumb(data: Uint8Array): Promise<{ bytes: Uint8Array; type: string }>;
 }
 
@@ -47,7 +48,10 @@ export class ImageWorker implements ImageOps {
   normalize = (data: Uint8Array) => this.#send<Uint8Array>({ op: "normalize", data });
   prepare = (parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], zoom?: boolean) =>
     this.#send<Prepared>({ op: "prepare", parent, regions, refs, zoom });
-  merge = (parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean, zoom?: Box) =>
-    this.#send<Merged>({ op: "merge", parent, result, mask, annot, overall, zoom });
+  merge = (parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean) =>
+    this.#send<Merged>({ op: "merge", parent, result, mask, annot, overall });
+  mergeParts = (parent: Uint8Array, pieces: Piece[], overall: boolean) => this.#send<PartsMerged>({ op: "mergeParts", parent, pieces, overall });
+  placeParts = (parent: Uint8Array, pieces: Pick<Piece, "box" | "result">[]) =>
+    this.#send<Uint8Array>({ op: "placeParts", parent, pieces });
   thumb = (data: Uint8Array) => this.#send<{ bytes: Uint8Array; type: string }>({ op: "thumb", data });
 }

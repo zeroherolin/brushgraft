@@ -107,6 +107,7 @@ export interface Spec {
     zoom_min_pixels: number;
     zoom_max_share: number;
     zoom_output_pixels: number;
+    zoom_max_parts: number;
   };
 }
 

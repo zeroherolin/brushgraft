@@ -79,8 +79,11 @@ _TEXT = {
 
 
 def compile_prompt(prompt: str, regions: Sequence[dict], *, has_parent: bool,
-                   ref_count: int = 0, lang: Lang = "en") -> str:
-    """Return the prompt to send; raise UserError if there is nothing to send."""
+                   ref_count: int = 0, lang: Lang = "en",
+                   numbers: Sequence[int] | None = None) -> str:
+    """Return the prompt to send; raise UserError if there is nothing to send. ``numbers``
+    gives each region's place among all of an edit's (from 0), when only some are sent (a
+    close-up): it keeps its number and color, as in imaging.annotate."""
     prompt = prompt.strip()
     instructions = [r.get("instruction", "").strip() for r in regions]
     if regions and not has_parent:
@@ -115,7 +118,8 @@ def compile_prompt(prompt: str, regions: Sequence[dict], *, has_parent: bool,
         lines.append(text["region_refs"].format(refs=refs))
     lines.append(text["lead"])
     colors = COLOR_NAMES[lang]
-    for k, instruction in enumerate(instructions):
+    for i, instruction in enumerate(instructions):
+        k = numbers[i] if numbers is not None else i
         lines.append(text["region"].format(
             k=k + 1, circled=CIRCLED[k], color=colors[k % len(colors)],
             text=instruction or text["region_default"]))

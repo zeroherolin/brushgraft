@@ -5,15 +5,18 @@
 import { sniff } from "../../imaging/formats";
 import type { ImageOps } from "../../imaging/client";
 import { sameAspect } from "../../imaging/pasteback";
-import { zoomSize, type Box } from "../../imaging/zoom";
-import { ASSET_REF, type Job, type JobError, type LogLine, type Region, type ServerEvent, type Shape, type TreeNode } from "../../types";
+import type { PartsMerged, PreparedPart } from "../../imaging/ops";
+import { zoomSize } from "../../imaging/zoom";
+import {
+  ASSET_REF, type Job, type JobError, type LogLine, type Region, type SentRequest, type ServerEvent, type Shape, type TreeNode,
+} from "../../types";
 import { ApiError, userError } from "../errors";
 import { charCount, compilePrompt } from "../prompts";
 import { checkSize, fitSize, SIZE_PATTERN } from "../sizes";
 import { spec } from "../spec";
 import type { JobRequest } from "../types";
 import { createImage, ImageAPIError, NetworkError, type LogFn } from "./imageapi";
-import { isQuotaError, type BrowserStore } from "./store";
+import { addUsage, isQuotaError, type BrowserStore } from "./store";
 
 const LOG_LINES_PER_JOB = 200;
 // Pasting back holds about 25 copies of the image's pixels in memory at once; above this a phone
@@ -40,6 +43,23 @@ const NOTE_LOG: Record<string, string> = {
   [spec.notes.spill_grown]: "New content went past the region; grew the paste-back area",
   [spec.notes.spill_too_large]: "New content spread too far; pasted back the region only",
 };
+const ASK_LOG: Record<string, string> = {
+  overall: "The overall request changed the whole close-up; sending the whole image as well",
+  unusable: "A close-up couldn't be pasted back; sending the whole image as well",
+};
+
+type Generation = Awaited<ReturnType<typeof createImage>>;
+
+/** One request of an edit sent in parts: a close-up of some regions, or the whole image with all of them. */
+interface Part extends PreparedPart {
+  prompt: string;
+  size: string;
+  /** the annotated copy as stored */
+  annotSha: string;
+}
+
+/** As job.requests lists it. */
+const record = (p: Part): SentRequest => ({ prompt: p.prompt, box: p.box, size: p.size, annot_image: p.annotSha });
 
 interface Prepared {
   jobId: string;
@@ -57,8 +77,13 @@ interface Prepared {
   annot?: Uint8Array;
   /** the user wrote an overall request besides the regions */
   overall: boolean;
-  /** the close-up sent instead of the whole original */
-  zoom?: Box;
+  /**
+   * A small edit of a large image goes in parts instead (each variant sends them all): the regions
+   * in close-ups, and the whole image with every region when some are too large for one. ``whole``
+   * makes that part; a close-up may call for it too (see mergeParts)
+   */
+  parts?: Part[];
+  whole?: () => Promise<Part>;
 }
 
 export interface RunnerDeps {
@@ -76,6 +101,34 @@ export interface RunnerDeps {
 }
 
 const error = (code: string, detail = "", variant = ""): JobError => ({ code, detail, variant });
+
+/** The error a request ended with. */
+function failure(e: unknown, variant: string): JobError {
+  if (e instanceof ImageAPIError) return error(apiErrorCode(e), e.message, variant);
+  if (e instanceof NetworkError) return error("network", e.message, variant);
+  if (e instanceof ApiError) return error("api_error", e.message, variant);
+  return error("internal", `${e instanceof Error ? e.name : "Error"}: ${e instanceof Error ? e.message : e}`, variant);
+}
+
+/** At most ``max`` tasks at once; the others wait their turn. */
+class Slots {
+  #running = 0;
+  #waiting: (() => void)[] = [];
+
+  constructor(private max: () => number) {}
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.#running < this.max()) this.#running++;
+    else await new Promise<void>((resolve) => this.#waiting.push(resolve)); // its slot is handed over
+    try {
+      return await task();
+    } finally {
+      const next = this.#waiting.shift();
+      if (next) next();
+      else this.#running--;
+    }
+  }
+}
 
 // An API that turns a prompt down as too long answers 413, or (relays seen) 400/500 with text that
 // says so: brushgraft.jobs._TOO_LONG
@@ -123,8 +176,11 @@ function validate(b: JobRequest): void {
 export class JobRunner {
   #logs = new Map<string, LogLine[]>();
   #pending = 0;
-  #running = 0;
-  #waiting: (() => void)[] = [];
+  // Relay services answer 429 when pushed too hard: at most this many requests at once. A job's
+  // variants take the first slots, the requests they send the second (an edit sent in parts sends
+  // several at once)
+  #variants = new Slots(() => this.deps.maxParallel ?? spec.http.max_parallel);
+  #calls = new Slots(() => this.deps.maxParallel ?? spec.http.max_parallel);
 
   constructor(private deps: RunnerDeps) {}
 
@@ -173,14 +229,27 @@ export class JobRunner {
     const regions: Region[] = parent ? body.regions : [];
     const parentBytes = parent ? new Uint8Array((await store.getImage(parent.image)).data) : undefined;
     const refBytes = await Promise.all(refImages.map(async (sha) => new Uint8Array((await store.getImage(sha)).data)));
-    // A small edit of a large image goes as a close-up, to be pasted back within it: not with an
-    // overall request (that is about the whole image), nor for a model that redraws the scene
+    // A small edit of a large image goes in close-ups, to be pasted back within them: not for a
+    // model that redraws the scene (nothing of its output is pasted back), nor when the whole
+    // output is wanted, nor for an image too large to paste back in this browser
     const aligned = spec.models.find((m) => m.name === model)?.aligned ?? true;
-    const zoom = body.composite && regions.length > 0 && !body.prompt.trim() && aligned;
+    const zoom = body.composite && regions.length > 0 && aligned && !!parent && parent.width * parent.height <= MAX_PASTE_PIXELS;
     const prepared = await this.deps.images.prepare(parentBytes, regions, refBytes, zoom);
-    if (prepared.zoom) size = zoomSize(prepared.zoom);
     const maskSha = prepared.mask ? (await store.putImage(prepared.mask)).sha : null;
-    const annotSha = prepared.annot ? (await store.putImage(prepared.annot)).sha : null;
+    let annotSha = prepared.annot ? (await store.putImage(prepared.annot)).sha : null;
+    const parts: Part[] = [];
+    for (const p of prepared.parts ?? []) {
+      const some = p.regions.map((i) => regions[i]);
+      parts.push({
+        ...p,
+        prompt: p.box
+          ? compilePrompt(body.prompt, some, { hasParent: true, refCount: refImages.length, lang: body.lang, numbers: p.regions })
+          : fullPrompt,
+        size: p.box ? zoomSize(p.box) : size,
+        annotSha: (await store.putImage(p.annot)).sha,
+      });
+    }
+    if (parts.length) annotSha = parts[0].annotSha;
 
     const job = await store.createJob({
       project_id: body.project_id,
@@ -197,12 +266,17 @@ export class JobRunner {
       composite: body.composite && body.regions.length > 0,
       mask_image: maskSha,
       annot_image: annotSha,
+      requests: parts.map(record),
       owner: this.deps.owner,
     }, parent?.image);
+    let whole: Promise<Part> | null = parts[0]?.box === null ? Promise.resolve(parts[0]) : null;
     const req: Prepared = {
       jobId: job.id, n: body.n, prompt: fullPrompt, model, size, images: prepared.images, apiKey, baseUrl,
       parent: parentBytes, mask: job.composite ? prepared.mask : undefined, annot: prepared.annot,
-      overall: !!job.prompt, zoom: prepared.zoom,
+      overall: !!job.prompt,
+      parts: parts.length ? parts : undefined,
+      // the whole image, with every region, as an edit not sent in parts; made once
+      whole: () => (whole ??= this.#wholePart(parentBytes!, regions, refBytes, fullPrompt, size)),
     };
     this.#logs.set(job.id, []);
     this.deps.publish({ type: "job", job });
@@ -211,31 +285,26 @@ export class JobRunner {
     return job;
   }
 
+  async #wholePart(parent: Uint8Array, regions: Region[], refs: Uint8Array[], prompt: string, size: string): Promise<Part> {
+    const p = await this.deps.images.prepare(parent, regions, refs, false);
+    const annotSha = (await this.deps.store.putImage(p.annot!)).sha;
+    return { box: null, regions: regions.map((_, i) => i), images: p.images, mask: p.mask!, annot: p.annot!, prompt, size, annotSha };
+  }
+
   #setPending(n: number): void {
     this.#pending = n;
     this.deps.onActivity?.(n);
   }
 
-  /** Run at most ``maxParallel`` requests at once, across all jobs (relays answer 429 when pushed). */
-  #schedule(task: () => Promise<void>): Promise<void> {
-    const max = this.deps.maxParallel ?? spec.http.max_parallel;
-    return new Promise((resolve) => {
-      const go = async () => {
-        this.#running++;
-        try {
-          await task();
-        } catch (e) {
-          console.error(e); // an attempt records its own failures; this is a bug
-        } finally {
-          this.#running--;
-          this.#setPending(this.#pending - 1);
-          this.#waiting.shift()?.();
-          resolve();
-        }
-      };
-      if (this.#running < max) void go();
-      else this.#waiting.push(() => void go());
-    });
+  /** Run a job's variant when a slot is free. */
+  async #schedule(task: () => Promise<void>): Promise<void> {
+    try {
+      await this.#variants.run(task);
+    } catch (e) {
+      console.error(e); // an attempt records its own failures; this is a bug
+    } finally {
+      this.#setPending(this.#pending - 1);
+    }
   }
 
   #log(jobId: string, level: string, msg: string): void {
@@ -260,41 +329,14 @@ export class JobRunner {
     const tag = variant ? `[${variant}] ` : "";
     const log: LogFn = (level, msg) => this.#log(req.jobId, level, tag + msg);
 
-    let gen: Awaited<ReturnType<typeof createImage>> | null = null;
-    let err: JobError | null = null;
-    const nodes: TreeNode[] = [];
-    log("info", `Requesting ${req.model} at ${req.size}`);
-    if (req.zoom) {
-      const [x0, y0, x1, y1] = req.zoom;
-      log("info", `Sending a close-up of the regions: ${x1 - x0}x${y1 - y0} at (${x0}, ${y0})`);
-    }
-    try {
-      gen = await createImage(req.prompt, { images: req.images, model: req.model, size: req.size }, {
-        apiKey: req.apiKey, baseUrl: req.baseUrl, log, fetch: this.deps.fetch, sleep: this.deps.sleep,
-      });
-    } catch (e) {
-      if (e instanceof ImageAPIError) err = error(apiErrorCode(e), e.message, variant);
-      else if (e instanceof NetworkError) err = error("network", e.message, variant);
-      else if (e instanceof ApiError) err = error("api_error", e.message, variant);
-      else err = error("internal", `${e instanceof Error ? e.name : "Error"}: ${e instanceof Error ? e.message : e}`, variant);
-    }
-
-    for (const data of gen?.images ?? []) {
-      try {
-        nodes.push(await this.#saveResult(req, data, log));
-      } catch (e) {
-        err = isQuotaError(e)
-          ? error("storage_full", "", variant)
-          : error("save_failed", `${e instanceof Error ? e.name : "Error"}: ${e instanceof Error ? e.message : e}`, variant);
-      }
-    }
-    if (gen && !gen.images.length && !err) err = gen.lost.length ? error("image_unreachable", gen.lost[0], variant) : error("no_image", "", variant);
+    const started = Date.now();
+    const { nodes, err, usage } = req.parts ? await this.#runParts(req, req.parts, variant, log) : await this.#runWhole(req, variant, log);
     if (err) log("error", `${ERROR_LOG[err.code]}${err.detail ? `: ${err.detail}` : ""}`);
-    else log("ok", `Done in ${gen!.elapsed.toFixed(0)}s`);
+    else log("ok", `Done in ${((Date.now() - started) / 1000).toFixed(0)}s`);
 
     let job: Job;
     try {
-      job = await store.recordAttempt(req.jobId, { ok: nodes.length > 0, error: err, usage: gen?.usage ?? null });
+      job = await store.recordAttempt(req.jobId, { ok: nodes.length > 0, error: err, usage });
     } catch (e) {
       if (e instanceof ApiError && e.code === "not_found") return; // the project was deleted meanwhile
       throw e;
@@ -303,31 +345,64 @@ export class JobRunner {
     this.deps.publish({ type: "job", job });
   }
 
+  /** Send one request when a slot is free (the cap holds across jobs). */
+  #request(req: Prepared, prompt: string, images: Uint8Array[], size: string, log: LogFn, what = ""): Promise<Generation> {
+    return this.#calls.run(() => {
+      log("info", `Requesting ${req.model} at ${size}${what}`);
+      return createImage(prompt, { images, model: req.model, size }, {
+        apiKey: req.apiKey, baseUrl: req.baseUrl, log, fetch: this.deps.fetch, sleep: this.deps.sleep,
+      });
+    });
+  }
+
+  /** One request; its image (if it is an edit of regions) pasted back. */
+  async #runWhole(req: Prepared, variant: string, log: LogFn): Promise<{ nodes: TreeNode[]; err: JobError | null; usage: Record<string, number> | null }> {
+    let gen: Generation | null = null;
+    let err: JobError | null = null;
+    const nodes: TreeNode[] = [];
+    try {
+      gen = await this.#request(req, req.prompt, req.images, req.size, log);
+    } catch (e) {
+      err = failure(e, variant);
+    }
+    for (const data of gen?.images ?? []) {
+      try {
+        nodes.push(await this.#saveResult(req, data, log));
+      } catch (e) {
+        err = this.#saveError(e, variant);
+      }
+    }
+    if (gen && !gen.images.length && !err) err = gen.lost.length ? error("image_unreachable", gen.lost[0], variant) : error("no_image", "", variant);
+    return { nodes, err, usage: gen?.usage ?? null };
+  }
+
+  #saveError(e: unknown, variant: string): JobError {
+    return isQuotaError(e)
+      ? error("storage_full", "", variant)
+      : error("save_failed", `${e instanceof Error ? e.name : "Error"}: ${e instanceof Error ? e.message : e}`, variant);
+  }
+
   async #saveResult(req: Prepared, data: Uint8Array, log: LogFn): Promise<TreeNode> {
     const { store, images } = this.deps;
     const job = await store.getJob(req.jobId);
     const common = { projectId: job.project_id, parentId: job.parent_id, jobId: job.id };
-    let raw = (await store.putImage(data)).sha;
+    const raw = (await store.putImage(data)).sha;
     if (!req.mask || !req.parent) return store.addNode({ image: raw, ...common });
     const original = sniff(req.parent)!;
-    // what was sent: the whole original, or a close-up of it
-    const sent = req.zoom ? { width: req.zoom[2] - req.zoom[0], height: req.zoom[3] - req.zoom[1] } : original;
     const result = sniff(data)!;
-    if (!sameAspect([sent.width, sent.height], [result.width, result.height])) {
+    if (!sameAspect([original.width, original.height], [result.width, result.height])) {
       log("warn", `Output is ${result.width}x${result.height}, a different aspect ratio from the original; not pasted back`);
       return store.addNode({ image: raw, note: spec.notes.aspect_mismatch, ...common });
     }
     let merged: Awaited<ReturnType<ImageOps["merge"]>>;
     try {
       if (original.width * original.height > MAX_PASTE_PIXELS) throw new Error("the image is too large for this browser");
-      merged = await images.merge(req.parent, data, req.mask, req.annot, req.overall, req.zoom);
+      merged = await images.merge(req.parent, data, req.mask, req.annot, req.overall);
     } catch (e) {
       // the image is paid for: never lose it to a paste-back problem (memory, a damaged file)
       log("warn", `${NOTE_LOG[spec.notes.paste_failed]} (${e instanceof Error ? `${e.name}: ${e.message}` : e})`);
       return store.addNode({ image: raw, note: spec.notes.paste_failed, ...common });
     }
-    // for a close-up, the model's whole output is the original with the close-up replaced
-    if (merged.whole) raw = (await store.putImage(merged.whole)).sha;
     if (merged.note) log(merged.image ? "info" : "warn", NOTE_LOG[merged.note]);
     if (!merged.image) return store.addNode({ image: raw, note: merged.note, ...common }); // the model redrew the scene
     const final = (await store.putImage(merged.image)).sha;
@@ -336,6 +411,107 @@ export class JobRunner {
       return store.addNode({ image: raw, rawImage: raw, mergedImage: final, note: merged.note, ...common });
     }
     return store.addNode({ image: final, rawImage: raw, note: merged.note, ...common });
+  }
+
+  /** The parts of an edit, all at once (and the whole image after them if a close-up calls for it), put back together into one version. */
+  async #runParts(
+    req: Prepared,
+    planned: Part[],
+    variant: string,
+    log: LogFn,
+  ): Promise<{ nodes: TreeNode[]; err: JobError | null; usage: Record<string, number> | null }> {
+    const { store, images } = this.deps;
+    let parts = planned;
+    const sent = await this.#sendParts(req, parts, variant, log);
+    let { outputs, usage } = sent;
+    if (sent.err) return { nodes: [], err: sent.err, usage };
+    const pieces = () => parts.map((p, i) => ({ box: p.box, result: outputs[i], mask: p.mask, annot: p.annot }));
+    let done: PartsMerged;
+    try {
+      done = await images.mergeParts(req.parent!, pieces(), req.overall);
+      if (done.ask) {
+        log("info", ASK_LOG[done.ask]);
+        const part = await req.whole!();
+        await store.addJobRequest(req.jobId, record(part)).catch(() => {}); // gone: the project was deleted meanwhile
+        const more = await this.#sendParts(req, [part], variant, log);
+        usage = addUsage(usage, more.usage);
+        if (more.err) return { nodes: [], err: more.err, usage };
+        parts = [...parts, part];
+        outputs = [...outputs, ...more.outputs];
+        done = await images.mergeParts(req.parent!, pieces(), req.overall);
+      }
+    } catch (e) {
+      // the images are paid for: never lose them to a paste-back problem (memory, a damaged file)
+      log("warn", `${NOTE_LOG[spec.notes.paste_failed]} (${e instanceof Error ? `${e.name}: ${e.message}` : e})`);
+      try {
+        const image = (await store.putImage(await images.placeParts(req.parent!, pieces()))).sha;
+        return { nodes: [await this.#addNode(req, { image, note: spec.notes.paste_failed })], err: null, usage };
+      } catch (e2) {
+        return { nodes: [], err: this.#saveError(e2, variant), usage };
+      }
+    }
+    try {
+      return { nodes: [await this.#saveParts(req, done, parts, outputs, log)], err: null, usage };
+    } catch (e) {
+      return { nodes: [], err: this.#saveError(e, variant), usage };
+    }
+  }
+
+  /** Send ``parts`` at once: each one's image, the usage summed, the first error. */
+  async #sendParts(
+    req: Prepared,
+    parts: Part[],
+    variant: string,
+    log: LogFn,
+  ): Promise<{ outputs: Uint8Array[]; usage: Record<string, number> | null; err: JobError | null }> {
+    const results = await Promise.allSettled(
+      parts.map((part, i) => {
+        const label = parts.length > 1 ? `Request ${i + 1}/${parts.length}: ` : "";
+        let what = " (the whole image)";
+        if (part.box) {
+          const [x0, y0, x1, y1] = part.box;
+          what = ` (regions ${part.regions.map((k) => k + 1).join(", ")}, a close-up of ${x1 - x0}x${y1 - y0} at (${x0}, ${y0}))`;
+        }
+        return this.#request(req, part.prompt, part.images, part.size, (level, msg) => log(level, label + msg), what);
+      }),
+    );
+    const outputs: Uint8Array[] = [];
+    let usage: Record<string, number> | null = null;
+    let err: JobError | null = null;
+    for (const r of results) {
+      if (r.status === "rejected") {
+        err ??= failure(r.reason, variant);
+        continue;
+      }
+      usage = addUsage(usage, r.value.usage);
+      if (r.value.images.length) outputs.push(r.value.images[0]);
+      else err ??= r.value.lost.length ? error("image_unreachable", r.value.lost[0], variant) : error("no_image", "", variant);
+    }
+    return { outputs, usage, err };
+  }
+
+  async #saveParts(req: Prepared, done: PartsMerged, parts: Part[], outputs: Uint8Array[], log: LogFn): Promise<TreeNode> {
+    const { store } = this.deps;
+    const note = done.note;
+    if (!done.merged) {
+      // the whole image's output can't be pasted back: use it
+      const data = outputs[parts.findIndex((p) => p.box === null)];
+      log("warn", note === spec.notes.aspect_mismatch ? "The whole image's output has a different aspect ratio from the original; not pasted back" : NOTE_LOG[note]);
+      return this.#addNode(req, { image: (await store.putImage(data)).sha, note });
+    }
+    if (note) log("info", NOTE_LOG[note]);
+    const raw = (await store.putImage(done.raw!)).sha;
+    const final = (await store.putImage(done.merged)).sha;
+    if (note === spec.notes.overall_change) {
+      // adopt the whole output; the pasted-back one stays beside it
+      return this.#addNode(req, { image: raw, rawImage: raw, mergedImage: final, note });
+    }
+    return this.#addNode(req, { image: final, rawImage: raw, note });
+  }
+
+  async #addNode(req: Prepared, fields: { image: string; rawImage?: string; mergedImage?: string; note?: string }): Promise<TreeNode> {
+    const job = await this.deps.store.getJob(req.jobId);
+    return this.deps.store.addNode({ projectId: job.project_id, parentId: job.parent_id, jobId: job.id, ...fields });
   }
 }
 

@@ -124,15 +124,20 @@ export function annotationLayout(width: number, height: number, regions: Region[
   });
 }
 
-/** Outline each region along its shape and number it: the second image sent to the model. */
-export async function annotate(codec: Codec, image: Raster, regions: Region[]): Promise<Raster> {
+/**
+ * Outline each region along its shape and number it: the second image sent to the model.
+ * ``numbers`` gives each region's place among all of an edit's (from 0), when only some are
+ * shown: it keeps its number and color.
+ */
+export async function annotate(codec: Codec, image: Raster, regions: Region[], numbers?: number[]): Promise<Raster> {
   const out = copyRaster(toRgb(image));
   const { width: w, height: h } = out;
   const badge = annotationBadge(w, h);
   const occupied = unionMask(w, h, regions);
   const badges: { cx: number; cy: number; rgb: [number, number, number]; text: string }[] = [];
-  annotationLayout(w, h, regions).forEach(({ ring, anchors }, i) => {
+  annotationLayout(w, h, regions).forEach(({ ring, anchors }, k) => {
     if (!ring) return;
+    const i = numbers ? numbers[k] : k;
     const rgb = hex(regionColor(i));
     for (let p = 0; p < ring.d.length; p++) {
       if (!ring.d[p]) continue;

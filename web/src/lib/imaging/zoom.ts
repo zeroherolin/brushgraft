@@ -1,6 +1,7 @@
-// A small edit of a large image is sent as a close-up: the area around the regions, in the
+// A small edit of a large image is sent in close-ups: the area around the regions, in the
 // image's proportions, so the model sees them in detail. Python's counterparts are zoom_box,
-// zoom_size and shift_regions in brushgraft.imaging (the constants and the reasons are there).
+// zoom_parts, zoom_size and shift_regions in brushgraft.imaging (the constants and the reasons
+// are there).
 
 import { fitSize } from "../backend/sizes";
 import { spec } from "../backend/spec";
@@ -22,6 +23,40 @@ export function zoomBox(width: number, height: number, box: Box): Box | null {
   const left = Math.floor(Math.min(Math.max((x0 + x1) / 2 - w / 2, 0), width - w));
   const top = Math.floor(Math.min(Math.max((y0 + y1) / 2 - h / 2, 0), height - h));
   return [left, top, left + w, top + h];
+}
+
+/**
+ * The close-ups to send regions in, given each one's bounding box (null for an empty region):
+ * [close-up, the regions' indices], in the regions' order. Regions close together share one;
+ * regions too large for any are left out, and so are the largest close-ups past zoom_max_parts
+ * (those regions go with the whole image).
+ */
+export function zoomParts(width: number, height: number, boxes: (Box | null)[]): [Box, number[]][] {
+  const union = (group: number[]): Box => {
+    const bs = group.map((i) => boxes[i]!);
+    return [Math.min(...bs.map((b) => b[0])), Math.min(...bs.map((b) => b[1])), Math.max(...bs.map((b) => b[2])), Math.max(...bs.map((b) => b[3]))];
+  };
+  const area = (z: Box) => (z[2] - z[0]) * (z[3] - z[1]);
+  let groups = boxes.flatMap((b, i) => (b && zoomBox(width, height, b) ? [[i]] : []));
+  for (;;) {
+    let best: [number, number, number] | null = null;
+    for (let a = 0; a < groups.length; a++) {
+      for (let b = a + 1; b < groups.length; b++) {
+        const z = zoomBox(width, height, union([...groups[a], ...groups[b]]));
+        if (z && (best === null || area(z) < best[0])) best = [area(z), a, b];
+      }
+    }
+    if (best === null) break;
+    const [, a, b] = best;
+    groups[a] = [...groups[a], ...groups[b]].sort((x, y) => x - y);
+    groups = groups.filter((_, i) => i !== b);
+  }
+  let parts = groups.map((g): [Box, number[]] => [zoomBox(width, height, union(g))!, g]);
+  if (parts.length > K.zoom_max_parts) {
+    const kept = new Set([...parts].sort((p, q) => area(p[0]) - area(q[0])).slice(0, K.zoom_max_parts));
+    parts = parts.filter((p) => kept.has(p));
+  }
+  return parts;
 }
 
 /** The size to ask for a close-up in: its proportions, at least zoom_output_pixels. */

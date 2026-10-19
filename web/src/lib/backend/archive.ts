@@ -6,7 +6,7 @@
 
 import { Zip, ZipPassThrough, unzipSync } from "fflate";
 import { detectExt, sniff } from "../imaging/formats";
-import type { Job, JobError, Project, Region, ShapeOp, TreeNode } from "../types";
+import type { Job, JobError, Project, Region, SentRequest, ShapeOp, TreeNode } from "../types";
 import { ApiError, userError } from "./errors";
 import { charCount } from "./prompts";
 import { spec } from "./spec";
@@ -134,6 +134,17 @@ function jobError(v: unknown): JobError | string {
 }
 
 /** Check a project.json and return it in the shape the stores take. Throws bad_archive. */
+function sentRequest(r: unknown): SentRequest {
+  const box = isObject(r) ? r.box : 0;
+  if (!isObject(r) || (box !== null && (!Array.isArray(box) || box.length !== 4))) throw bad("a request is malformed");
+  return {
+    prompt: str(r.prompt, "a prompt sent", spec.max_full_prompt),
+    box: box === null ? null : (box.map((v) => Math.trunc(num(v, "a close-up", spec.imaging.max_coord))) as SentRequest["box"]),
+    size: str(r.size, "a size", 20, true),
+    annot_image: sha(r.annot_image, "an annotated image", true),
+  };
+}
+
 export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
   if (!isObject(raw) || raw.format !== A.format) throw bad("project.json is missing or has another format");
   if (typeof raw.version !== "number" || raw.version > A.version) {
@@ -169,6 +180,8 @@ export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
     if (refImages !== undefined && refImages !== null && (!Array.isArray(refImages) || refImages.length !== j.refs.length)) {
       throw bad("a job's reference images don't match its references");
     }
+    const requests = j.requests ?? []; // not in files from before edits were sent in parts
+    if (!Array.isArray(requests) || requests.length > spec.max_regions + 1) throw bad("a job has too many requests");
     const n = num(j.n, "a job's count");
     if (!Number.isInteger(n) || n < 1 || n > 4) throw bad("a job's count is out of range");
     const errors = Array.isArray(j.errors) ? j.errors.slice(0, 50).map(jobError) : [];
@@ -197,6 +210,7 @@ export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
       composite: j.composite === true,
       mask_image: sha(j.mask_image, "a mask", true),
       annot_image: sha(j.annot_image, "an annotated image", true),
+      requests: requests.map(sentRequest),
       status,
       done: Math.min(n, Math.max(0, Math.trunc(num(j.done ?? 0, "done")))),
       failed: Math.min(n, Math.max(0, Math.trunc(num(j.failed ?? 0, "failed")))),
@@ -234,7 +248,9 @@ export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
 export function referencedImages(m: Omit<ArchiveContent, "images">): Set<string> {
   const out = new Set<string>();
   for (const n of m.nodes) for (const s of [n.image, n.raw_image, n.merged_image]) if (s) out.add(s);
-  for (const j of m.jobs) for (const s of [j.mask_image, j.annot_image, ...j.ref_images]) if (s) out.add(s);
+  for (const j of m.jobs) {
+    for (const s of [j.mask_image, j.annot_image, ...j.ref_images, ...j.requests.map((r) => r.annot_image)]) if (s) out.add(s);
+  }
   return out;
 }
 

@@ -2,14 +2,15 @@
 // sent to the model and pasting the result back take a second or two on large images.
 
 import { browserCodec } from "./browser-codec";
-import { forApi, merge, normalizeUpload, prepare, thumbnail } from "./ops";
+import { forApi, merge, mergeParts, normalizeUpload, placeParts, prepare, thumbnail, type Piece } from "./ops";
 import type { Region } from "../types";
-import type { Box } from "./zoom";
 
 export type WorkerRequest =
   | { id: number; op: "normalize"; data: Uint8Array }
   | { id: number; op: "prepare"; parent?: Uint8Array; regions: Region[]; refs: Uint8Array[]; zoom?: boolean }
-  | { id: number; op: "merge"; parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean; zoom?: Box }
+  | { id: number; op: "merge"; parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean }
+  | { id: number; op: "mergeParts"; parent: Uint8Array; pieces: Piece[]; overall: boolean }
+  | { id: number; op: "placeParts"; parent: Uint8Array; pieces: Pick<Piece, "box" | "result">[] }
   | { id: number; op: "thumb"; data: Uint8Array }
   | { id: number; op: "forApi"; data: Uint8Array; maxPixels?: number };
 
@@ -29,8 +30,16 @@ async function run(req: WorkerRequest): Promise<{ value: unknown; transfer: Arra
     }
     case "merge": {
       const out = await merge(browserCodec, req);
-      const transfer = [out.image, out.whole].filter((b): b is Uint8Array => !!b).map((b) => b.buffer as ArrayBuffer);
+      return { value: out, transfer: out.image ? [out.image.buffer as ArrayBuffer] : [] };
+    }
+    case "mergeParts": {
+      const out = await mergeParts(browserCodec, req);
+      const transfer = [out.merged, out.raw].filter((b): b is Uint8Array => !!b).map((b) => b.buffer as ArrayBuffer);
       return { value: out, transfer };
+    }
+    case "placeParts": {
+      const bytes = await placeParts(browserCodec, req);
+      return { value: bytes, transfer: [bytes.buffer as ArrayBuffer] };
     }
     case "thumb": {
       const out = await thumbnail(browserCodec, req.data);

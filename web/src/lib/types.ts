@@ -91,6 +91,16 @@ export interface JobError {
 
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
+/** One request of an edit sent in parts. */
+export interface SentRequest {
+  prompt: string;
+  /** the close-up sent; null for the whole image */
+  box: [number, number, number, number] | null;
+  size: string;
+  /** the annotated image sent */
+  annot_image: string | null;
+}
+
 export interface Job {
   id: string;
   project_id: string;
@@ -109,6 +119,8 @@ export interface Job {
   composite: boolean;
   mask_image: string | null;
   annot_image: string | null;
+  /** an edit sent in parts (close-ups of its regions): each request, in the order sent; else empty */
+  requests: SentRequest[];
   status: JobStatus;
   done: number;
   failed: number;

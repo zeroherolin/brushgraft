@@ -226,7 +226,9 @@ export class BrowserBackend implements Backend {
     const images = new Map<string, Uint8Array>();
     const need = new Set<string>();
     for (const n of nodes) for (const s of [n.image, n.raw_image, n.merged_image]) if (s) need.add(s);
-    for (const j of jobs) for (const s of [j.mask_image, j.annot_image, ...j.ref_images]) if (s) need.add(s);
+    for (const j of jobs) {
+      for (const s of [j.mask_image, j.annot_image, ...j.ref_images, ...j.requests.map((r) => r.annot_image)]) if (s) need.add(s);
+    }
     for (const sha of need) images.set(sha, new Uint8Array((await this.#store.getImage(sha)).data));
     const archiveNodes = nodes.map(({ project_id: _p, width: _w, height: _h, ...rest }) => (void [_p, _w, _h], rest));
     const archiveJobs = jobs.map(({ project_id: _p, ...rest }) => (void _p, rest));

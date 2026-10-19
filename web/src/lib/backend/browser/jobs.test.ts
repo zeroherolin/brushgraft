@@ -1,14 +1,15 @@
 import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ImageOps } from "../../imaging/client";
-import { merge, normalizeUpload, prepare, thumbnail } from "../../imaging/ops";
+import { merge, mergeParts, normalizeUpload, placeParts, prepare, thumbnail } from "../../imaging/ops";
 import { describeJobError } from "../../joberror";
 import type { Job, JobError, ServerEvent, TreeNode } from "../../types";
 import { makePng, scenePng, b64, jsonResponse } from "../../../test/images";
 import { decodePng } from "../../../test/png";
-import { zoomBox, zoomSize } from "../../imaging/zoom";
-import { bbox } from "../../imaging/raster";
-import { unionMask } from "../../imaging/shapes";
+import { zoomBox, zoomParts, zoomSize, type Box } from "../../imaging/zoom";
+import { bbox, type Raster } from "../../imaging/raster";
+import { regionMask, unionMask } from "../../imaging/shapes";
+import { fitSize } from "../sizes";
 import { testCodec } from "../../../test/codec";
 import { ApiError } from "../errors";
 import { JobRunner } from "./jobs";
@@ -18,7 +19,9 @@ import type { JobRequest } from "../types";
 const ops: ImageOps = {
   normalize: (d) => normalizeUpload(testCodec, d),
   prepare: (parent, regions, refs, zoom) => prepare(testCodec, { parent, regions, refs, zoom }),
-  merge: (parent, result, mask, annot, overall, zoom) => merge(testCodec, { parent, result, mask, annot, overall, zoom }),
+  merge: (parent, result, mask, annot, overall) => merge(testCodec, { parent, result, mask, annot, overall }),
+  mergeParts: (parent, pieces, overall) => mergeParts(testCodec, { parent, pieces, overall }),
+  placeParts: (parent, pieces) => placeParts(testCodec, { parent, pieces }),
   thumb: (d) => thumbnail(testCodec, d),
 };
 
@@ -71,6 +74,48 @@ const base = (project_id: string, extra: Partial<JobRequest> = {}): JobRequest =
 const ok = (png: Uint8Array) => jsonResponse({ data: [{ b64_json: b64(png) }], usage: { total_tokens: 7 } });
 
 const codeOf = async (p: Promise<unknown>) => ((await p.catch((e) => e)) as ApiError).code;
+
+interface Sent {
+  prompt: string;
+  /** the size asked for */
+  size: string;
+  images: Raster[];
+}
+
+/**
+ * A model that does as it is asked: what it was sent (the whole image, or the close-up in ``zooms`` of
+ * its size, told apart by its content on ``original``) at the size asked for, with ``objects`` (boxes on
+ * the whole image) drawn white in it; with ``overcast``, every color grey-blue. What it got goes in ``sent``.
+ */
+function drawing(original: Raster, zooms: Box[], objects: Box[], sent: Sent[], overcast = false): Reply {
+  return async (call) => {
+    const form = await new Request("http://x", { method: "POST", headers: call.headers as HeadersInit, body: call.body as Blob }).formData();
+    const ims = await Promise.all((form.getAll("image[]") as Blob[]).map(async (f) => decodePng(Buffer.from(await f.arrayBuffer()), "RGB")));
+    const size = form.get("size") as string;
+    sent.push({ prompt: form.get("prompt") as string, size, images: ims });
+    const im = ims[0];
+    const differs = (z: Box) => {
+      let sum = 0;
+      for (let y = 0; y < im.height; y += 7) for (let x = 0; x < im.width; x += 7) sum += Math.abs(im.data[(y * im.width + x) * 3] - original.data[((z[1] + y) * original.width + z[0] + x) * 3]);
+      return sum;
+    };
+    const fits = zooms.filter((z) => z[2] - z[0] === im.width && z[3] - z[1] === im.height).sort((a, b) => differs(a) - differs(b));
+    const [x0, y0, x1] = fits[0] ?? [0, 0, original.width];
+    const [w, h] = size.split("x").map(Number);
+    const k = w / (x1 - x0);
+    return ok(
+      makePng(w, h, (x, y) => {
+        const [ox, oy] = [x0 + x / k, y0 + y / k];
+        if (objects.some(([a, b, c, d]) => ox >= a && ox < c && oy >= b && oy < d)) return [255, 255, 255];
+        const i = (Math.min(im.height - 1, Math.floor((y * im.height) / h)) * im.width + Math.min(im.width - 1, Math.floor((x * im.width) / w))) * 3;
+        const [r, g, b] = [im.data[i], im.data[i + 1], im.data[i + 2]];
+        if (!overcast) return [r, g, b];
+        const v = (r * 299 + g * 587 + b * 114) / 1000;
+        return [v * 0.55 + 20, v * 0.6 + 30, v * 0.7 + 70].map(Math.round) as [number, number, number];
+      }),
+    );
+  };
+}
 
 let s: ReturnType<typeof setup>;
 let projectId: string;
@@ -218,34 +263,16 @@ describe("editing", () => {
     const region = { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 1200, y: 200, w: 80, h: 60 }] };
     // from the mask's bounds, as the job does (a rectangle includes its far edge)
     const zoom = zoomBox(W, H, bbox(unionMask(W, H, [region]))!)!;
-    let sent: number[][] = [];
-    let asked = "";
-    s.replies.push(async (call) => {
-      const form = await new Request("http://x", { method: "POST", headers: call.headers as HeadersInit, body: call.body as Blob }).formData();
-      const ims = await Promise.all(
-        (form.getAll("image[]") as Blob[]).map(async (f) => decodePng(Buffer.from(await f.arrayBuffer()), "RGB")),
-      );
-      sent = ims.map((im) => [im.width, im.height]);
-      asked = form.get("size") as string;
-      // what a model does: the close-up it was sent, at the size asked for, with the object in the region
-      const [w, h] = asked.split("x").map(Number);
-      const k = w / ims[0].width;
-      const [rx, ry] = [1200 - zoom[0], 200 - zoom[1]];
-      return ok(
-        makePng(w, h, (x, y) => {
-          const [sx, sy] = [Math.min(ims[0].width - 1, Math.floor(x / k)), Math.min(ims[0].height - 1, Math.floor(y / k))];
-          if (sx >= rx + 8 && sx < rx + 72 && sy >= ry + 8 && sy < ry + 52) return [255, 255, 255];
-          const i = (sy * ims[0].width + sx) * 3;
-          return [ims[0].data[i], ims[0].data[i + 1], ims[0].data[i + 2]];
-        }),
-      );
-    });
+    const sent: Sent[] = [];
+    s.replies.push(drawing(o, [zoom], [[1208, 208, 1272, 252]], sent));
     const job = await s.runner.submit(base(projectId, { parent_id: parent.id, prompt: "", regions: [region], size: null, model: "gpt-image-2.5-flare" }));
     expect((await waitDone(s, job.id)).status).toBe("done");
-    expect(sent).toEqual([[zoom[2] - zoom[0], zoom[3] - zoom[1]], [zoom[2] - zoom[0], zoom[3] - zoom[1]]]);
-    expect(asked).toBe(zoomSize(zoom));
-    expect((await s.store.getJob(job.id)).size).toBe(asked);
-    expect(s.runner.logs(job.id).some((l) => l.msg.includes("close-up of the regions"))).toBe(true);
+    expect(sent[0].images.map((im) => [im.width, im.height])).toEqual([[zoom[2] - zoom[0], zoom[3] - zoom[1]], [zoom[2] - zoom[0], zoom[3] - zoom[1]]]);
+    expect(sent[0].size).toBe(zoomSize(zoom));
+    const stored = await s.store.getJob(job.id);
+    expect(stored.size).toBe(fitSize(W, H)); // what the whole image would be sent at
+    expect(stored.requests).toEqual([{ prompt: sent[0].prompt, box: zoom, size: sent[0].size, annot_image: stored.annot_image }]);
+    expect(s.runner.logs(job.id).some((l) => l.msg.includes("a close-up of"))).toBe(true);
     const node = (await s.store.projectTree(projectId)).nodes.find((n) => n.job_id === job.id)!;
     const merged = decodePng(Buffer.from((await s.store.getImage(node.image)).data), "RGB");
     const whole = decodePng(Buffer.from((await s.store.getImage(node.raw_image!)).data), "RGB");
@@ -257,6 +284,70 @@ describe("editing", () => {
       for (const [x, y] of [[zoom[0] - 1, 230], [5, 5], [W - 1, zoom[3]], [1240, zoom[3] + 2]]) expect(at(im, x, y)).toEqual(at(o, x, y));
     }
   }, 30_000); // a large image: slow on a shared CI machine
+
+  it("sends regions far apart as close-ups, made into one version", async () => {
+    const [W, H] = [1600, 1100];
+    const original = scenePng(W, H);
+    const parent = await root(original);
+    const o = decodePng(Buffer.from(original), "RGB");
+    const regions = [
+      { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 100, y: 100, w: 60, h: 50 }] },
+      { instruction: "a blue cup", shapes: [{ type: "rect" as const, x: 1400, y: 950, w: 60, h: 50 }] },
+    ];
+    const zooms = zoomParts(W, H, regions.map((r) => bbox(regionMask(W, H, r.shapes)))).map(([z]) => z);
+    expect(zooms).toHaveLength(2);
+    const sent: Sent[] = [];
+    const objects: Box[] = [[105, 105, 155, 145], [1405, 955, 1455, 995]];
+    s.replies.push(drawing(o, zooms, objects, sent), drawing(o, zooms, objects, sent));
+    const job = await s.runner.submit(base(projectId, { parent_id: parent.id, prompt: "", regions, size: null, model: "gpt-image-2.5-flare" }));
+    const done = await waitDone(s, job.id);
+    expect([done.status, done.usage]).toEqual(["done", { total_tokens: 14 }]);
+    const second = sent.find((c) => c.prompt.includes("a blue cup"))!;
+    // each close-up shows its own regions, with their numbers and colors
+    expect(second.prompt).toContain("Area 2 (blue): a blue cup");
+    expect(second.prompt).not.toContain("Area 1");
+    const colors = new Set<string>();
+    const annot = second.images[1];
+    for (let i = 0; i < annot.data.length; i += 3) colors.add(`${annot.data[i]},${annot.data[i + 1]},${annot.data[i + 2]}`);
+    expect([colors.has("0,122,255"), colors.has("255,59,48")]).toEqual([true, false]);
+    expect(done.requests.map((r) => r.box)).toEqual(zooms);
+    const nodes = (await s.store.projectTree(projectId)).nodes.filter((n) => n.job_id === job.id);
+    expect(nodes).toHaveLength(1);
+    const merged = decodePng(Buffer.from((await s.store.getImage(nodes[0].image)).data), "RGB");
+    const at = (x: number, y: number) => Array.from(merged.data.subarray((y * W + x) * 3, (y * W + x) * 3 + 3));
+    expect([at(130, 125), at(1430, 975)]).toEqual([[255, 255, 255], [255, 255, 255]]);
+  }, 30_000);
+
+  it("sends the whole image as well when the overall request changed all of a close-up", async () => {
+    const [W, H] = [1600, 1100];
+    const original = scenePng(W, H);
+    const parent = await root(original);
+    const o = decodePng(Buffer.from(original), "RGB");
+    const region = { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 1200, y: 200, w: 60, h: 50 }] };
+    const zoom = zoomBox(W, H, bbox(unionMask(W, H, [region]))!)!;
+    const sent: Sent[] = [];
+    const objects: Box[] = [[1205, 205, 1255, 245]];
+    s.replies.push(drawing(o, [zoom], objects, sent, true), drawing(o, [zoom], objects, sent, true));
+    const job = await s.runner.submit(
+      base(projectId, { parent_id: parent.id, prompt: "make the sky overcast", regions: [region], size: null, model: "gpt-image-2.5-flare" }),
+    );
+    const done = await waitDone(s, job.id);
+    expect([done.status, done.usage]).toEqual(["done", { total_tokens: 14 }]);
+    expect(sent.map((c) => [c.images[0].width, c.images[0].height])).toEqual([[zoom[2] - zoom[0], zoom[3] - zoom[1]], [W, H]]);
+    expect(sent[1].prompt).toBe(done.full_prompt);
+    expect(done.requests.map((r) => r.box)).toEqual([zoom, null]);
+    expect(s.runner.logs(job.id).some((l) => l.msg.includes("sending the whole image as well"))).toBe(true);
+    const node = (await s.store.projectTree(projectId)).nodes.find((n) => n.job_id === job.id)!;
+    expect(node.note).toBe("overall_change");
+    expect(node.image).toBe(node.raw_image);
+    const adopted = decodePng(Buffer.from((await s.store.getImage(node.image)).data), "RGB");
+    const merged = decodePng(Buffer.from((await s.store.getImage(node.merged_image!)).data), "RGB");
+    const at = (im: Raster, x: number, y: number) => Array.from(im.data.subarray((y * W + x) * 3, (y * W + x) * 3 + 3));
+    // the whole image changed, with the region's object from the close-up in it; the pasted-back one changed the region only
+    expect(Math.min(...at(adopted, 1230, 225))).toBeGreaterThan(230);
+    expect(at(adopted, 200, 900)).not.toEqual(at(o, 200, 900));
+    expect(at(merged, 200, 900)).toEqual(at(o, 200, 900));
+  }, 30_000);
 
   it("adopts the whole output when the overall request changed the whole image, keeping the pasted one", async () => {
     const [W, H] = [720, 480];

@@ -13,6 +13,7 @@ const have = existsSync(`${dir}cases.json`);
 interface Case {
   size: [number, number];
   regions: Region[];
+  numbers: number[] | null;
   badges: [number, number][];
   badge: number;
   exact: boolean;
@@ -22,7 +23,7 @@ describe.skipIf(!have)("annotation boxes match Python's", () => {
   const cases: Case[] = have ? JSON.parse(readFileSync(`${dir}cases.json`, "utf8")) : [];
   cases.forEach((c, k) => {
     it(`${k}: ${c.regions.length} region(s) on ${c.size.join("x")}`, async () => {
-      const got = await annotate(testCodec, readPng(`${dir}${k}_orig.png`, "RGB"), c.regions);
+      const got = await annotate(testCodec, readPng(`${dir}${k}_orig.png`, "RGB"), c.regions, c.numbers ?? undefined);
       const want = readPng(`${dir}${k}_annot.png`, "RGB");
       // Compare away from the badges: their numbers use another font, their discs another edge rule
       const near = (x: number, y: number) => c.badges.some(([bx, by]) => Math.abs(x - bx) <= c.badge + 3 && Math.abs(y - by) <= c.badge + 3);

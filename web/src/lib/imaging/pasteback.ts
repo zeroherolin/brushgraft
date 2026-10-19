@@ -440,8 +440,17 @@ export interface PasteResult {
    */
   image: Raster | null;
   note: string;
-  /** the model's output after undoing its tone drift: what was pasted from */
-  toned?: Raster;
+}
+
+/** pasteBack's work before the blend (see pasteWeights). */
+export interface PasteWeights {
+  /** the model's output with its tone drift undone, in the original's channels; null when it redrew the scene */
+  toned: Raster | null;
+  /** the weights it is pasted with, from (x0, y0) on (none elsewhere); null: none at all */
+  soft: Raster | null;
+  x0: number;
+  y0: number;
+  note: string;
 }
 
 /**
@@ -451,8 +460,26 @@ export interface PasteResult {
  * ``overall``: the user also wrote an overall request, which may ask for changes everywhere.
  */
 export function pasteBack(original: Raster, result: Raster, mask: Raster, annotated: Raster | null, overall = false): PasteResult {
+  const w = pasteWeights(original, result, mask, annotated, overall);
+  if (!w.toned) return { image: null, note: w.note };
+  const image = copyRaster(original.channels === 4 ? toRgba(original) : toRgb(original));
+  blendOnto(image, w.toned, w);
+  return { image, note: w.note };
+}
+
+/** ``top`` over ``base`` (changed in place) by the weights of pasteWeights, in ``base``'s channels. */
+export function blendOnto(base: Raster, top: Raster, w: Pick<PasteWeights, "soft" | "x0" | "y0">): void {
+  if (!w.soft) return;
+  const x1 = w.x0 + w.soft.width;
+  const y1 = w.y0 + w.soft.height;
+  const res = top.channels === base.channels ? top : base.channels === 4 ? toRgba(top) : toRgb(top);
+  paste(base, composite(crop(res, w.x0, w.y0, x1, y1), crop(base, w.x0, w.y0, x1, y1), w.soft), w.x0, w.y0);
+}
+
+/** pasteBack's work before the blend: brushgraft.imaging.paste_weights. */
+export function pasteWeights(original: Raster, result: Raster, mask: Raster, annotated: Raster | null, overall = false): PasteWeights {
   const { width, height } = original;
-  if (!aligned(original, result, mask)) return { image: null, note: NOTE.reframed };
+  if (!aligned(original, result, mask)) return { toned: null, soft: null, x0: 0, y0: 0, note: NOTE.reframed };
   const scale = scaleFor(width, height);
   const seed = smallBits(mask, scale);
   const { w, h } = seed;
@@ -520,12 +547,10 @@ export function pasteBack(original: Raster, result: Raster, mask: Raster, annota
     settle = pieces.settle;
   }
 
-  const asRgba = original.channels === 4;
-  const orig = asRgba ? toRgba(original) : toRgb(original);
-  const res = asRgba ? toRgba(toned) : toRgb(toned);
+  const res = original.channels === 4 ? toRgba(toned) : toRgb(toned);
   const box = bbox(areaImg);
   const note = changedOverall ? NOTE.overall_change : grown.note;
-  if (!box) return { image: copyRaster(orig), note, toned };
+  if (!box) return { toned: res, soft: null, x0: 0, y0: 0, note };
   // Blurs reach a bounded distance, so work on the box around the area plus that much (and the
   // whole pieces' box): the result is the same as blurring the whole image, at a fraction of the cost
   const margin = Math.max(2 * blurReach(radius) + 2, K.piece_zone * radius + 6);
@@ -540,7 +565,5 @@ export function pasteBack(original: Raster, result: Raster, mask: Raster, annota
   // the outlines lie within the feathered edge: where the model copied them, the original goes back
   if (band) soft = darker(soft, point(crop(band, x0, y0, x1, y1), (v) => 255 - v));
   if (settle) soft = settle(soft, x0, y0);
-  const image = copyRaster(orig);
-  paste(image, composite(crop(res, x0, y0, x1, y1), crop(orig, x0, y0, x1, y1), soft), x0, y0);
-  return { image, note, toned };
+  return { toned: res, soft, x0, y0, note };
 }

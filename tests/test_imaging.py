@@ -623,6 +623,37 @@ class TestZoom:
     def test_otherwise_the_whole_image_goes(self, size, box):
         assert imaging.zoom_box(size, box) is None
 
+    def test_regions_close_together_share_a_close_up(self):
+        size = (6000, 4000)
+        boxes = [(1000, 1000, 1100, 1080), (1300, 1100, 1400, 1180),  # near each other
+                 (5000, 3500, 5100, 3580),                             # far from them
+                 None,                                                 # empty
+                 (0, 0, 4000, 3000)]                                   # too large for any
+        parts = imaging.zoom_parts(size, boxes)
+        assert [numbers for _, numbers in parts] == [[0, 1], [2]]
+        z = parts[0][0]
+        assert z == imaging.zoom_box(size, (1000, 1000, 1400, 1180))
+        assert imaging.zoom_parts(size, [(1000, 1000, 1100, 1080)]) == [
+            (imaging.zoom_box(size, (1000, 1000, 1100, 1080)), [0])]
+
+    def test_past_the_most_close_ups_the_largest_go_whole(self):
+        size = (8000, 8000)
+        # far apart, each its own close-up; the larger, the later
+        boxes = [(x, y, x + 100 + 300 * k, y + 100)
+                 for k, (x, y) in enumerate([(100, 100), (5000, 100), (100, 5000), (5000, 5000),
+                                             (2500, 2500)])]
+        parts = imaging.zoom_parts(size, boxes)
+        assert [numbers for _, numbers in parts] == [[0], [1], [2], [3]]
+        assert len(parts) == imaging.ZOOM_MAX_PARTS
+        boxes.reverse()  # the order of the regions is kept
+        assert [numbers for _, numbers in imaging.zoom_parts(size, boxes)] == [[1], [2], [3], [4]]
+
+    def test_a_close_up_shows_its_regions_with_their_own_numbers_and_colors(self):
+        region = {"shapes": [{"type": "rect", "x": 40, "y": 40, "w": 60, "h": 40}]}
+        image = Image.new("RGB", (200, 150), (128, 128, 128))
+        colors = {c for _, c in imaging.annotate(image, [region], numbers=[2]).getcolors(10000)}
+        assert (52, 199, 89) in colors and (255, 59, 48) not in colors  # green, region 3's
+
     def test_regions_move_with_the_crop(self):
         regions = [{"instruction": "a", "shapes": [
             {"type": "rect", "x": 10, "y": 20, "w": 5, "h": 5, "op": "subtract"},

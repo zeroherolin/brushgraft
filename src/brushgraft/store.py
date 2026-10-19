@@ -34,7 +34,7 @@ import promptbrush as pb
 from brushgraft.errors import NotFound, UserError
 
 DB_FILE = "brushgraft.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # A reference to an asset, in a job's refs (anything else is a version's id)
 ASSET_REF = "asset:"
 THUMB_EDGE = 384
@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     composite    INTEGER NOT NULL,          -- paste the regions back onto the parent
     mask_image   TEXT,                      -- region mask (white = selected)
     annot_image  TEXT,                      -- annotated copy sent to the model
+    requests     TEXT NOT NULL DEFAULT '[]', -- JSON: an edit sent in parts, each request
+                                            -- [{prompt, box, size, annot_image}] (see jobs.py)
     status       TEXT NOT NULL,             -- queued | running | done | failed
     done         INTEGER NOT NULL DEFAULT 0,
     failed       INTEGER NOT NULL DEFAULT 0,
@@ -111,7 +113,7 @@ CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project_id);
 CREATE INDEX IF NOT EXISTS jobs_parent ON jobs(parent_id);
 """
 
-_JSON_FIELDS = ("regions", "refs", "ref_images", "errors", "usage")
+_JSON_FIELDS = ("regions", "refs", "ref_images", "requests", "errors", "usage")
 
 
 def new_id() -> str:
@@ -155,6 +157,9 @@ class Store:
         self._db.executescript(_SCHEMA)
         if version == 1:
             self._migrate_from_1()
+        if version in (1, 2):
+            # version 3: jobs.requests
+            self._db.execute("ALTER TABLE jobs ADD COLUMN requests TEXT NOT NULL DEFAULT '[]'")
         self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_from_1(self) -> None:
@@ -249,6 +254,9 @@ class Store:
                     UNION SELECT annot_image FROM jobs WHERE annot_image IS NOT NULL
                     UNION SELECT r.value FROM jobs, json_each(jobs.ref_images) r
                         WHERE r.value IS NOT NULL
+                    UNION SELECT json_extract(r.value, '$.annot_image')
+                        FROM jobs, json_each(jobs.requests) r
+                        WHERE json_extract(r.value, '$.annot_image') IS NOT NULL
                     UNION SELECT image FROM assets)
             """)]
             for sha in unused:
@@ -319,7 +327,8 @@ class Store:
         for n in tree["nodes"]:
             shas.update(s for s in (n["image"], n["raw_image"], n["merged_image"]) if s)
         for j in tree["jobs"]:
-            shas.update(s for s in (j["mask_image"], j["annot_image"], *j["ref_images"]) if s)
+            shas.update(s for s in (j["mask_image"], j["annot_image"], *j["ref_images"],
+                                    *(r["annot_image"] for r in j["requests"])) if s)
         return {sha: self.read_image(sha) for sha in shas}
 
     def import_project(self, project: dict, nodes: list[dict], jobs: list[dict],
@@ -345,6 +354,7 @@ class Store:
                               "regions": json.dumps(j["regions"], ensure_ascii=False),
                               "refs": json.dumps(j["refs"]),
                               "ref_images": json.dumps(j["ref_images"]),
+                              "requests": json.dumps(j["requests"], ensure_ascii=False),
                               "errors": json.dumps(j["errors"], ensure_ascii=False),
                               "usage": json.dumps(j["usage"]) if j["usage"] else None}
                     # a job that was still running when it was exported never finishes here
@@ -554,7 +564,7 @@ class Store:
         with self._lock:
             job = self.get_job(job_id)
             errors = job["errors"] + ([error] if error else [])
-            total = _add_usage(job["usage"], usage)
+            total = add_usage(job["usage"], usage)
             done = job["done"] + int(ok)
             failed = job["failed"] + int(not ok)
             status, finished = job["status"], None
@@ -568,6 +578,15 @@ class Store:
                  json.dumps(total) if total else None, status, finished,
                  job_id))
             return self.get_job(job_id)
+
+    def add_job_request(self, job_id: str, request: dict) -> None:
+        """Record a request a job sent besides those it was made with (the whole image, for an
+        edit sent in close-ups), once."""
+        with self._lock:
+            requests = self.get_job(job_id)["requests"]
+            if request not in requests:
+                self._db.execute("UPDATE jobs SET requests = ? WHERE id = ?",
+                                 (json.dumps(requests + [request], ensure_ascii=False), job_id))
 
     def delete_job(self, job_id: str) -> None:
         """Delete a job with the nodes it produced (and their subtrees)."""
@@ -619,7 +638,7 @@ def _decode(row: sqlite3.Row) -> dict:
     return d
 
 
-def _add_usage(total: dict | None, usage: dict | None) -> dict | None:
+def add_usage(total: dict | None, usage: dict | None) -> dict | None:
     if not usage:
         return total
     total = dict(total or {})

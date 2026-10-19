@@ -22,7 +22,7 @@ beforeEach(() => {
 
 const jobFor = (projectId: string, parentId: string | null = null, n = 1) => ({
   project_id: projectId, parent_id: parentId, kind: (parentId ? "edit" : "generate") as "edit" | "generate", prompt: "p", full_prompt: "p",
-  regions: [], refs: [], ref_images: [], model: "m", size: "1024x1024", n, composite: false, mask_image: null, annot_image: null, owner: "tab",
+  regions: [], refs: [], ref_images: [], model: "m", size: "1024x1024", n, composite: false, mask_image: null, annot_image: null, requests: [], owner: "tab",
 });
 
 describe("images", () => {

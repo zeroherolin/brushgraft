@@ -332,15 +332,17 @@ def mask_cases(out: Path) -> None:
         base = scene(size, k)
         imaging.union_mask(size, regions).save(out / f"{k}.png")
         base.save(out / f"{k}_orig.png")
-        imaging.annotate(base, regions).save(out / f"{k}_annot.png")
+        # some as a close-up shows them: numbered (and colored) as among more regions
+        numbers = [i + 2 for i in range(len(regions))] if k % 3 == 1 else None
+        imaging.annotate(base, regions, numbers).save(out / f"{k}_annot.png")
         # where the numbered badges are (the numbers use different fonts, so tests skip them)
         w, h = size
         badge = imaging.annotation_badge(size)
         occupied = imaging.union_mask(size, regions)
         badges = [list(imaging._badge_center(occupied, anchors, badge))
                   for ring, anchors in imaging.annotation_layout(size, regions) if ring is not None]
-        cases.append({"size": size, "regions": regions, "badges": badges, "badge": badge,
-                      "exact": k >= 12,
+        cases.append({"size": size, "regions": regions, "numbers": numbers, "badges": badges,
+                      "badge": badge, "exact": k >= 12,
                       "feather": imaging.feather_radius(size)})
     (out / "cases.json").write_text(json.dumps(cases, indent=1))
 
@@ -384,6 +386,18 @@ def rules_cases(out: Path) -> None:
             res = {"error": exc.code, "params": exc.params, "message": str(exc)}
         prompts.append({"prompt": prompt, "regions": regions, "parent": parent, "refs": 0,
                         "lang": "zh", **res})
+    # The regions of a close-up, numbered as among all of an edit's
+    for (instr, numbers), prompt, lang in itertools.product(
+            [(["a hat"], [3]), (["a hat", ""], [0, 9]), (["x", "y"], [7, 19])],
+            ("", "make it blue"), ("en", "zh")):
+        regions = [{"instruction": i, "shapes": []} for i in instr]
+        try:
+            res = {"text": compile_prompt(prompt, regions, has_parent=True, ref_count=1, lang=lang,
+                                          numbers=numbers)}
+        except UserError as exc:
+            res = {"error": exc.code, "params": exc.params, "message": str(exc)}
+        prompts.append({"prompt": prompt, "regions": regions, "parent": True, "refs": 1,
+                        "lang": lang, "numbers": numbers, **res})
     sizes = []
     dims = [(1, 1), (640, 480), (1024, 1024), (1536, 1024), (4000, 3000), (5000, 100), (100, 5000),
             (3840, 2160), (800, 600), (1200, 1600), (333, 777), (4096, 4096), (97, 31),
@@ -419,8 +433,23 @@ def rules_cases(out: Path) -> None:
         zoom = imaging.zoom_box(size, box)
         zooms.append({"size": size, "box": box, "zoom": zoom,
                       "output": imaging.zoom_size(zoom) if zoom else None})
+    # how regions are grouped into close-ups: mostly small ones, some large, some empty
+    parts = []
+    for _ in range(80):
+        w, h = (int(v) for v in rng.integers(1500, 9000, 2))
+        boxes = []
+        for _ in range(int(rng.integers(1, 9))):
+            if rng.random() < 0.1:
+                boxes.append(None)
+                continue
+            x0, y0 = int(rng.integers(0, w - 2)), int(rng.integers(0, h - 2))
+            reach = 400 if rng.random() < 0.8 else 4000
+            boxes.append((x0, y0, min(w, x0 + int(rng.integers(1, reach))),
+                          min(h, y0 + int(rng.integers(1, reach)))))
+        parts.append({"size": (w, h), "boxes": boxes,
+                      "parts": imaging.zoom_parts((w, h), boxes)})
     (out / "rules.json").write_text(json.dumps(
-        {"prompts": prompts, "sizes": sizes, "checks": checks, "zooms": zooms},
+        {"prompts": prompts, "sizes": sizes, "checks": checks, "zooms": zooms, "parts": parts},
         ensure_ascii=False))
 
 
@@ -451,7 +480,11 @@ def archive_cases(out: Path) -> None:
     jobs = [{"id": "j1", "parent_id": "aa11", "kind": "edit", "prompt": "", "full_prompt": "x",
              "regions": [region], "refs": ["aa11", "asset:hat1"],
              "ref_images": [sha[0], sha[2]], "model": "gpt-image-2", "size": "1536x1024",
-             "n": 1, "composite": True, "mask_image": None, "annot_image": None, "status": "done",
+             "n": 1, "composite": True, "mask_image": None, "annot_image": None,
+             "requests": [{"prompt": "x", "box": [10, 20, 30, 40], "size": "1536x1024",
+                           "annot_image": sha[2]},
+                          {"prompt": "x", "box": None, "size": "1536x1024", "annot_image": None}],
+             "status": "done",
              "done": 1, "failed": 0,
              "errors": [{"code": "network", "detail": "boom", "variant": "1/2"}],
              "usage": {"total_tokens": 12}, "created_at": 1700000040.0,

@@ -847,4 +847,9 @@ test("a small edit of a large image goes as a close-up, and its result lands whe
   expect(pixel.slice(0, 2)).toEqual([W, H]);
   expect(pixel[2]).toBeGreaterThan(150); // the blob's red
   expect(pixel[3]).toBeLessThan(90);
+  // Version details names the close-up that was sent
+  await page.locator(".tree .row").nth(1).click();
+  await page.locator("details.info > summary").click();
+  await page.locator("details.sent > summary").click();
+  await expect(page.locator("details.sent .request")).toHaveText(/^Close-up \d+ × \d+ at \(\d+, \d+\)$/);
 });

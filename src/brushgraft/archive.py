@@ -63,8 +63,8 @@ def node_record(node: dict) -> dict:
 
 def job_record(job: dict) -> dict:
     keys = ("id", "parent_id", "kind", "prompt", "full_prompt", "regions", "refs", "ref_images",
-            "model", "size", "n", "composite", "mask_image", "annot_image", "status", "done",
-            "failed", "errors", "usage", "created_at", "finished_at")
+            "model", "size", "n", "composite", "mask_image", "annot_image", "requests", "status",
+            "done", "failed", "errors", "usage", "created_at", "finished_at")
     return {k: job[k] for k in keys}
 
 
@@ -178,6 +178,16 @@ def _job_error(e: Any) -> Any:
             "variant": _text(e.get("variant"), "a variant", 20, optional=True)}
 
 
+def _request(r: Any) -> dict:
+    box = r.get("box") if isinstance(r, dict) else 0
+    if box is not None and (not isinstance(box, list) or len(box) != 4):
+        raise _bad("a request is malformed")
+    return {"prompt": _text(r.get("prompt"), "a prompt sent", MAX_FULL_PROMPT),
+            "box": None if box is None else [int(_number(v, "a close-up", MAX_COORD)) for v in box],
+            "size": _text(r.get("size"), "a size", 20, optional=True),
+            "annot_image": _sha(r.get("annot_image"), "an annotated image", True)}
+
+
 def _node(n: Any) -> dict:
     if not isinstance(n, dict):
         raise _bad("a version is malformed")
@@ -201,6 +211,7 @@ def _job(j: Any) -> dict:
     if j.get("kind") not in ("generate", "edit"):
         raise _bad("a job has an unknown kind")
     regions, refs, ref_images = j.get("regions"), j.get("refs"), j.get("ref_images")
+    requests = j.get("requests", [])  # not in files from before edits were sent in parts
     if not isinstance(regions, list) or len(regions) > MAX_REGIONS:
         raise _bad("a job has too many regions")
     if not isinstance(refs, list) or len(refs) > 8:
@@ -208,6 +219,8 @@ def _job(j: Any) -> dict:
     if ref_images is not None and (not isinstance(ref_images, list)
                                    or len(ref_images) != len(refs)):
         raise _bad("a job's reference images don't match its references")
+    if not isinstance(requests, list) or len(requests) > MAX_REGIONS + 1:
+        raise _bad("a job has too many requests")
     n = _number(j.get("n"), "a job's count")
     if n != int(n) or not 1 <= n <= 4:
         raise _bad("a job's count is out of range")
@@ -233,6 +246,7 @@ def _job(j: Any) -> dict:
         "composite": j.get("composite") is True,
         "mask_image": _sha(j.get("mask_image"), "a mask", True),
         "annot_image": _sha(j.get("annot_image"), "an annotated image", True),
+        "requests": [_request(r) for r in requests],
         "status": status if isinstance(status, str) and status in _STATUS else "failed",
         "done": min(int(n), max(0, int(_number(j.get("done", 0), "done")))),
         "failed": min(int(n), max(0, int(_number(j.get("failed", 0), "failed")))),
@@ -297,7 +311,8 @@ def referenced_images(manifest: dict) -> set[str]:
     for n in manifest["nodes"]:
         out.update(s for s in (n["image"], n["raw_image"], n["merged_image"]) if s)
     for j in manifest["jobs"]:
-        out.update(s for s in (j["mask_image"], j["annot_image"], *j["ref_images"]) if s)
+        out.update(s for s in (j["mask_image"], j["annot_image"], *j["ref_images"],
+                               *(r["annot_image"] for r in j["requests"])) if s)
     return out
 
 

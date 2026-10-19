@@ -68,6 +68,13 @@ def test_every_box_color_has_a_name_and_colors_repeat_with_the_boxes():
     assert "Area 9 (red): r8" in text and "Area 10 (blue): r9" in text
 
 
+def test_a_close_up_names_its_regions_by_their_own_numbers():
+    text = compile_prompt("keep the light", [region("a cup"), region("")], has_parent=True,
+                          numbers=[1, 4], lang="zh")
+    assert "② 号圈（蓝色）内：a cup" in text and "⑤ 号圈（紫色）内：按整体要求修改" in text
+    assert "整体要求：keep the light" in text
+
+
 def test_regions_without_overall_request_need_every_instruction():
     compile_prompt("", [region("remove it")], has_parent=True)
     with pytest.raises(UserError) as exc:

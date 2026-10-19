@@ -32,7 +32,9 @@ function checked(full: string): string {
 export function compilePrompt(
   promptIn: string,
   regions: Pick<Region, "instruction">[],
-  opts: { hasParent: boolean; refCount?: number; lang?: "en" | "zh" },
+  // numbers: each region's place among all of an edit's (from 0), when only some are sent (a
+  // close-up): it keeps its number and color, as in annotate
+  opts: { hasParent: boolean; refCount?: number; lang?: "en" | "zh"; numbers?: number[] },
 ): string {
   const prompt = promptIn.trim();
   const refCount = opts.refCount ?? 0;
@@ -70,7 +72,8 @@ export function compilePrompt(
   if (refCount) lines.push(fill(text.region_refs, { refs }));
   lines.push(text.lead);
   const colors = spec.prompt.colors[opts.lang ?? "en"];
-  instructions.forEach((instruction, k) => {
+  instructions.forEach((instruction, i) => {
+    const k = opts.numbers ? opts.numbers[i] : i;
     lines.push(
       fill(text.region, {
         k: k + 1,

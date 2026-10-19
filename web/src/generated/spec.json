@@ -258,6 +258,7 @@
     "zoom_context": 2.0,
     "zoom_min_pixels": 589824,
     "zoom_max_share": 0.35,
-    "zoom_output_pixels": 1572864
+    "zoom_output_pixels": 1572864,
+    "zoom_max_parts": 4
   }
 }
