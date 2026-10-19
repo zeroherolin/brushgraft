@@ -8,6 +8,7 @@
 
 import { ApiError, backend, type JobRequest } from "./backend";
 import { charCount } from "./backend/prompts";
+import { canCopyImage, copyImage, cutOut } from "./clipboard";
 import { spec } from "./backend/spec";
 import { dialogs } from "./dialogs.svelte";
 import { fig } from "./format";
@@ -947,6 +948,38 @@ class AppState {
     await this.loadAssets();
     if (added) this.notify(t("toast.assetsAdded", { n: added }));
     else if (already) this.notify(t("toast.assetAlready", { name: already.name }));
+  }
+
+  /** The version's image onto the clipboard, at full size (the one on screen may be scaled). */
+  copyImage(node: TreeNode): void {
+    void this.#copy(() => backend.imageBlob(node.image), t("toast.copied"));
+  }
+
+  /** What a region of the draft covers of the version's image, cut out (transparent around it). */
+  copyRegion(index: number): void {
+    const node = this.selected;
+    const region = this.draft.regions[index];
+    if (!node || !region) return;
+    const shapes = $state.snapshot(region.shapes) as Shape[];
+    void this.#copy(async () => {
+      const cut = await cutOut(await backend.imageBlob(node.image), shapes);
+      if (!cut) throw new Error(t("toast.copyEmpty"));
+      return cut;
+    }, t("toast.copiedRegion"));
+  }
+
+  async #copy(make: () => Promise<Blob>, done: string): Promise<void> {
+    if (!canCopyImage()) {
+      this.notify(t("canvas.copyUnavailable"), true);
+      return;
+    }
+    try {
+      await copyImage(make);
+      this.notify(done);
+    } catch (e) {
+      // the page lost the focus, or the user turned clipboard access down
+      this.notify(t("toast.copyFailed", { error: e instanceof DOMException && e.name === "NotAllowedError" ? t("toast.copyDenied") : errorText(e) }), true);
+    }
   }
 
   /** The version's image into the library, named after the version. */

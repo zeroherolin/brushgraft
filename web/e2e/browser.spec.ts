@@ -894,3 +894,64 @@ test("regions far apart go as one edit in several requests, each of which can be
   await page.keyboard.press("Escape");
   await expect(caption).not.toContainText("viewing request");
 });
+
+test("the canvas's context menu copies the image or a region, and works from the keyboard", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await setUp(page);
+  await saveKey(page);
+  await importPhoto(page);
+  const P = await imageToPage(page, [1200, 800]);
+  const menu = page.getByRole("menu", { name: "Canvas menu" });
+  const pasted = () =>
+    page.evaluate(async () => {
+      const [item] = await navigator.clipboard.read();
+      const bitmap = await createImageBitmap(await item.getType("image/png"));
+      const c = new OffscreenCanvas(bitmap.width, bitmap.height).getContext("2d")!;
+      c.drawImage(bitmap, 0, 0);
+      return { size: [bitmap.width, bitmap.height], corner: c.getImageData(0, 0, 1, 1).data[3], middle: c.getImageData(bitmap.width >> 1, bitmap.height >> 1, 1, 1).data[3] };
+    });
+
+  // right-click: the menu, its first item focused; the browser's own menu never shows
+  const [x, y] = P(600, 400);
+  await page.mouse.click(x, y, { button: "right" });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("menuitem").first()).toBeFocused();
+  await menu.getByRole("menuitem", { name: "Copy image" }).click();
+  await expect(menu).toHaveCount(0);
+  await expect(page.locator(".toast")).toContainText("Image copied");
+  expect((await pasted()).size).toEqual([1200, 800]); // full size, whatever the zoom
+
+  // a region under the pointer is selected, and can be cut out: transparent around an ellipse
+  await page.keyboard.press("Shift+M");
+  await drag(page, [P(300, 200), P(500, 400)]);
+  await page.keyboard.press("Escape");
+  const [rx, ry] = P(400, 300);
+  await page.mouse.click(rx, ry, { button: "right" });
+  await menu.getByRole("menuitem", { name: "Copy selection" }).click();
+  await expect(page.locator(".toast")).toContainText("Selection copied");
+  const cut = await pasted();
+  expect(cut.size[0]).toBeGreaterThan(195);
+  expect(cut.size[0]).toBeLessThan(205);
+  expect([cut.corner, cut.middle]).toEqual([0, 255]);
+
+  // the keyboard: arrows move, Esc closes and gives the focus back; the menu key opens it again
+  await page.mouse.click(rx, ry, { button: "right" });
+  await page.keyboard.press("ArrowUp"); // wraps to the last: Delete region
+  await expect(menu.getByRole("menuitem", { name: /Delete region/ })).toBeFocused();
+  await page.keyboard.press("v"); // the app's shortcuts wait: no tool change, the menu stays
+  await expect(menu).toBeVisible();
+  await expect(page.getByRole("button", { name: "Ellipse" })).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
+  await expect(page.locator(".viewport")).toBeFocused();
+  await page.keyboard.press("Shift+F10");
+  await expect(menu).toBeVisible();
+  await menu.getByRole("menuitem", { name: /Delete region/ }).press("Enter");
+  await expect(page.locator(".regions textarea")).toHaveCount(0);
+
+  // ⌘C / Ctrl+C copies the image too, but not while text is selected
+  await page.evaluate(() => navigator.clipboard.writeText("x"));
+  await page.keyboard.press("ControlOrMeta+c");
+  await expect(page.locator(".toast")).toContainText("Image copied");
+  expect((await pasted()).size).toEqual([1200, 800]);
+});

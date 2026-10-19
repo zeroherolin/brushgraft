@@ -82,7 +82,9 @@
     }
     if (mod && !e.altKey) {
       // As in Photoshop: ⌘Z undo, ⇧⌘Z or ⌘Y redo, ⌘A select all, ⌘D deselect
-      if (key === "z" && editing) e.shiftKey ? app.redo() : app.undo();
+      // ⌘C copies the version's image, unless text is selected (a prompt in Version details)
+      if (key === "c" && !e.shiftKey && app.selected && !window.getSelection()?.toString()) app.copyImage(app.selected);
+      else if (key === "z" && editing) e.shiftKey ? app.redo() : app.undo();
       else if (key === "y" && editing) app.redo();
       else if (key === "a" && editing) app.selectAll();
       else if (key === "d" && editing) app.selectedRegion = -1;

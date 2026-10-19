@@ -2,6 +2,7 @@
   import BookmarkPlus from "@lucide/svelte/icons/bookmark-plus";
   import Brush from "@lucide/svelte/icons/brush";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import Copy from "@lucide/svelte/icons/copy";
   import CircleDashed from "@lucide/svelte/icons/circle-dashed";
   import Columns2 from "@lucide/svelte/icons/columns-2";
   import Download from "@lucide/svelte/icons/download";
@@ -32,7 +33,8 @@
   import { fig, zoomText } from "../lib/format";
   import { loadImage } from "../lib/media";
   import { i18n, t, type Key } from "../lib/i18n.svelte";
-  import { altKey, redoKey, undoKey } from "../lib/platform";
+  import { altKey, modKey, redoKey, undoKey } from "../lib/platform";
+  import CanvasMenu from "./CanvasMenu.svelte";
   import { dismissible } from "../lib/popover";
   import {
     clampShape, dragBox, handlePoint, HANDLES, hitRegion, inRegion, regionBox, resizeBox, shapesBox, simplify, snap45, transformShapes,
@@ -864,6 +866,32 @@
   }
 
   // -- interaction --------------------------------------------------------
+  // -- the context menu ---------------------------------------------------------------
+  /** where the canvas's menu is open, in the window; null: closed */
+  let menuAt = $state<{ x: number; y: number } | null>(null);
+  // another version, or a job opened, closes it
+  $effect(() => {
+    void node?.id;
+    void viewing;
+    menuAt = null;
+  });
+
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault(); // the browser's own (save the canvas as an image) never: ours, or none
+    // a long press on a touch screen draws or pans; the caption has the image's actions there
+    if ((e as PointerEvent).pointerType === "touch" || !node || gesture || poly) return;
+    const box = viewport.getBoundingClientRect();
+    const inside = e.clientX >= box.left && e.clientX < box.right && e.clientY >= box.top && e.clientY < box.bottom;
+    // the menu key or Shift+F10 may give no point on the canvas: its middle then
+    const [x, y] = inside ? [e.clientX, e.clientY] : [box.left + box.width / 2, box.top + box.height / 2];
+    // a region under the pointer is what the menu acts on, as in other editors
+    if (editing && !comparing) {
+      const hit = hitRegion(toImage(x - box.left, y - box.top), app.draft.regions);
+      if (hit >= 0) app.selectedRegion = hit;
+    }
+    menuAt = { x, y };
+  }
+
   function local(e: PointerEvent | WheelEvent): Point {
     const rect = viewport.getBoundingClientRect();
     return [e.clientX - rect.left, e.clientY - rect.top];
@@ -1109,6 +1137,7 @@
 
   function onWheel(e: WheelEvent) {
     if (!node) return;
+    menuAt = null;
     e.preventDefault();
     const [sx, sy] = local(e);
     const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? height : 1;
@@ -1187,6 +1216,13 @@
       }
     }
     const mod = e.metaKey || e.ctrlKey;
+    // the menu key or Shift+F10 with nothing focused: the canvas's menu, as when it has the focus
+    if (node && (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) && (e.target === document.body || e.target === viewport)) {
+      e.preventDefault();
+      const box = viewport.getBoundingClientRect();
+      onContextMenu(new MouseEvent("contextmenu", { clientX: box.left + box.width / 2, clientY: box.top + box.height / 2 }));
+      return;
+    }
     // Zoom as in Photoshop: ⌘/Ctrl with 0, 1, + and −, or the keys alone
     const zoomKey = (k: string) => {
       if (k === "0") refit();
@@ -1478,7 +1514,7 @@
       app.cursor = null;
     }}
     onwheel={onWheel}
-    oncontextmenu={(e) => e.preventDefault()}
+    oncontextmenu={onContextMenu}
   >
     <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px"></canvas>
     {#if viewing && !node}
@@ -1623,6 +1659,9 @@
         <button class="quiet icon" title={t("canvas.saveAsAsset")} aria-label={t("canvas.saveAsAsset")} onclick={() => void app.saveAsAsset(node)}>
           <BookmarkPlus size={15} />
         </button>
+        <button class="quiet icon" title={t("canvas.copy", { key: `${modKey}C` })} aria-label={t("menu.copyImage")} onclick={() => app.copyImage(node)}>
+          <Copy size={15} />
+        </button>
         <button class="quiet icon" title={t("canvas.download")} aria-label={t("canvas.download")} onclick={() => void backend.download(node.image, `brushgraft-${version}`)}>
           <Download size={15} />
         </button>
@@ -1631,6 +1670,18 @@
         </button>
       </span>
     </footer>
+  {/if}
+  {#if menuAt && node}
+    <CanvasMenu
+      {node}
+      x={menuAt.x}
+      y={menuAt.y}
+      editing={editing && !comparing}
+      viewing={!!viewing}
+      onfit={refit}
+      onactual={actualSize}
+      onclose={() => (menuAt = null)}
+    />
   {/if}
 </section>
 

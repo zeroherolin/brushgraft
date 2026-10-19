@@ -122,6 +122,8 @@ The text brushgraft wraps around your instructions follows the UI language, so w
 | <kbd>Delete</kbd>, arrow keys | Delete the selected region; nudge it (<kbd>Shift</kbd>: 10 px). Dragging it with Move, <kbd>Shift</kbd> keeps the move straight or at 45° |
 | <kbd>Esc</kbd> | Cancel the drag under way; deselect |
 | <kbd>C</kbd> | Compare with the previous version |
+| <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + <kbd>C</kbd> | Copy the version's full-size image to the clipboard, to paste into another app without saving a file (the copy button under the canvas does the same) |
+| Right-click the canvas (or <kbd>Shift</kbd>+<kbd>F10</kbd>) | Canvas menu: copy the image, or what the region under the pointer covers (cut out, transparent around it); download; save to the asset library; star; compare; fit or 100%; select all, deselect, delete the region |
 | Wheel; <kbd>Shift</kbd> or <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + wheel | Scroll up and down; left and right (trackpad: two fingers) |
 | <kbd>Alt</kbd>/<kbd>⌥</kbd> + wheel, pinch | Zoom about the pointer (Settings › Zoom with scroll wheel swaps wheel and <kbd>Alt</kbd> + wheel, as in Photoshop) |
 | Space + drag | Pan |

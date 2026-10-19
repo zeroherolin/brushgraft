@@ -94,6 +94,8 @@ export interface Backend {
   thumbSrc(sha: string): Promise<string>;
   /** hand the image to the user as a file; ``name`` has no extension */
   download(sha: string, name: string): Promise<void>;
+  /** the image's bytes, typed (PNG, JPEG or WebP) */
+  imageBlob(sha: string): Promise<Blob>;
 
   /** browser backend only: how much space the data takes, and a request that the browser keep it */
   storage?(): Promise<StorageInfo | null>;

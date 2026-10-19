@@ -160,4 +160,10 @@ export class ServerBackend implements Backend {
   async download(sha: string, name: string): Promise<void> {
     saveAs(`/api/images/${sha}?download=${encodeURIComponent(name)}`, name);
   }
+
+  async imageBlob(sha: string): Promise<Blob> {
+    const resp = await fetch(`/api/images/${sha}`, { credentials: "same-origin" });
+    if (!resp.ok) throw await failure(resp);
+    return resp.blob();
+  }
 }

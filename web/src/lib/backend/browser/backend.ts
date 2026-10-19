@@ -415,6 +415,11 @@ export class BrowserBackend implements Backend {
     save(new Blob([row.data], { type: MIME[row.ext] }), `${name}${row.ext}`);
   }
 
+  async imageBlob(sha: string): Promise<Blob> {
+    const row = await this.#store.getImage(sha);
+    return new Blob([row.data], { type: MIME[row.ext] });
+  }
+
   // -- storage -------------------------------------------------------------
   async storage(): Promise<StorageInfo | null> {
     if (!navigator.storage?.estimate) return null;

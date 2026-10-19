@@ -42,6 +42,8 @@
     ["key.polygonTool", "key.polygon"],
     ["[  ]  X", "key.brush"],
     [`${modKey}A  ${modKey}D`, "key.selectAll"],
+    [`${modKey}C`, "key.copy"],
+    ["key.rightClick", "key.canvasMenu"],
     ["Delete", "key.delete"],
     ["↑ ↓ ← →", "key.nudge"],
     ["Esc", "key.escape"],

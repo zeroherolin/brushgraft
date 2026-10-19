@@ -203,3 +203,25 @@ test("server mode: a tree reload that was already on its way doesn't swallow a j
   await expect(page.locator(".toast.error")).toContainText("content moderation", { timeout: 20_000 });
   expect(trees).toBeGreaterThan(1);
 });
+
+test("server mode: the canvas's menu copies the image from the server", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await open(page);
+  // a project of its own, so the test runs alone too
+  await page.locator("header .picker").click();
+  await page.getByRole("menuitem", { name: /New project/ }).click();
+  await page.locator("dialog[open] input").fill("clipboard");
+  await page.locator("dialog[open] button[type=submit]").click();
+  await page.locator("input[type=file][accept*='image']").first().setInputFiles({ name: "room.png", mimeType: "image/png", buffer: photo() });
+  await expect(page.locator(".tree .row")).toHaveCount(1);
+  const vp = (await page.locator(".viewport").boundingBox())!;
+  await page.mouse.click(vp.x + vp.width / 2, vp.y + vp.height / 2, { button: "right" });
+  await page.getByRole("menu", { name: "Canvas menu" }).getByRole("menuitem", { name: "Copy image" }).click();
+  await expect(page.locator(".toast")).toContainText("Image copied");
+  const size = await page.evaluate(async () => {
+    const [item] = await navigator.clipboard.read();
+    const bitmap = await createImageBitmap(await item.getType("image/png"));
+    return [bitmap.width, bitmap.height];
+  });
+  expect(size).toEqual([1200, 800]);
+});
