@@ -4,11 +4,12 @@
 import { browserCodec } from "./browser-codec";
 import { forApi, merge, normalizeUpload, prepare, thumbnail } from "./ops";
 import type { Region } from "../types";
+import type { Box } from "./zoom";
 
 export type WorkerRequest =
   | { id: number; op: "normalize"; data: Uint8Array }
-  | { id: number; op: "prepare"; parent?: Uint8Array; regions: Region[]; refs: Uint8Array[] }
-  | { id: number; op: "merge"; parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean }
+  | { id: number; op: "prepare"; parent?: Uint8Array; regions: Region[]; refs: Uint8Array[]; zoom?: boolean }
+  | { id: number; op: "merge"; parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean; zoom?: Box }
   | { id: number; op: "thumb"; data: Uint8Array }
   | { id: number; op: "forApi"; data: Uint8Array; maxPixels?: number };
 
@@ -23,12 +24,13 @@ async function run(req: WorkerRequest): Promise<{ value: unknown; transfer: Arra
       return { value: bytes, transfer: [bytes.buffer as ArrayBuffer] };
     }
     case "prepare": {
-      const out = await prepare(browserCodec, { parent: req.parent, regions: req.regions, refs: req.refs });
+      const out = await prepare(browserCodec, { parent: req.parent, regions: req.regions, refs: req.refs, zoom: req.zoom });
       return { value: out, transfer: [] };
     }
     case "merge": {
       const out = await merge(browserCodec, req);
-      return { value: out, transfer: out.image ? [out.image.buffer as ArrayBuffer] : [] };
+      const transfer = [out.image, out.whole].filter((b): b is Uint8Array => !!b).map((b) => b.buffer as ArrayBuffer);
+      return { value: out, transfer };
     }
     case "thumb": {
       const out = await thumbnail(browserCodec, req.data);

@@ -6,6 +6,9 @@ import { describeJobError } from "../../joberror";
 import type { Job, JobError, ServerEvent, TreeNode } from "../../types";
 import { makePng, scenePng, b64, jsonResponse } from "../../../test/images";
 import { decodePng } from "../../../test/png";
+import { zoomBox, zoomSize } from "../../imaging/zoom";
+import { bbox } from "../../imaging/raster";
+import { unionMask } from "../../imaging/shapes";
 import { testCodec } from "../../../test/codec";
 import { ApiError } from "../errors";
 import { JobRunner } from "./jobs";
@@ -14,12 +17,12 @@ import type { JobRequest } from "../types";
 
 const ops: ImageOps = {
   normalize: (d) => normalizeUpload(testCodec, d),
-  prepare: (parent, regions, refs) => prepare(testCodec, { parent, regions, refs }),
-  merge: (parent, result, mask, annot, overall) => merge(testCodec, { parent, result, mask, annot, overall }),
+  prepare: (parent, regions, refs, zoom) => prepare(testCodec, { parent, regions, refs, zoom }),
+  merge: (parent, result, mask, annot, overall, zoom) => merge(testCodec, { parent, result, mask, annot, overall, zoom }),
   thumb: (d) => thumbnail(testCodec, d),
 };
 
-type Reply = Response | Error | ((req: { url: string; body: unknown }) => Response | Promise<Response>);
+type Reply = Response | Error | ((req: { url: string; body: unknown; headers: unknown }) => Response | Promise<Response>);
 
 function setup(opts: { maxParallel?: number; key?: string } = {}) {
   const store = new BrowserStore(new IDBFactory(), "t");
@@ -205,6 +208,54 @@ describe("editing", () => {
     at(merged, 115, 80).forEach((v, k) => expect(Math.abs(v - [200, 150, 120][k])).toBeLessThanOrEqual(1));
     expect(at(merged, 5, 5)).toEqual(at(o, 5, 5)); // far away is the original, untouched
     expect(at(merged, 700, 460)).toEqual(at(o, 700, 460));
+  });
+
+  it("sends a small edit of a large image as a close-up, and pastes the result back within it", async () => {
+    const [W, H] = [2400, 1600];
+    const original = scenePng(W, H);
+    const parent = await root(original);
+    const o = decodePng(Buffer.from(original), "RGB");
+    const region = { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 1800, y: 300, w: 120, h: 90 }] };
+    // from the mask's bounds, as the job does (a rectangle includes its far edge)
+    const zoom = zoomBox(W, H, bbox(unionMask(W, H, [region]))!)!;
+    let sent: number[][] = [];
+    let asked = "";
+    s.replies.push(async (call) => {
+      const form = await new Request("http://x", { method: "POST", headers: call.headers as HeadersInit, body: call.body as Blob }).formData();
+      const ims = await Promise.all(
+        (form.getAll("image[]") as Blob[]).map(async (f) => decodePng(Buffer.from(await f.arrayBuffer()), "RGB")),
+      );
+      sent = ims.map((im) => [im.width, im.height]);
+      asked = form.get("size") as string;
+      // what a model does: the close-up it was sent, at the size asked for, with the object in the region
+      const [w, h] = asked.split("x").map(Number);
+      const k = w / ims[0].width;
+      const [rx, ry] = [1800 - zoom[0], 300 - zoom[1]];
+      return ok(
+        makePng(w, h, (x, y) => {
+          const [sx, sy] = [Math.min(ims[0].width - 1, Math.floor(x / k)), Math.min(ims[0].height - 1, Math.floor(y / k))];
+          if (sx >= rx + 10 && sx < rx + 110 && sy >= ry + 10 && sy < ry + 80) return [255, 255, 255];
+          const i = (sy * ims[0].width + sx) * 3;
+          return [ims[0].data[i], ims[0].data[i + 1], ims[0].data[i + 2]];
+        }),
+      );
+    });
+    const job = await s.runner.submit(base(projectId, { parent_id: parent.id, prompt: "", regions: [region], size: null, model: "gpt-image-2.5-flare" }));
+    expect((await waitDone(s, job.id)).status).toBe("done");
+    expect(sent).toEqual([[zoom[2] - zoom[0], zoom[3] - zoom[1]], [zoom[2] - zoom[0], zoom[3] - zoom[1]]]);
+    expect(asked).toBe(zoomSize(zoom));
+    expect((await s.store.getJob(job.id)).size).toBe(asked);
+    expect(s.runner.logs(job.id).some((l) => l.msg.includes("close-up of the regions"))).toBe(true);
+    const node = (await s.store.projectTree(projectId)).nodes.find((n) => n.job_id === job.id)!;
+    const merged = decodePng(Buffer.from((await s.store.getImage(node.image)).data), "RGB");
+    const whole = decodePng(Buffer.from((await s.store.getImage(node.raw_image!)).data), "RGB");
+    expect([merged.width, merged.height, whole.width, whole.height]).toEqual([W, H, W, H]);
+    const at = (im: typeof merged, x: number, y: number) => Array.from(im.data.subarray((y * W + x) * 3, (y * W + x) * 3 + 3));
+    expect(at(merged, 1860, 345)).toEqual([255, 255, 255]); // the object, where it belongs
+    // outside the close-up, both are the original, pixel for pixel
+    for (const im of [merged, whole]) {
+      for (const [x, y] of [[zoom[0] - 1, 345], [5, 5], [W - 1, zoom[3]], [1860, zoom[3] + 2]]) expect(at(im, x, y)).toEqual(at(o, x, y));
+    }
   });
 
   it("adopts the whole output when the overall request changed the whole image, keeping the pasted one", async () => {

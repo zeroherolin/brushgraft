@@ -404,8 +404,24 @@ def rules_cases(out: Path) -> None:
             except ValueError as exc:
                 checks.append({"model": model, "size": size, "ok": False, "message": str(exc)})
     quiet.__exit__(None, None, None)
+    # the close-up of a small edit: where it lies, and the size it is asked for in
+    from brushgraft import imaging
+
+    zooms = []
+    fixed = [((3840, 2160), (3005, 899, 3422, 1007)), ((1536, 1024), (100, 100, 200, 200)),
+             ((6000, 4000), (0, 0, 40, 40)), ((6000, 4000), (5960, 3990, 6000, 4000)),
+             ((4000, 1200), (1000, 100, 1400, 1100)), ((1200, 4000), (100, 1000, 1100, 1400))]
+    for w, h in rng.integers(800, 8000, (60, 2)):
+        x0, y0 = int(rng.integers(0, w - 1)), int(rng.integers(0, h - 1))
+        x1, y1 = int(rng.integers(x0 + 1, w + 1)), int(rng.integers(y0 + 1, h + 1))
+        fixed.append(((int(w), int(h)), (x0, y0, x1, y1)))
+    for size, box in fixed:
+        zoom = imaging.zoom_box(size, box)
+        zooms.append({"size": size, "box": box, "zoom": zoom,
+                      "output": imaging.zoom_size(zoom) if zoom else None})
     (out / "rules.json").write_text(json.dumps(
-        {"prompts": prompts, "sizes": sizes, "checks": checks}, ensure_ascii=False))
+        {"prompts": prompts, "sizes": sizes, "checks": checks, "zooms": zooms},
+        ensure_ascii=False))
 
 
 def archive_cases(out: Path) -> None:

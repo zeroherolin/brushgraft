@@ -797,3 +797,54 @@ test("watching one job, another finishing under the same version doesn't take th
   await expect(panel).toHaveCount(0);
   await expect(page.locator(".caption .text")).toHaveText("make it warmer"); // and its result shows
 });
+
+test("a small edit of a large image goes as a close-up, and its result lands where the region is", async ({ page }) => {
+  await setUp(page);
+  await saveKey(page);
+  const [W, H] = [3000, 2000];
+  const big = new PNG({ width: W, height: H });
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const n = Math.sin(x * 0.05) * Math.cos(y * 0.04) * 40 + ((x * 7 + y * 13) % 11) * 2;
+      big.data.set([Math.min(255, 110 + x * 0.04 + n), Math.min(255, 130 + y * 0.05 - n), Math.min(255, 90 + n * 0.5), 255], (y * W + x) * 4);
+    }
+  }
+  await page.locator("input[type=file][accept*='image']").first().setInputFiles({ name: "big.png", mimeType: "image/png", buffer: PNG.sync.write(big) });
+  await expect(page.locator(".tree .row")).toHaveCount(1);
+  const P = await imageToPage(page, [W, H]);
+  await page.keyboard.press("r");
+  await drag(page, [P(2300, 500), P(2420, 590)]);
+  await page.locator(".regions textarea").first().fill("a red lamp");
+  await page.keyboard.press("Control+Enter");
+  await expect(page.locator(".tree .row")).toHaveCount(2, { timeout: 30_000 });
+  const edit = (await apiLog()).filter((l) => l.op === "edit").at(-1) as unknown as { size: [number, number] };
+  // the close-up: the area around the region, far less than the image
+  expect(edit.size[0] * edit.size[1]).toBeGreaterThanOrEqual(768 * 768);
+  expect(edit.size[0]).toBeLessThan(W / 2);
+  // the model's blob (centred on the region it was shown) is in the version, where the region is
+  const pixel = await page.evaluate(
+    ([x, y]) =>
+      new Promise<number[]>((resolve) => {
+        const open = indexedDB.open("brushgraft");
+        open.onsuccess = () => {
+          const tx = open.result.transaction(["nodes", "images"]);
+          const all = tx.objectStore("nodes").getAll();
+          all.onsuccess = () => {
+            const node = (all.result as { parent_id: string | null; image: string }[]).find((n) => n.parent_id)!;
+            const img = tx.objectStore("images").get(node.image);
+            img.onsuccess = async () => {
+              const bitmap = await createImageBitmap(new Blob([img.result.data]));
+              const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+              const ctx = canvas.getContext("2d")!;
+              ctx.drawImage(bitmap, 0, 0);
+              resolve([bitmap.width, bitmap.height, ...Array.from(ctx.getImageData(x, y, 1, 1).data.slice(0, 3))]);
+            };
+          };
+        };
+      }),
+    [2360, 545],
+  );
+  expect(pixel.slice(0, 2)).toEqual([W, H]);
+  expect(pixel[2]).toBeGreaterThan(150); // the blob's red
+  expect(pixel[3]).toBeLessThan(90);
+});

@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageFilter, ImageFont
 
+import promptbrush as pb
+
 from brushgraft import imaging
 from brushgraft.errors import UserError
 from brushgraft.store import NOTE_OVERALL, NOTE_REFRAMED, NOTE_SPILL_GROWN, NOTE_SPILL_TOO_LARGE
@@ -595,6 +597,43 @@ class TestMaskOps:
         zone = np.zeros_like(strong)
         zone[5:25, 5:25] = True
         assert sorted(int(c.sum()) for c in imaging._components_near(strong, zone)) == [20, 25]
+
+
+class TestZoom:
+    def test_a_small_region_of_a_large_image_gets_a_close_up_around_it(self):
+        box = imaging.zoom_box((3840, 2160), (3005, 899, 3422, 1007))
+        x0, y0, x1, y1 = box
+        w, h = x1 - x0, y1 - y0
+        assert w * h >= imaging.ZOOM_MIN_PIXELS and imaging.same_aspect((w, h), (3840, 2160))
+        assert x0 <= 3005 and y0 <= 899 and x1 >= 3422 and y1 >= 1007  # the region, within
+        assert imaging.zoom_box((3840, 2160), (3760, 900, 3830, 1000))[2] == 3840  # kept inside
+        # asked for larger than it is, in its proportions, at a size every model takes
+        out_w, out_h = map(int, imaging.zoom_size(box).split("x"))
+        assert out_w * out_h > w * h and imaging.same_aspect((out_w, out_h), (w, h))
+        assert pb.fit_size(out_w, out_h) == f"{out_w}x{out_h}"
+
+    def test_the_close_up_keeps_twice_the_regions_extent(self):
+        x0, y0, x1, y1 = imaging.zoom_box((6000, 4000), (1000, 1000, 1700, 1100))
+        assert x1 - x0 >= 1400 and x0 <= 1000 - 300 and x1 >= 1700 + 300
+
+    @pytest.mark.parametrize("size, box", [
+        ((1536, 1024), (100, 100, 200, 200)),  # the image is about the model's size already
+        ((3840, 2160), (0, 0, 2400, 1400)),    # a large region
+    ])
+    def test_otherwise_the_whole_image_goes(self, size, box):
+        assert imaging.zoom_box(size, box) is None
+
+    def test_regions_move_with_the_crop(self):
+        regions = [{"instruction": "a", "shapes": [
+            {"type": "rect", "x": 10, "y": 20, "w": 5, "h": 5, "op": "subtract"},
+            {"type": "lasso", "points": [[10, 10], [20, 10], [15, 30]]},
+            {"type": "brush", "points": [[50, 50]], "radius": 4}]}]
+        moved = imaging.shift_regions(regions, -10, -5)
+        assert moved[0]["shapes"] == [
+            {"type": "rect", "x": 0, "y": 15, "w": 5, "h": 5, "op": "subtract"},
+            {"type": "lasso", "points": [[0, 5], [10, 5], [5, 25]]},
+            {"type": "brush", "points": [[40, 45]], "radius": 4}]
+        assert regions[0]["shapes"][0]["x"] == 10  # the original is left as it was
 
 
 class TestNormalizeUpload:

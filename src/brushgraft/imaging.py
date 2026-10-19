@@ -88,10 +88,55 @@ API_MAX_BYTES = 8 * 1024 * 1024
 REF_MAX_PIXELS = 1536 * 1536
 # Uploads in these formats are kept as is; others (GIF, rotated JPEG) become PNG
 KEEP_UPLOAD_FORMATS = {"PNG", "JPEG", "WEBP"}
+# A small edit in a large image is sent as a close-up: the area around the regions, in the image's
+# proportions. Shown whole, a large image is scaled down to the model's working size first, and a
+# region a few hundred pixels across is then too small to edit (measured on a 416x107 box in a
+# 3840x2160 diagram, gpt-image-2: sent whole, left as it was 2 times out of 2; as a 1366x769
+# close-up, fixed 1 of 2; as a 1024x576 one, fixed 4 of 5). The result is pasted back within the
+# close-up, as usual.
+ZOOM_CONTEXT = 2.0               # the close-up is at least twice the regions' extent
+ZOOM_MIN_PIXELS = 768 * 768      # and covers at least this many of the image's pixels, for context
+ZOOM_MAX_SHARE = 0.35            # used only when it is at most this share of the image
+ZOOM_OUTPUT_PIXELS = 1536 * 1024  # asked for at least this size, scaled back down: finer detail
 
 
 def region_color(index: int) -> str:
     return REGION_COLORS[index % len(REGION_COLORS)]
+
+
+def zoom_box(size: tuple[int, int], box: tuple[int, int, int, int]
+             ) -> tuple[int, int, int, int] | None:
+    """The close-up to send for regions within ``box`` (their bounding box, ends exclusive) on an
+    image of ``size``, as (left, top, right, bottom); None to send the whole image."""
+    width, height = size
+    x0, y0, x1, y1 = box
+    aspect = width / height
+    w = max((x1 - x0) * ZOOM_CONTEXT, (y1 - y0) * ZOOM_CONTEXT * aspect)
+    if w * (w / aspect) < ZOOM_MIN_PIXELS:
+        w = math.sqrt(ZOOM_MIN_PIXELS * aspect)
+    w = math.ceil(w)
+    h = math.ceil(w / aspect)
+    if w > width or h > height or w * h > ZOOM_MAX_SHARE * width * height:
+        return None
+    left = math.floor(min(max((x0 + x1) / 2 - w / 2, 0), width - w))
+    top = math.floor(min(max((y0 + y1) / 2 - h / 2, 0), height - h))
+    return left, top, left + w, top + h
+
+
+def zoom_size(box: tuple[int, int, int, int]) -> str:
+    """The size to ask for a close-up in: its proportions, at least ZOOM_OUTPUT_PIXELS."""
+    w, h = box[2] - box[0], box[3] - box[1]
+    k = max(1.0, math.sqrt(ZOOM_OUTPUT_PIXELS / (w * h)))
+    return pb.fit_size(math.floor(w * k), math.floor(h * k))
+
+
+def shift_regions(regions: Sequence[dict], dx: float, dy: float) -> list[dict]:
+    """``regions`` moved by (dx, dy): their shapes as they lie on a crop."""
+    def shift(shape: dict) -> dict:
+        if shape["type"] in ("rect", "ellipse"):
+            return {**shape, "x": shape["x"] + dx, "y": shape["y"] + dy}
+        return {**shape, "points": [[x + dx, y + dy] for x, y in shape["points"]]}
+    return [{**r, "shapes": [shift(s) for s in r["shapes"]]} for r in regions]
 
 
 def feather_radius(size: tuple[int, int]) -> int:

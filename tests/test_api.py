@@ -201,6 +201,62 @@ class TestJobs:
         diff = ImageChops.difference(merged, original).convert("L")
         assert ImageChops.multiply(diff, outside).getbbox() is None
 
+    def test_a_small_edit_of_a_large_image_goes_as_a_close_up(self, client, project, fake_api):
+        # a 4K-like picture and a small box: the model gets the area around it, larger
+        root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
+        region = {"shapes": [{"type": "rect", "x": 1800, "y": 300, "w": 120, "h": 90}],
+                  "instruction": "a red teapot"}
+        # from the mask's bounds, as the job does (a rectangle includes its far edge)
+        zoom = imaging.zoom_box((2400, 1600), imaging.union_mask((2400, 1600), [region]).getbbox())
+        assert zoom is not None
+
+        def respond(call):
+            # what a model does: the close-up it was sent, at the size asked for, plus the object
+            sent = Image.open(io.BytesIO(call["images"][0])).convert("RGB")
+            w, h = (int(v) for v in call["size"].split("x"))
+            out = sent.resize((w, h), Image.Resampling.LANCZOS)
+            k = w / sent.width
+            x, y = (1800 - zoom[0]) * k, (300 - zoom[1]) * k
+            ImageDraw.Draw(out).rectangle((x + 10 * k, y + 10 * k, x + 110 * k, y + 80 * k),
+                                          fill=(255, 255, 255))
+            buf = io.BytesIO()
+            out.save(buf, "PNG")
+            return pb.Generation([buf.getvalue()], None, 1)
+
+        fake_api.respond = respond
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
+                      model="gpt-image-2.5-flare")
+        job = wait_job(client, project["id"], resp.json()["id"])
+        assert job["status"] == "done", job["errors"]
+        call = fake_api.calls[0]
+        sent = [Image.open(io.BytesIO(b)) for b in call["images"]]
+        assert [im.size for im in sent] == [(zoom[2] - zoom[0], zoom[3] - zoom[1])] * 2
+        assert call["size"] == job["size"] == imaging.zoom_size(zoom)
+        logs = client.get(f"/api/jobs/{job['id']}/logs").json()
+        assert any("close-up of the regions" in line["msg"] for line in logs)
+
+        (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
+                   .json()["nodes"] if n["parent_id"] == root["id"]]
+        merged, original = image(client, node["image"]), image(client, root["image"])
+        whole = image(client, node["raw_image"])
+        assert merged.size == whole.size == original.size
+        assert merged.getpixel((1860, 345)) == (255, 255, 255)  # the object, where it belongs
+        # outside the close-up, both are the original, pixel for pixel
+        outside = Image.new("L", original.size, 255)
+        outside.paste(0, zoom)
+        for im in (merged, whole):
+            diff = ImageChops.difference(im, original).convert("L")
+            assert ImageChops.multiply(diff, outside).getbbox() is None
+
+    def test_an_overall_request_sends_the_whole_image(self, client, project, fake_api):
+        root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
+        region = {"shapes": [{"type": "rect", "x": 1800, "y": 300, "w": 120, "h": 90}],
+                  "instruction": "a red teapot"}
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
+                      prompt="keep the lighting", model="gpt-image-2.5-flare")
+        wait_job(client, project["id"], resp.json()["id"])
+        assert Image.open(io.BytesIO(fake_api.calls[0]["images"][0])).size == (2400, 1600)
+
     @staticmethod
     def overcast(call):
         """What a model does with "make the sky overcast": every color goes grey-blue, the

@@ -102,6 +102,11 @@ export interface Spec {
     piece_zone: number;
     /** the farthest a shape's coordinates may lie from the image, in px */
     max_coord: number;
+    /** a small edit of a large image is sent as a close-up: see imaging.ZOOM_* */
+    zoom_context: number;
+    zoom_min_pixels: number;
+    zoom_max_share: number;
+    zoom_output_pixels: number;
   };
 }
 

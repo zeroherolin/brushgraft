@@ -3,6 +3,7 @@
 import { ApiError } from "../backend/errors";
 import type { Region } from "../types";
 import type { Merged, Prepared } from "./ops";
+import type { Box } from "./zoom";
 import type { WorkerReply, WorkerRequest } from "./worker";
 
 type Distribute<T> = T extends unknown ? Omit<T, "id"> : never;
@@ -10,8 +11,8 @@ type Distribute<T> = T extends unknown ? Omit<T, "id"> : never;
 /** What the backend needs done to images; ImageWorker does it off-thread, tests do it in place. */
 export interface ImageOps {
   normalize(data: Uint8Array): Promise<Uint8Array>;
-  prepare(parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[]): Promise<Prepared>;
-  merge(parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean): Promise<Merged>;
+  prepare(parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], zoom?: boolean): Promise<Prepared>;
+  merge(parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean, zoom?: Box): Promise<Merged>;
   thumb(data: Uint8Array): Promise<{ bytes: Uint8Array; type: string }>;
 }
 
@@ -44,9 +45,9 @@ export class ImageWorker implements ImageOps {
   }
 
   normalize = (data: Uint8Array) => this.#send<Uint8Array>({ op: "normalize", data });
-  prepare = (parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[]) =>
-    this.#send<Prepared>({ op: "prepare", parent, regions, refs });
-  merge = (parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean) =>
-    this.#send<Merged>({ op: "merge", parent, result, mask, annot, overall });
+  prepare = (parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], zoom?: boolean) =>
+    this.#send<Prepared>({ op: "prepare", parent, regions, refs, zoom });
+  merge = (parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean, zoom?: Box) =>
+    this.#send<Merged>({ op: "merge", parent, result, mask, annot, overall, zoom });
   thumb = (data: Uint8Array) => this.#send<{ bytes: Uint8Array; type: string }>({ op: "thumb", data });
 }

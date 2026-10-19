@@ -11,8 +11,9 @@ import type { Codec } from "./codec";
 import { detectExt, jpegOrientation, sniff } from "./formats";
 import { pasteBack, sameAspect } from "./pasteback";
 import { register } from "./register";
-import { bbox, resize, type Raster } from "./raster";
+import { bbox, crop, paste, resize, toGray, toRgb, toRgba, type Raster } from "./raster";
 import { unionMask } from "./shapes";
+import { shiftRegions, zoomBox, type Box } from "./zoom";
 
 const K = spec.imaging;
 const KEEP_UPLOAD_FORMATS = new Set([".png", ".jpg", ".webp"]);
@@ -98,29 +99,43 @@ export async function forApi(codec: Codec, data: Uint8Array, maxPixels = spec.si
 }
 
 export interface Prepared {
-  /** sent in order: original, annotated copy, references */
+  /** sent in order: original (or its close-up), annotated copy, references */
   images: Uint8Array[];
   mask?: Uint8Array;
+  /** the annotated copy as sent */
   annot?: Uint8Array;
+  /** the close-up sent instead of the whole original */
+  zoom?: Box;
 }
 
-/** The images of an edit or generation: what to send, and the mask and annotated copy to keep. */
+/**
+ * The images of an edit or generation: what to send, and the mask and annotated copy to keep.
+ * With ``zoom``, a small edit of a large image goes as a close-up (see zoom.ts).
+ */
 export async function prepare(
   codec: Codec,
-  input: { parent?: Uint8Array; regions: Region[]; refs: Uint8Array[] },
+  input: { parent?: Uint8Array; regions: Region[]; refs: Uint8Array[]; zoom?: boolean },
 ): Promise<Prepared> {
   const out: Prepared = { images: [] };
   const { parent, regions } = input;
-  if (parent) {
-    out.images.push(await forApi(codec, parent));
-    if (regions.length) {
-      const original = await codec.decode(parent);
-      const mask = unionMask(original.width, original.height, regions);
-      if (bbox(mask) === null) throw userError("empty_region", "The region is empty; draw it again");
-      out.mask = await codec.encodePng(mask);
-      out.annot = await codec.encodePng(await annotate(codec, original, regions));
-      out.images.push(await forApi(codec, out.annot));
+  if (parent && !regions.length) out.images.push(await forApi(codec, parent));
+  if (parent && regions.length) {
+    const original = await codec.decode(parent);
+    const mask = unionMask(original.width, original.height, regions);
+    const box = bbox(mask);
+    if (box === null) throw userError("empty_region", "The region is empty; draw it again");
+    out.mask = await codec.encodePng(mask);
+    const zoom = input.zoom ? zoomBox(original.width, original.height, box) : null;
+    let shown = original;
+    let shownRegions = regions;
+    if (zoom) {
+      shown = crop(original, ...zoom);
+      shownRegions = shiftRegions(regions, -zoom[0], -zoom[1]);
+      out.zoom = zoom;
     }
+    out.images.push(await forApi(codec, zoom ? await codec.encodePng(shown) : parent));
+    out.annot = await codec.encodePng(await annotate(codec, shown, shownRegions));
+    out.images.push(await forApi(codec, out.annot));
   }
   for (const ref of input.refs) out.images.push(await forApi(codec, ref, K.ref_max_pixels));
   return out;
@@ -130,28 +145,46 @@ export interface Merged {
   /** the pasted-back image as PNG; null when the model redrew the scene (use its whole output) */
   image: Uint8Array | null;
   note: string;
+  /** for a close-up: the model's whole output, as the original with the close-up replaced */
+  whole?: Uint8Array;
 }
 
 /**
- * Paste the edited region of the model's output onto the original. ``note`` explains
- * what happened (see note.* in the locales); the caller has already checked the aspect.
+ * Paste the edited region of the model's output onto the original (within ``zoom``, when a
+ * close-up was sent). ``note`` explains what happened (see note.* in the locales).
  */
 export async function merge(
   codec: Codec,
-  input: { parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean },
+  input: { parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean; zoom?: Box },
 ): Promise<Merged> {
-  const original = await codec.decode(input.parent);
+  const full = await codec.decode(input.parent);
+  const zoom = input.zoom;
+  // what was sent: the whole original, or a close-up of it
+  const original = zoom ? crop(full, ...zoom) : full;
   let result = await codec.decode(input.result);
   if (!sameAspect([original.width, original.height], [result.width, result.height])) {
     return { image: null, note: spec.notes.aspect_mismatch };
   }
-  const mask = (await codec.decode(input.mask)) as Raster;
-  const gray = grayOf(mask);
+  let gray = grayOf((await codec.decode(input.mask)) as Raster);
+  if (zoom) gray = crop(gray, ...zoom);
   // on the original's pixel grid: scaled back as it is, it can sit a few pixels off
   result = register(original, result, gray);
   const annotated = input.annot ? await codec.decode(input.annot) : null;
   const done = pasteBack(original, result, gray, annotated, input.overall ?? false);
-  return { image: done.image ? await codec.encodePng(done.image) : null, note: done.note };
+  if (!zoom) return { image: done.image ? await codec.encodePng(done.image) : null, note: done.note };
+  return {
+    image: done.image ? await codec.encodePng(placed(full, done.image, zoom)) : null,
+    note: done.note,
+    whole: await codec.encodePng(placed(full, result, zoom)),
+  };
+}
+
+/** ``full`` with ``part`` put at the close-up's place, in ``full``'s channels. */
+function placed(full: Raster, part: Raster, zoom: Box): Raster {
+  const out = { ...full, data: full.data.slice() };
+  const src = part.channels === full.channels ? part : full.channels === 4 ? toRgba(part) : full.channels === 1 ? toGray(part) : toRgb(part);
+  paste(out, src, zoom[0], zoom[1]);
+  return out;
 }
 
 /** A mask PNG decoded as RGB is gray: take one channel. */

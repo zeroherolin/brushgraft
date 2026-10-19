@@ -50,9 +50,9 @@ createServer(async (req, res) => {
   if (url.pathname === "/v1/images/edits") {
     const form = await new Request("http://x", { method: "POST", headers: req.headers, body: await body(req), duplex: "half" }).formData();
     const files = form.getAll("image[]");
-    log.push({ op: "edit", model: form.get("model"), prompt: form.get("prompt"), images: files.length, auth: req.headers.authorization });
-    await new Promise((r) => setTimeout(r, form.get("model") === "slow" ? 2000 : 300));
     const a = PNG.sync.read(Buffer.from(await files[0].arrayBuffer()));
+    log.push({ op: "edit", model: form.get("model"), prompt: form.get("prompt"), images: files.length, size: [a.width, a.height], auth: req.headers.authorization });
+    await new Promise((r) => setTimeout(r, form.get("model") === "slow" ? 2000 : 300));
     const out = new PNG({ width: a.width, height: a.height });
     // a little brighter everywhere, as real models drift
     for (let i = 0; i < a.data.length; i += 4) out.data.set([Math.min(255, a.data[i] + 6), Math.min(255, a.data[i + 1] + 6), Math.min(255, a.data[i + 2] + 6), 255], i);

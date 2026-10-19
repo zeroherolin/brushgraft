@@ -254,6 +254,10 @@
     "piece_weak": 24,
     "piece_core": 96,
     "piece_zone": 40,
-    "max_coord": 100000
+    "max_coord": 100000,
+    "zoom_context": 2.0,
+    "zoom_min_pixels": 589824,
+    "zoom_max_share": 0.35,
+    "zoom_output_pixels": 1572864
   }
 }

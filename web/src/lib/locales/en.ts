@@ -240,7 +240,7 @@ export const en = {
   "composer.composite": "Change regions only (keep the rest of the original)",
   "composer.notAligned": "This model reframes the image as a square; results cannot be pasted back.",
   "composer.tooOblong": "The aspect ratio exceeds {max}:1, the maximum the models output; results cannot be pasted back.",
-  "composer.compositeHelp": "Models also alter colors and details across the image. When on, only the regions are pasted back and all other pixels stay unchanged. If the overall request changes the whole image (e.g. an overcast sky), the whole output is used.",
+  "composer.compositeHelp": "Models also alter colors and details across the image. When on, only the regions are pasted back and all other pixels stay unchanged. Without an overall request, small regions in a large image are sent as a close-up, so the model sees them in detail. If the overall request changes the whole image (e.g. an overcast sky), the whole output is used.",
   "composer.needKey": "Set API key",
   "composer.submitting": "Submitting…",
   "composer.submitEdit": (p: P) => (Number(p.n) > 1 ? `Generate ${p.n} edits` : "Generate edit"),

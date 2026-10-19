@@ -4,6 +4,7 @@ import { PARITY } from "../../test/png";
 import { ApiError } from "./errors";
 import { compilePrompt } from "./prompts";
 import { checkSize, fitSize } from "./sizes";
+import { zoomBox, zoomSize } from "../imaging/zoom";
 
 const file = `${PARITY}rules/rules.json`;
 const have = existsSync(file);
@@ -32,6 +33,15 @@ describe.skipIf(!have)("prompts and size rules match Python's", () => {
 
   it("fits every size the same", () => {
     for (const c of data.sizes) expect(fitSize(c.w, c.h), `${c.w}x${c.h}`).toBe(c.fit);
+  });
+
+  it("picks the same close-up for a small edit, asked for in the same size", () => {
+    for (const c of data.zooms) {
+      const zoom = zoomBox(c.size[0], c.size[1], c.box);
+      expect(zoom, JSON.stringify(c)).toEqual(c.zoom);
+      if (zoom) expect(zoomSize(zoom), JSON.stringify(c)).toBe(c.output);
+    }
+    expect(data.zooms.filter((c: { zoom: unknown }) => c.zoom).length).toBeGreaterThan(5);
   });
 
   it("checks sizes the same", () => {

@@ -238,7 +238,7 @@ export const zh: { [K in keyof typeof en]: string | ((p: P) => string) } = {
   "composer.composite": "仅修改选区，保留其余部分",
   "composer.notAligned": "此模型会重新构图并输出正方形图片，结果无法贴回原图。",
   "composer.tooOblong": "图片长宽比超过 {max}:1（模型输出上限），结果无法贴回原图。",
-  "composer.compositeHelp": "模型会同时改动整张图的颜色和细节。勾选后仅将选区贴回原图，其余像素保持不变；若整体要求改动了整张图（例如改为阴天），则采用整张输出。",
+  "composer.compositeHelp": "模型会同时改动整张图的颜色和细节。勾选后仅将选区贴回原图，其余像素保持不变。未填写整体要求时，大图中的小选区会以局部放大图发送，便于模型看清细节；若整体要求改动了整张图（例如改为阴天），则采用整张输出。",
   "composer.needKey": "设置 API Key",
   "composer.submitting": "提交中…",
   "composer.submitEdit": (p) => (Number(p.n) > 1 ? `生成修改版（${p.n} 张）` : "生成修改版"),

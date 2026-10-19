@@ -37,8 +37,9 @@ class _Request:
     base_url: str
     parent: bytes | None           # the original, for pasting back
     mask: bytes | None             # region mask (PNG), for pasting back
-    annot: bytes | None            # annotated image at full size, to spot copied marks
+    annot: bytes | None            # annotated image as sent, to spot copied marks
     overall: bool                  # the user wrote an overall request besides the regions
+    zoom: tuple[int, int, int, int] | None = None  # the close-up sent instead of the whole image
 
 
 # English log lines for job errors and paste-back notes (the UI shows the codes
@@ -147,17 +148,30 @@ class JobRunner:
 
         images: list[bytes] = []
         parent_bytes = mask_bytes = annot_bytes = None
-        mask_sha = annot_sha = None
+        mask_sha = annot_sha = zoom = None
         if parent:
             parent_bytes = self.store.read_image(parent["image"])
             images.append(imaging.for_api(parent_bytes))
         if parent and regions:
             original = imaging.open_image(parent_bytes)
             mask = imaging.union_mask(original.size, regions)
-            if mask.getbbox() is None:
+            box = mask.getbbox()
+            if box is None:
                 raise UserError("empty_region", "The region is empty; draw it again")
+            # A small edit of a large image goes as a close-up, to be pasted back within it: not
+            # with an overall request (that is about the whole image), nor for a model that
+            # redraws the scene (nothing of its output is pasted back)
+            info = pb.MODELS.get(model)
+            if composite and not prompt.strip() and (info is None or info.aligned):
+                zoom = imaging.zoom_box(original.size, box)
+            shown, shown_regions = original, regions
+            if zoom:
+                shown = original.crop(zoom)
+                shown_regions = imaging.shift_regions(regions, -zoom[0], -zoom[1])
+                images[0] = imaging.for_api(imaging.png_bytes(shown))
+                size = imaging.zoom_size(zoom)
             mask_bytes = imaging.png_bytes(mask)
-            annot_bytes = imaging.png_bytes(imaging.annotate(original, regions))
+            annot_bytes = imaging.png_bytes(imaging.annotate(shown, shown_regions))
             mask_sha = self.store.put_image(mask_bytes)["sha"]
             annot_sha = self.store.put_image(annot_bytes)["sha"]
             images.append(imaging.for_api(annot_bytes))
@@ -175,7 +189,7 @@ class JobRunner:
                        size=size, images=tuple(images), api_key=api_key,
                        base_url=self.settings.base_url, parent=parent_bytes,
                        mask=mask_bytes if job["composite"] else None,
-                       annot=annot_bytes, overall=bool(job["prompt"]))
+                       annot=annot_bytes, overall=bool(job["prompt"]), zoom=zoom)
         with self._lock:
             self._logs[job["id"]] = deque(maxlen=LOG_LINES_PER_JOB)
         self.bus.publish({"type": "job", "job": job})
@@ -207,6 +221,10 @@ class JobRunner:
         nodes = []
         with pb.log_sink(sink):
             pb.log("info", f"Requesting {req.model} at {req.size}")
+            if req.zoom:
+                x0, y0, x1, y1 = req.zoom
+                pb.log("info", f"Sending a close-up of the regions: {x1 - x0}x{y1 - y0} at "
+                               f"({x0}, {y0})")
             try:
                 gen = pb.create_image(req.prompt, images=req.images,
                                       model=req.model, size=req.size,
@@ -250,7 +268,9 @@ class JobRunner:
         raw = self.store.put_image(data)["sha"]
         if req.mask is None or req.parent is None:
             return self.store.add_node(image=raw, **common)
-        original = imaging.open_image(req.parent)
+        full = imaging.open_image(req.parent)
+        # what was sent: the whole original, or a close-up of it
+        original = full.crop(req.zoom) if req.zoom else full
         result = imaging.open_image(data)
         if not imaging.same_aspect(original.size, result.size):
             pb.log("warn", f"Output is {result.width}x{result.height}, a different "
@@ -260,10 +280,21 @@ class JobRunner:
         annotated = imaging.open_image(req.annot) if req.annot is not None else None
         try:
             mask = imaging.open_image(req.mask)
+            if req.zoom:
+                mask = mask.crop(req.zoom)
             # on the original's pixel grid: scaled back as it is, it can sit a few pixels off
             result = imaging.register(original, result, mask)
+            if req.zoom:
+                # the model's whole output, for a close-up: the original with the close-up replaced
+                whole = full.copy()
+                whole.paste(result, req.zoom[:2])
+                raw = self.store.put_image(imaging.png_bytes(whole))["sha"]
             merged, note = imaging.paste_back(original, result, mask, annotated,
                                               overall=req.overall)
+            if req.zoom and merged is not None:
+                done = full.copy()
+                done.paste(merged, req.zoom[:2])
+                merged = done
         except Exception as exc:  # the image is paid for: never lose it to a paste-back problem
             pb.log("warn", f"{_NOTE_LOG[NOTE_PASTE_FAILED]} ({type(exc).__name__}: {exc})")
             return self.store.add_node(image=raw, note=NOTE_PASTE_FAILED, **common)

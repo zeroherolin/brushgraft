@@ -5,6 +5,7 @@
 import { sniff } from "../../imaging/formats";
 import type { ImageOps } from "../../imaging/client";
 import { sameAspect } from "../../imaging/pasteback";
+import { zoomSize, type Box } from "../../imaging/zoom";
 import { ASSET_REF, type Job, type JobError, type LogLine, type Region, type ServerEvent, type Shape, type TreeNode } from "../../types";
 import { ApiError, userError } from "../errors";
 import { charCount, compilePrompt } from "../prompts";
@@ -52,9 +53,12 @@ interface Prepared {
   /** the original, for pasting back */
   parent?: Uint8Array;
   mask?: Uint8Array;
+  /** the annotated copy as sent */
   annot?: Uint8Array;
   /** the user wrote an overall request besides the regions */
   overall: boolean;
+  /** the close-up sent instead of the whole original */
+  zoom?: Box;
 }
 
 export interface RunnerDeps {
@@ -169,7 +173,12 @@ export class JobRunner {
     const regions: Region[] = parent ? body.regions : [];
     const parentBytes = parent ? new Uint8Array((await store.getImage(parent.image)).data) : undefined;
     const refBytes = await Promise.all(refImages.map(async (sha) => new Uint8Array((await store.getImage(sha)).data)));
-    const prepared = await this.deps.images.prepare(parentBytes, regions, refBytes);
+    // A small edit of a large image goes as a close-up, to be pasted back within it: not with an
+    // overall request (that is about the whole image), nor for a model that redraws the scene
+    const aligned = spec.models.find((m) => m.name === model)?.aligned ?? true;
+    const zoom = body.composite && regions.length > 0 && !body.prompt.trim() && aligned;
+    const prepared = await this.deps.images.prepare(parentBytes, regions, refBytes, zoom);
+    if (prepared.zoom) size = zoomSize(prepared.zoom);
     const maskSha = prepared.mask ? (await store.putImage(prepared.mask)).sha : null;
     const annotSha = prepared.annot ? (await store.putImage(prepared.annot)).sha : null;
 
@@ -193,7 +202,7 @@ export class JobRunner {
     const req: Prepared = {
       jobId: job.id, n: body.n, prompt: fullPrompt, model, size, images: prepared.images, apiKey, baseUrl,
       parent: parentBytes, mask: job.composite ? prepared.mask : undefined, annot: prepared.annot,
-      overall: !!job.prompt,
+      overall: !!job.prompt, zoom: prepared.zoom,
     };
     this.#logs.set(job.id, []);
     this.deps.publish({ type: "job", job });
@@ -255,6 +264,10 @@ export class JobRunner {
     let err: JobError | null = null;
     const nodes: TreeNode[] = [];
     log("info", `Requesting ${req.model} at ${req.size}`);
+    if (req.zoom) {
+      const [x0, y0, x1, y1] = req.zoom;
+      log("info", `Sending a close-up of the regions: ${x1 - x0}x${y1 - y0} at (${x0}, ${y0})`);
+    }
     try {
       gen = await createImage(req.prompt, { images: req.images, model: req.model, size: req.size }, {
         apiKey: req.apiKey, baseUrl: req.baseUrl, log, fetch: this.deps.fetch, sleep: this.deps.sleep,
@@ -294,23 +307,27 @@ export class JobRunner {
     const { store, images } = this.deps;
     const job = await store.getJob(req.jobId);
     const common = { projectId: job.project_id, parentId: job.parent_id, jobId: job.id };
-    const raw = (await store.putImage(data)).sha;
+    let raw = (await store.putImage(data)).sha;
     if (!req.mask || !req.parent) return store.addNode({ image: raw, ...common });
     const original = sniff(req.parent)!;
+    // what was sent: the whole original, or a close-up of it
+    const sent = req.zoom ? { width: req.zoom[2] - req.zoom[0], height: req.zoom[3] - req.zoom[1] } : original;
     const result = sniff(data)!;
-    if (!sameAspect([original.width, original.height], [result.width, result.height])) {
+    if (!sameAspect([sent.width, sent.height], [result.width, result.height])) {
       log("warn", `Output is ${result.width}x${result.height}, a different aspect ratio from the original; not pasted back`);
       return store.addNode({ image: raw, note: spec.notes.aspect_mismatch, ...common });
     }
     let merged: Awaited<ReturnType<ImageOps["merge"]>>;
     try {
       if (original.width * original.height > MAX_PASTE_PIXELS) throw new Error("the image is too large for this browser");
-      merged = await images.merge(req.parent, data, req.mask, req.annot, req.overall);
+      merged = await images.merge(req.parent, data, req.mask, req.annot, req.overall, req.zoom);
     } catch (e) {
       // the image is paid for: never lose it to a paste-back problem (memory, a damaged file)
       log("warn", `${NOTE_LOG[spec.notes.paste_failed]} (${e instanceof Error ? `${e.name}: ${e.message}` : e})`);
       return store.addNode({ image: raw, note: spec.notes.paste_failed, ...common });
     }
+    // for a close-up, the model's whole output is the original with the close-up replaced
+    if (merged.whole) raw = (await store.putImage(merged.whole)).sha;
     if (merged.note) log(merged.image ? "info" : "warn", NOTE_LOG[merged.note]);
     if (!merged.image) return store.addNode({ image: raw, note: merged.note, ...common }); // the model redrew the scene
     const final = (await store.putImage(merged.image)).sha;
