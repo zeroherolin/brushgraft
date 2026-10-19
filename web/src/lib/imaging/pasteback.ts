@@ -150,14 +150,18 @@ export function copiedBand(echo: Raster, mask: Raster): Raster {
 // ---------------------------------------------------------------------------
 // Whole pieces in the feathered edge
 // ---------------------------------------------------------------------------
-type Settle = (soft: Raster, ox: number, oy: number) => Raster;
+/** The weights at (ox, oy) settled; past them too, for a line taken whole beyond the zone. */
+type Settle = (soft: Raster, ox: number, oy: number) => { soft: Raster; x0: number; y0: number };
 
 /**
  * The area with the changed words that reach it taken whole, and a function that sets the
- * feathered weights over the other changed words near it to all or nothing: imaging.whole_pieces.
- * ``settle`` takes the weights cropped at (ox, oy), covering the pieces' box.
+ * feathered weights over everything else that changed near it to all or nothing:
+ * imaging.whole_pieces (the reasons are there). ``settle`` takes the weights cropped at (ox, oy),
+ * covering the pieces' box.
  */
-export function wholePieces(original: Raster, toned: Raster, area: Raster, radius: number, band: Raster | null): { area: Raster; settle: Settle | null } {
+export function wholePieces(
+  original: Raster, toned: Raster, area: Raster, radius: number, band: Raster | null, core: Raster | null = null,
+): { area: Raster; settle: Settle | null } {
   const { width: w, height: h } = area;
   const a = fromGray(area.data, w, h);
   // when the model copied the outlines, they are its edge (as in growArea): pieces only up to them
@@ -171,13 +175,16 @@ export function wholePieces(original: Raster, toned: Raster, area: Raster, radiu
   const y1 = Math.min(h, zb[3] - 1 + 5);
   const cw = x1 - x0;
   const ch = y1 - y0;
-  const o = gaussianBlur(crop(toRgb(original), x0, y0, x1, y1), K.piece_blur);
-  const r = gaussianBlur(crop(toRgb(toned), x0, y0, x1, y1), K.piece_blur);
+  const oRgb = crop(toRgb(original), x0, y0, x1, y1);
+  const rRgb = crop(toRgb(toned), x0, y0, x1, y1);
+  const o = gaussianBlur(oRgb, K.piece_blur);
+  const r = gaussianBlur(rRgb, K.piece_blur);
   const n = cw * ch;
   const diff = new Int16Array(n);
   for (let i = 0; i < n; i++) {
     diff[i] = Math.max(Math.abs(o.data[i * 3] - r.data[i * 3]), Math.abs(o.data[i * 3 + 1] - r.data[i * 3 + 1]), Math.abs(o.data[i * 3 + 2] - r.data[i * 3 + 2]));
   }
+  const beyondShift = changedBeyondShift(oRgb, rRgb, K.piece_weak);
   const z = newBits(cw, ch);
   const aCrop = newBits(cw, ch);
   for (let y = 0; y < ch; y++) {
@@ -187,91 +194,495 @@ export function wholePieces(original: Raster, toned: Raster, area: Raster, radiu
     }
   }
   const weak = newBits(cw, ch);
+  const sharp = newBits(cw, ch);
+  const either = newBits(cw, ch);
   for (let i = 0; i < n; i++) {
     const x = i % cw;
     const y = (i - x) / cw;
-    weak.d[i] = diff[i] >= K.piece_weak && z.d[i] && !(band && band.data[(y + y0) * w + x + x0] > 0) ? 1 : 0;
+    if (!z.d[i] || (band && band.data[(y + y0) * w + x + x0] > 0)) continue;
+    weak.d[i] = diff[i] >= K.piece_weak ? 1 : 0;
+    sharp.d[i] = beyondShift.d[i];
+    either.d[i] = weak.d[i] | sharp.d[i];
   }
-  const labels = label8(weak);
+  const labels = label8(either);
   let max = 0;
   for (let i = 0; i < n; i++) if (labels[i] > max) max = labels[i];
   const cored = new Uint8Array(max + 1);
   for (let i = 0; i < n; i++) if (weak.d[i] && diff[i] >= K.piece_core) cored[labels[i]] = 1;
   cored[0] = 0;
   const pieces = newBits(cw, ch);
-  let anyPiece = false;
-  for (let i = 0; i < n; i++) if (cored[labels[i]]) (pieces.d[i] = 1), (anyPiece = true);
-  if (!anyPiece) return { area, settle: null };
-  // letters along a line: within a feather radius across, a pixel up or down
-  const runLabels = label8(dilateAxis(dilateAxis(pieces, radius, "x"), 1, "y"));
-  const runs = new Int32Array(n);
-  let maxRun = 0;
-  for (let i = 0; i < n; i++) {
-    runs[i] = pieces.d[i] ? runLabels[i] : 0;
-    if (runs[i] > maxRun) maxRun = runs[i];
-  }
-  const openRun = new Uint8Array(maxRun + 1);
-  // open runs touch the zone's edge, the image's included (the zone may cover all of a small one)
+  for (let i = 0; i < n; i++) if (cored[labels[i]]) pieces.d[i] = 1;
+  // open: touching the zone's edge, the image's included (the zone may cover all of a small one)
   const inner = erodeClosed(z, 1);
-  for (let i = 0; i < n; i++) if (z.d[i] && !inner.d[i]) openRun[runs[i]] = 1;
-  const reaches = new Uint8Array(maxRun + 1);
-  const near = dilate(aCrop, 2);
-  for (let i = 0; i < n; i++) if (near.d[i]) reaches[runs[i]] = 1;
+  const edge = newBits(cw, ch);
+  for (let i = 0; i < n; i++) edge.d[i] = z.d[i] && !inner.d[i] ? 1 : 0;
+  // rewritten words, merged along lines
+  const runs = linesOf(pieces, radius);
+  const maxRun = maxOf(runs);
+  const openRun = flagged(runs, edge, maxRun);
+  const reachesRun = flagged(runs, dilate(aCrop, 2), maxRun);
   const taken = newBits(cw, ch);
   let anyTaken = false;
-  for (let i = 0; i < n; i++) if (pieces.d[i] && reaches[runs[i]] && !openRun[runs[i]]) (taken.d[i] = 1), (anyTaken = true);
+  for (let i = 0; i < n; i++) if (pieces.d[i] && reachesRun[runs[i]] && !openRun[runs[i]]) (taken.d[i] = 1), (anyTaken = true);
+  const grown = cloneBits(aCrop);
   if (anyTaken) {
     const add = dilate(taken, 1);
-    const grown = copyRaster(area);
-    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) if (add.d[y * cw + x]) grown.data[(y + y0) * w + x + x0] = 255;
-    area = grown;
+    const out = copyRaster(area);
+    for (let y = 0; y < ch; y++) {
+      for (let x = 0; x < cw; x++) {
+        if (!add.d[y * cw + x]) continue;
+        out.data[(y + y0) * w + x + x0] = 255;
+        grown.d[y * cw + x] = 1;
+      }
+    }
+    area = out;
   }
   const rest = new Int32Array(n);
-  for (let i = 0; i < n; i++) rest[i] = openRun[runs[i]] || taken.d[i] ? 0 : runs[i];
+  for (let i = 0; i < n; i++) rest[i] = (pieces.d[i] && openRun[runs[i]]) || taken.d[i] ? 0 : runs[i];
+  // everything else that changed, line by line; a line running past the zone cut at its spaces
+  const other = newBits(cw, ch);
+  for (let i = 0; i < n; i++) other.d[i] = sharp.d[i] && !(pieces.d[i] && !openRun[runs[i]]) ? 1 : 0;
+  const lines = linesOf(other, radius);
+  const longLine = flagged(lines, edge, maxOf(lines));
+  const longOnly = new Int32Array(n);
+  for (let i = 0; i < n; i++) longOnly[i] = other.d[i] && longLine[lines[i]] ? lines[i] : 0;
+  const split = splitAtSpaces(longOnly, cw, oRgb, rRgb);
+  const splitMax = maxOf(split);
+  const seg = new Int32Array(n);
+  for (let i = 0; i < n; i++) seg[i] = longOnly[i] ? split[i] : lines[i] > 0 ? lines[i] + splitMax : 0;
+  // reaching the area: in its core, where the core's edge cuts it (one only near it needn't be), or
+  // in the words taken whole
+  const inside = newBits(cw, ch);
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      const i = y * cw + x;
+      const inCore = core ? core.data[(y + y0) * w + x + x0] > 0 : grown.d[i] === 1;
+      inside.d[i] = inCore || (anyTaken && grown.d[i] && !aCrop.d[i]) ? 1 : 0;
+    }
+  }
+  const maxSeg = maxOf(seg);
+  const reachesSeg = flagged(seg, inside, maxSeg);
+  const openSeg = flagged(seg, edge, maxSeg);
+  // what reaches the area and still runs past the zone can't come from the output whole
+  const cut = new Int32Array(n);
+  let anyCut = false;
+  for (let i = 0; i < n; i++) {
+    if (seg[i] > 0 && reachesSeg[seg[i]] && openSeg[seg[i]]) {
+      cut[i] = seg[i];
+      seg[i] = 0;
+      anyCut = true;
+    }
+  }
+  const n0 = maxOf(rest);
+  const groups = new Int32Array(n);
+  for (let i = 0; i < n; i++) groups[i] = rest[i] > 0 ? rest[i] : seg[i] > 0 ? seg[i] + n0 : 0;
+  const nGroups = maxOf(groups) + 1;
+  // these come from the output: they reach the area
+  const forced = new Uint8Array(nGroups);
+  for (let i = 0; i < n; i++) if (inside.d[i] && groups[i] > n0) forced[groups[i]] = 1;
+  forced[0] = 0;
+  if (nGroups === 1 && !anyCut) return { area, settle: null };
+  const cutIds = anyCut ? [...new Set(cut.filter((k) => k > 0))] : [];
+  // the two images whole, for a line cut past the zone
+  const wholeO = anyCut ? toRgb(original) : null;
+  const wholeR = anyCut ? toRgb(toned) : null;
 
   const settle: Settle = (soft, ox, oy) => {
     const s = new Int32Array(n);
     for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) s[y * cw + x] = soft.data[(y + y0 - oy) * soft.width + x + x0 - ox];
-    const counts = new Float64Array(maxRun + 1);
-    const sums = new Float64Array(maxRun + 1);
-    const whole = new Uint8Array(maxRun + 1);
-    let anyWhole = false;
+    const counts = new Float64Array(nGroups);
+    const sums = new Float64Array(nGroups);
+    const whole = new Uint8Array(nGroups);
+    let feathered = false;
     for (let i = 0; i < n; i++) {
-      counts[rest[i]]++;
-      sums[rest[i]] += s[i];
-      if (rest[i] && s[i] > 0 && s[i] < 255) (whole[rest[i]] = 1), (anyWhole = true);
+      counts[groups[i]]++;
+      sums[groups[i]] += s[i];
+      if (s[i] > 0 && s[i] < 255) {
+        feathered = true;
+        if (groups[i]) whole[groups[i]] = 1;
+      }
     }
-    if (!anyWhole) return soft;
     const onSeed = newBits(cw, ch);
     const offSeed = newBits(cw, ch);
     for (let i = 0; i < n; i++) {
-      const k = rest[i];
+      const k = groups[i];
       if (!whole[k]) continue;
-      if (2 * sums[k] >= 255 * counts[k]) onSeed.d[i] = 1;
+      if (forced[k] || 2 * sums[k] >= 255 * counts[k]) onSeed.d[i] = 1;
       else offSeed.d[i] = 1;
     }
+    const beyond: [number, number, number, number][] = [];
+    if (feathered) {
+      for (const k of cutIds) {
+        const line = newBits(cw, ch);
+        let inBand = false;
+        for (let i = 0; i < n; i++) {
+          if (cut[i] !== k) continue;
+          line.d[i] = 1;
+          if (s[i] > 0 && s[i] < 255) inBand = true;
+        }
+        if (inBand) beyond.push(...cutLine(line, s, wholeO!, wholeR!, x0, y0, edge, radius, onSeed, offSeed));
+      }
+    }
     const on = dilate(onSeed, 1);
-    const off = without(dilate(offSeed, 1), on);
+    const off = without(without(dilate(offSeed, 1), on), inside); // the area itself is the output's
     let changed = false;
     const out = newRaster(cw, ch, 1);
     for (let i = 0; i < n; i++) {
       out.data[i] = on.d[i] ? 255 : off.d[i] ? 0 : s[i];
       if (on.d[i] || off.d[i]) changed = true;
     }
-    if (!changed) return soft;
+    if (!changed) return { soft, x0: ox, y0: oy };
     // the pieces' edges antialiased, as the rest of the weights are smooth
     const smooth = gaussianBlur(out, 1);
-    const edge = dilate(or(on, off), 2);
-    const result = copyRaster(soft);
+    const near2 = dilate(or(on, off), 2);
+    // the weights grown to take in the lines taken whole past the zone
+    let [rx0, ry0, rx1, ry1] = [ox, oy, ox + soft.width, oy + soft.height];
+    for (const [top, bottom, left, right] of beyond) {
+      [rx0, ry0, rx1, ry1] = [Math.min(rx0, left), Math.min(ry0, top), Math.max(rx1, right), Math.max(ry1, bottom)];
+    }
+    const result = newRaster(rx1 - rx0, ry1 - ry0, 1);
+    paste(result, soft, ox - rx0, oy - ry0);
     for (let y = 0; y < ch; y++) {
       for (let x = 0; x < cw; x++) {
         const i = y * cw + x;
-        result.data[(y + y0 - oy) * soft.width + x + x0 - ox] = edge.d[i] ? smooth.data[i] : out.data[i];
+        result.data[(y + y0 - ry0) * result.width + x + x0 - rx0] = near2.d[i] ? smooth.data[i] : out.data[i];
       }
     }
-    return result;
+    for (const [top, bottom, left, right] of beyond) {
+      for (let y = top; y < bottom; y++) result.data.fill(255, (y - ry0) * result.width + left - rx0, (y - ry0) * result.width + right - rx0);
+    }
+    return { soft: result, x0: rx0, y0: ry0 };
   };
   return { area, settle };
+}
+
+const maxOf = (a: Int32Array): number => {
+  let m = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] > m) m = a[i];
+  return m;
+};
+
+/** Per label (0 to ``max``): whether any of its pixels is set in ``where``. */
+function flagged(labels: Int32Array, where: Bits, max: number): Uint8Array {
+  const out = new Uint8Array(max + 1);
+  for (let i = 0; i < labels.length; i++) if (where.d[i]) out[labels[i]] = 1;
+  return out;
+}
+
+/** ``pieces`` merged along lines (within ``gap`` across, a pixel up or down), labelled; 0 off them: imaging._lines. */
+function linesOf(pieces: Bits, gap: number): Int32Array {
+  const labels = label8(dilateAxis(dilateAxis(pieces, gap, "x"), 1, "y"));
+  for (let i = 0; i < labels.length; i++) if (!pieces.d[i]) labels[i] = 0;
+  return labels;
+}
+
+/**
+ * Where two RGB rasters of the same size differ by ``threshold`` or more beyond a pixel's shift: each
+ * pixel is that far from all of the other's 3x3 neighbours, one way or the other (the largest channel;
+ * the edge repeated). imaging.tolerant_diff(a, b) >= threshold, stopping at the first close neighbour.
+ */
+function changedBeyondShift(a: Raster, b: Raster, threshold: number): Bits {
+  const { width: w, height: h } = a;
+  const out = newBits(w, h);
+  const ad = a.data;
+  const bd = b.data;
+  // whether p's pixel i is at least threshold from q's pixel j, in any channel
+  const apart = (p: Uint8Array, i: number, q: Uint8Array, j: number): boolean => {
+    let d = p[i] - q[j];
+    if (d >= threshold || -d >= threshold) return true;
+    d = p[i + 1] - q[j + 1];
+    if (d >= threshold || -d >= threshold) return true;
+    d = p[i + 2] - q[j + 2];
+    return d >= threshold || -d >= threshold;
+  };
+  for (let y = 0; y < h; y++) {
+    const up = (y > 0 ? y - 1 : 0) * w;
+    const mid = y * w;
+    const down = (y < h - 1 ? y + 1 : y) * w;
+    for (let x = 0; x < w; x++) {
+      const i = (mid + x) * 3;
+      // the same pixel close enough: no neighbour need be looked at
+      if (!apart(ad, i, bd, i)) continue;
+      const l = x > 0 ? x - 1 : 0;
+      const r = x < w - 1 ? x + 1 : x;
+      // that far from all nine neighbours, one way or the other
+      let far = true;
+      for (let pass = 0; pass < 2; pass++) {
+        const p = pass ? bd : ad;
+        const q = pass ? ad : bd;
+        far = true;
+        for (const row of [up, mid, down]) {
+          if (!apart(p, i, q, (row + l) * 3) || !apart(p, i, q, (row + x) * 3) || !apart(p, i, q, (row + r) * 3)) {
+            far = false;
+            break;
+          }
+        }
+        if (far) break;
+      }
+      if (far) out.d[mid + x] = 1;
+    }
+  }
+  return out;
+}
+
+/** Of ``flat`` (one entry per column), the entries in runs of at least ``need`` set entries: imaging._wide_runs. */
+function wideRuns(flat: Uint8Array, need: number): Uint8Array {
+  const out = new Uint8Array(flat.length);
+  let start = -1;
+  for (let i = 0; i <= flat.length; i++) {
+    if (i < flat.length && flat[i]) {
+      if (start < 0) start = i;
+    } else if (start >= 0) {
+      if (i - start >= need) out.fill(1, start, i);
+      start = -1;
+    }
+  }
+  return out;
+}
+
+/** The median of ``v`` (sorted in place), as numpy takes it: the mean of the middle two of an even count. */
+function medianOf(v: Float64Array): number {
+  v.sort();
+  const m = v.length >> 1;
+  return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+
+/**
+ * Per column of an RGB raster's rows ``top`` to ``bottom`` (inclusive), ``left`` to ``right``: its pixels at
+ * least piece_flat from the column's median, in any channel: imaging._column_ink.
+ */
+function columnInk(im: Raster, top: number, bottom: number, left: number, right: number): Int32Array {
+  const { width: w, data: d } = im;
+  const rows = bottom - top + 1;
+  const out = new Int32Array(right - left + 1);
+  const vals = new Float64Array(rows);
+  const mid = [0, 0, 0];
+  for (let x = left; x <= right; x++) {
+    for (let c = 0; c < 3; c++) {
+      for (let y = top; y <= bottom; y++) vals[y - top] = d[(y * w + x) * 3 + c];
+      mid[c] = medianOf(vals);
+    }
+    let n = 0;
+    for (let y = top; y <= bottom; y++) {
+      const i = (y * w + x) * 3;
+      if (Math.max(Math.abs(d[i] - mid[0]), Math.abs(d[i + 1] - mid[1]), Math.abs(d[i + 2] - mid[2])) >= K.piece_flat) n++;
+    }
+    out[x - left] = n;
+  }
+  return out;
+}
+
+/** The pixels of each label, and its bounds. */
+function byLabel(labels: Int32Array, w: number): Map<number, { px: number[]; top: number; bottom: number; left: number; right: number }> {
+  const out = new Map<number, { px: number[]; top: number; bottom: number; left: number; right: number }>();
+  for (let i = 0; i < labels.length; i++) {
+    const k = labels[i];
+    if (!k) continue;
+    const x = i % w;
+    const y = (i - x) / w;
+    let g = out.get(k);
+    if (!g) out.set(k, (g = { px: [], top: y, bottom: y, left: x, right: x }));
+    g.px.push(i);
+    if (y > g.bottom) g.bottom = y;
+    if (x < g.left) g.left = x;
+    if (x > g.right) g.right = x;
+  }
+  return out;
+}
+
+/** Each line cut at the word spaces both images have: imaging._split_at_spaces. */
+function splitAtSpaces(lines: Int32Array, w: number, oRgb: Raster, rRgb: Raster): Int32Array {
+  const out = new Int32Array(lines.length);
+  let count = 0;
+  const groups = byLabel(lines, w);
+  for (const k of [...groups.keys()].sort((p, q) => p - q)) {
+    const { px, top, bottom, left, right } = groups.get(k)!;
+    const need = Math.max(2, roundHalfEven(K.piece_space * (bottom - top + 1)));
+    const len = right - left + 1;
+    const busy = new Uint8Array(len);
+    for (const i of px) busy[(i % w) - left] = 1;
+    const blank = (im: Raster) => Uint8Array.from(columnInk(im, top, bottom, left, right), (v) => (v === 0 ? 1 : 0));
+    const spaceO = wideRuns(blank(oRgb), need);
+    const spaceR = wideRuns(blank(rRgb), need);
+    // a stretch starts at a busy column after a gap (or at the line's start)
+    const number = new Int32Array(len);
+    let seenGap = true;
+    let current = count;
+    for (let c = 0; c < len; c++) {
+      if (!busy[c] && spaceO[c] && spaceR[c]) {
+        seenGap = true;
+      } else if (busy[c]) {
+        if (seenGap) {
+          current++;
+          seenGap = false;
+        }
+        number[c] = current;
+      }
+    }
+    for (const i of px) out[i] = number[(i % w) - left];
+    count = current;
+  }
+  return out;
+}
+
+/**
+ * Set ``on`` (from the output) and ``off`` (from the original) over a line of text that reaches the area
+ * and runs past the zone, cut on each side of the area at a word space of both images: imaging._cut_line.
+ * ``line``, ``s``, ``edge`` and the seeds are the zone's box, at (bx, by) in the whole images ``wholeO``
+ * and ``wholeR``. Returns the boxes past the zone to set to 255 (top, bottom, left, right; ends exclusive).
+ */
+function cutLine(
+  line: Bits, s: Int32Array, wholeO: Raster, wholeR: Raster, bx: number, by: number, edge: Bits, radius: number, on: Bits, off: Bits,
+): [number, number, number, number][] {
+  const bw = line.w;
+  const bh = line.h;
+  let top = Infinity;
+  let bottom = -1;
+  let left = Infinity;
+  let right = -1;
+  for (let i = 0; i < line.d.length; i++) {
+    if (!line.d[i]) continue;
+    const x = i % bw;
+    const y = (i - x) / bw;
+    top = Math.min(top, y);
+    bottom = Math.max(bottom, y);
+    left = Math.min(left, x);
+    right = Math.max(right, x);
+  }
+  const height = bottom - top + 1;
+  if (height > K.piece_line * radius || right - left + 1 < 2 * height) return [];
+  const width = wholeO.width; // columns are counted on the images from here on
+  const need = Math.max(2, roundHalfEven(K.piece_space * height));
+  const inkO = columnInk(wholeO, by + top, by + bottom, 0, width - 1);
+  const inkR = columnInk(wholeR, by + top, by + bottom, 0, width - 1);
+  const flatO = wideRuns(Uint8Array.from(inkO, (v) => (v === 0 ? 1 : 0)), need);
+  const flatR = wideRuns(Uint8Array.from(inkR, (v) => (v === 0 ? 1 : 0)), need);
+  const spaces = Uint8Array.from(flatO, (v, j) => v & flatR[j]);
+  const lo = bx + left;
+  const hi = bx + right;
+  // where row y is its background (its median) in both images
+  const clearAt = (y: number): Uint8Array => {
+    const out = new Uint8Array(width);
+    if (y < 0 || y >= wholeO.height) return out;
+    out.fill(1);
+    const vals = new Float64Array(width);
+    for (const im of [wholeO, wholeR]) {
+      const mid = [0, 0, 0];
+      for (let c = 0; c < 3; c++) {
+        for (let x = 0; x < width; x++) vals[x] = im.data[(y * width + x) * 3 + c];
+        mid[c] = medianOf(vals);
+      }
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 3;
+        if (Math.max(Math.abs(im.data[i] - mid[0]), Math.abs(im.data[i + 1] - mid[1]), Math.abs(im.data[i + 2] - mid[2])) >= K.piece_flat) out[x] = 0;
+      }
+    }
+    return out;
+  };
+  // the band: as narrow as leaves the line's letters inside it where the zone has it
+  let band: [number, number] | null = null;
+  let clear = new Uint8Array(width);
+  for (let m = 2; m <= Math.max(2, Math.floor(height / 3)); m++) {
+    const above = clearAt(by + top - m);
+    const below = clearAt(by + bottom + m);
+    const edges = Uint8Array.from(above, (v, j) => v & below[j]);
+    let all = true;
+    for (let j = lo; j <= hi && all; j++) if (!edges[j]) all = false;
+    if (all) {
+      band = [by + top - m + 1, by + bottom + m];
+      clear = edges;
+      break;
+    }
+  }
+  const colMax = (x: number) => {
+    let m = 0;
+    for (let y = top; y <= bottom; y++) m = Math.max(m, s[y * bw + x]);
+    return m;
+  };
+  let a0 = -1;
+  let a1 = -1;
+  for (let x = left; x <= right; x++) {
+    if (colMax(x) !== 255) continue;
+    if (a0 < 0) a0 = bx + x;
+    a1 = bx + x;
+  }
+  if (a0 < 0) a0 = a1 = colMax(left) >= colMax(right) ? lo - 1 : hi + 1; // it reaches the area at that end
+  // the last column before x with ink, and the first after it
+  const lastBefore = (ink: Int32Array, j: number) => {
+    for (let x = Math.min(j, width) - 1; x >= 0; x--) if (ink[x]) return x;
+    return -1;
+  };
+  const firstAfter = (ink: Int32Array, j: number) => {
+    for (let x = Math.max(j + 1, 0); x < width; x++) if (ink[x]) return x;
+    return width;
+  };
+  const beyond: [number, number, number, number][] = [];
+  for (const side of [1, -1]) {
+    const start = side === 1 ? a1 : a0;
+    const inPart = (x: number) => (side === 1 ? bx + x > start : bx + x < start);
+    let any = false;
+    let atZone = false;
+    for (let i = 0; i < line.d.length; i++) {
+      if (!line.d[i] || !inPart(i % bw)) continue;
+      any = true;
+      if (edge.d[i]) atZone = true;
+    }
+    if (!any) continue;
+    const cand: number[] = [];
+    if (side === 1) {
+      for (let j = start + 1; j <= hi; j++) if (spaces[j]) cand.push(j);
+    } else {
+      for (let j = start - 1; j >= lo; j--) if (spaces[j]) cand.push(j);
+    }
+    const far = new Set<number>();
+    if (!atZone) {
+      cand.push(side === 1 ? hi + 1 : lo - 1); // past the line's end
+    } else if (band) {
+      for (let j = side === 1 ? hi + 1 : lo - 1; j >= 0 && j < width; j += side) {
+        if (!clear[j]) break;
+        if (spaces[j]) far.add(j), cand.push(j);
+      }
+    }
+    if (!cand.length) continue; // no word space both images have: left as it is
+    // the space between the two images' words on either side of the cut: the output's towards the
+    // area, the original's beyond; then the nearest
+    const score = (j: number): number[] => {
+      const before = lastBefore(side === 1 ? inkR : inkO, j);
+      const after = firstAfter(side === 1 ? inkO : inkR, j);
+      return [Math.max(0, need - (after - before - 1)), Math.abs(j - start), j];
+    };
+    let best = cand[0];
+    let bestScore = score(best);
+    for (const j of cand.slice(1)) {
+      const sc = score(j);
+      for (let k = 0; k < 3; k++) {
+        if (sc[k] === bestScore[k]) continue;
+        if (sc[k] < bestScore[k]) (best = j), (bestScore = sc);
+        break;
+      }
+    }
+    if (!band) {
+      // the line's changed pixels only
+      for (let i = 0; i < line.d.length; i++) {
+        if (!line.d[i]) continue;
+        const x = bx + (i % bw);
+        if (!inPart(i % bw)) continue;
+        if (side === 1 ? x < best : x > best) on.d[i] = 1;
+        else off.d[i] = 1;
+      }
+    } else {
+      // all of the band: no trace of the other image's letters is left beside them
+      for (let y = Math.max(0, band[0] - by); y < Math.min(bh, Math.max(0, band[1] - by)); y++) {
+        for (let x = 0; x < bw; x++) {
+          const c = bx + x;
+          if (side === 1 ? c > start && c < best : c < start && c > best) on.d[y * bw + x] = 1;
+          else if (side === 1 ? c >= best : c <= best) off.d[y * bw + x] = 1;
+        }
+      }
+    }
+    if (far.has(best)) beyond.push(side === 1 ? [band![0], band![1], hi + 1, best] : [band![0], band![1], best + 1, lo]);
+  }
+  return beyond;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +827,8 @@ export function matchTone(original: Raster, result: Raster, mask: Raster): Raste
     offset = clamp(offset, -K.tone_max_offset, K.tone_max_offset);
     for (let v = 0; v < 256; v++) {
       const trust = v >= lo && v <= hi ? 1 : Math.max(0, 1 - Math.max(v - hi, lo - v) / K.tone_fade);
-      lut[c * 256 + v] = Math.min(255, Math.max(0, roundHalfEven(v + trust * (gain * v + offset - v))));
+      // a tie goes up: the two builds' fits can differ in the last bits (imaging.match_tone)
+      lut[c * 256 + v] = Math.min(255, Math.max(0, roundHalfEven(v + trust * (gain * v + offset - v) + K.tone_tie)));
     }
   }
   let identity = true;
@@ -527,22 +939,24 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
     Math.max(1, Math.ceil((K.bridge_radii * radius) / scale)), K.spill_min_patch / scale ** 2);
 
   let areaImg: Raster;
+  let core: Raster | null = null;
   if (grown.note === NOTE.spill_too_large) {
     areaImg = mask; // everything changed: no clean outline exists, keep the region
   } else {
     let strong = newBits(w, h);
     for (let i = 0; i < delta.length; i++) strong.d[i] = delta[i] > threshold ? 1 : 0;
     if (blocked) strong = without(strong, dilate(blocked, reach));
+    const fullSize = (b: Bits) => lighter(point(resize(bitsToGray(b), width, height, "bilinear"), (v) => (v >= 128 ? 255 : 0)), mask);
+    // the region and the new content that belongs to it
+    core = fullSize(grown.area);
     // strong changes the feather would half cover anyway are taken whole
-    const area = or(grown.area, and(strong, dilate(grown.area, Math.ceil((2 * radius) / scale))));
-    const up = resize(bitsToGray(area), width, height, "bilinear");
-    areaImg = lighter(point(up, (v) => (v >= 128 ? 255 : 0)), mask);
+    areaImg = fullSize(or(grown.area, and(strong, dilate(grown.area, Math.ceil((2 * radius) / scale)))));
   }
 
   const band = echo ? copiedBand(echo, mask) : null;
   let settle: Settle | null = null;
   if (grown.note !== NOTE.spill_too_large) {
-    const pieces = wholePieces(original, toned, areaImg, radius, band);
+    const pieces = wholePieces(original, toned, areaImg, radius, band, core);
     areaImg = pieces.area;
     settle = pieces.settle;
   }
@@ -554,8 +968,8 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
   // Blurs reach a bounded distance, so work on the box around the area plus that much (and the
   // whole pieces' box): the result is the same as blurring the whole image, at a fraction of the cost
   const margin = Math.max(2 * blurReach(radius) + 2, K.piece_zone * radius + 6);
-  const x0 = Math.max(0, box[0] - margin);
-  const y0 = Math.max(0, box[1] - margin);
+  let x0 = Math.max(0, box[0] - margin);
+  let y0 = Math.max(0, box[1] - margin);
   const x1 = Math.min(width, box[2] + margin);
   const y1 = Math.min(height, box[3] + margin);
   const area = crop(areaImg, x0, y0, x1, y1);
@@ -564,6 +978,6 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
   let soft = gaussianBlur(lighter(spread, area), radius);
   // the outlines lie within the feathered edge: where the model copied them, the original goes back
   if (band) soft = darker(soft, point(crop(band, x0, y0, x1, y1), (v) => 255 - v));
-  if (settle) soft = settle(soft, x0, y0);
+  if (settle) ({ soft, x0, y0 } = settle(soft, x0, y0));
   return { toned: res, soft, x0, y0, note };
 }

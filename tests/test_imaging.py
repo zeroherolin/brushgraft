@@ -543,6 +543,88 @@ class TestWholePieces:
         # at most a faint trace where the old line's end was, not a second set of letters
         assert pixel_diff(merged.crop(text), result.crop(text)).max() <= 12
 
+    @staticmethod
+    def paragraph(edited="flat", push=0, dx=0, dy=0, soft=0.0):
+        """A paragraph with ``edited`` in its fifth line; the rest of that line ``push`` pixels
+        along, everything ``dx``, ``dy`` off and blurred by ``soft``, as a model redraws it."""
+        im = Image.new("RGB", (1536, 1024), (255, 255, 255))
+        d = ImageDraw.Draw(im)
+        font = ImageFont.load_default(size=30)
+        words = "the quarterly report shows steady growth across all regions while costs".split()
+        for k in range(9):
+            line = " ".join(words[(k + j) % len(words)] for j in range(11))
+            y = 120 + k * 48 + dy
+            if k == 4:
+                d.text((60 + dx, y), "costs remained", font=font, fill=(40, 40, 40))
+                d.text((300 + dx, y), edited, font=font, fill=(40, 40, 40))
+                d.text((390 + push + dx, y), line, font=font, fill=(40, 40, 40))
+            else:
+                d.text((60 + dx, y), line, font=font, fill=(40, 40, 40))
+        return im.filter(ImageFilter.GaussianBlur(soft)) if soft else im
+
+    PARAGRAPH_REGION = [{"type": "rect", "x": 290, "y": 310, "w": 100, "h": 44}]
+
+    def blended(self, merged, page, result, box):
+        """Pixels within ``box`` that are neither the original's nor the output's, where the two
+        clearly differ: a word drawn twice."""
+        m, o, r = (np.asarray(im.crop(box), np.int16) for im in (merged, page, result))
+        apart = np.abs(o - r).max(axis=2) >= 48
+        mixed = np.minimum(np.abs(m - o).max(axis=2), np.abs(m - r).max(axis=2)) >= 16
+        return int((apart & mixed).sum())
+
+    def test_lines_the_model_only_redrew_a_pixel_off_are_not_drawn_twice(self):
+        # around the edited word the model redrew the paragraph a pixel off and softer: the lines
+        # above and below run through the feathered edge
+        page = self.paragraph()
+        mask = imaging.region_mask(page.size, self.PARAGRAPH_REGION)
+        result = imaging.register(page, self.paragraph("yearly", dx=2, dy=1, soft=0.8), mask)
+        merged, _ = imaging.paste_back(page, result, mask)
+        assert self.blended(merged, page, result, (200, 240, 600, 420)) == 0
+        # and the original stays beyond the words next to the region (taken whole)
+        far = ~imaging._dilate(np.asarray(mask) > 0, 150)
+        assert pixel_diff(merged, page)[far].max() == 0
+
+    def test_a_line_pushed_along_by_a_longer_word_is_cut_at_a_word_space(self):
+        # "flat" became "yearly", and the rest of the line moved along by more than a word space,
+        # far past the zone: the line comes from the output up to a word space, then the original
+        page = self.paragraph()
+        result = self.paragraph("yearly", push=11)
+        mask = imaging.region_mask(page.size, self.PARAGRAPH_REGION)
+        merged, _ = imaging.paste_back(page, result, mask)
+        line = (40, 308, 1536, 356)
+        assert self.blended(merged, page, result, line) == 0
+        # each column of the line is all one image's: no letter is cut across
+        m, o, r = (np.asarray(im.crop(line).convert("L"), np.int16)
+                   for im in (merged, page, result))
+        from_page = (np.abs(m - o) <= 2).all(axis=0)
+        from_result = (np.abs(m - r) <= 2).all(axis=0)
+        assert (from_page | from_result).all()
+
+    def test_tolerant_diff_ignores_a_shift_of_a_pixel(self):
+        page = np.asarray(text_page())
+        shifted = np.roll(page, 1, axis=1)
+        assert imaging.tolerant_diff(page, shifted)[:, 2:-2].max() == 0
+        other = np.asarray(text_page(seed=4))
+        assert imaging.tolerant_diff(page, other).max() > 100
+
+    def test_a_line_is_split_at_spaces_both_images_have(self):
+        # two words; in the output the second moved along a little, less than the space
+        def words(second_at):
+            im = Image.new("RGB", (400, 60), (255, 255, 255))
+            d = ImageDraw.Draw(im)
+            font = ImageFont.load_default(size=30)
+            d.text((10, 10), "steady", font=font, fill=(0, 0, 0))
+            d.text((second_at, 10), "growth", font=font, fill=(0, 0, 0))
+            return np.asarray(im)
+
+        o, r = words(140), words(144)
+        changed = imaging.tolerant_diff(o, r) >= imaging.PIECE_WEAK
+        lines = imaging._lines(changed, 9)
+        assert len(np.unique(lines[lines > 0])) == 1  # one line...
+        split = imaging._split_at_spaces(lines, o, r)
+        left, right = split[:, :120], split[:, 140:]
+        assert set(np.unique(left[left > 0])).isdisjoint(np.unique(right[right > 0]))  # two words
+
     def test_label8_groups_like_a_flood_fill(self):
         rng = np.random.default_rng(1)
         for _ in range(50):

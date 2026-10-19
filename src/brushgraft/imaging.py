@@ -61,16 +61,21 @@ REGISTER_MAX_TILES = 400   # patches measured at most, spread over the image
 REGISTER_MIN_SHIFT = 0.5   # px: an output nowhere further off than this is left as it is
 REGISTER_MAX_SPREAD = 0.75  # px: patches must agree with the fitted offsets to within this
 REGISTER_NEAR = 256        # px: patches this close to the regions settle what is left near them
-# Whole pieces in the feathered edge (whole_pieces): where the output differs strongly from the
-# original near the area (a letter rewritten, an object redrawn), blending the two shows both
+# Whole pieces in the feathered edge (whole_pieces): where the output differs from the original
+# near the area (a letter rewritten or only redrawn, an object redrawn), blending the two shows both
 PIECE_BLUR = 1.5           # px: smooths away the edge jitter of text the model only redrew
 PIECE_WEAK = 24            # levels: how far a piece of change extends
-PIECE_CORE = 96            # levels: a piece counts only with a core this strong. Measured after
+PIECE_CORE = 96            # levels: a piece is rewritten with a core this strong. Measured after
 #                            registration: letters the model only redrew reach it 1% of the time,
 #                            letters it rewrote always do
 PIECE_ZONE = 40            # feather radii: how far from the area pieces are looked at. A rewritten
 #                            line (a date, a price) often runs well past the region, and when a
 #                            word changes length the rest of its line moves along
+PIECE_FLAT = 12            # levels: a pixel this far from its column's middle value is ink (a word
+#                            space has none)
+PIECE_SPACE = 0.15         # a word space is at least this share of its line's height wide (the gap
+#                            between two letters is less)
+PIECE_LINE = 10            # feather radii: a line of text cut at a word space is at most this high
 # An overall request that changed the whole image (a new sky): far from the regions, more than
 # this share changed by more than this much. Measured on 397 edits with regions only, models
 # changed at most 18% of the far field that much on their own; a requested overcast sky, 30%.
@@ -83,6 +88,7 @@ TONE_MAX_OFFSET = 30.0     # or shifts it by more than this many levels
 TONE_MIN_SPAN = 80         # levels the fit must span to estimate a gain (else offset only)
 TONE_FADE = 40             # beyond the measured levels the correction fades out over this many
 TONE_KEEP = 60             # percent of pixels, the best-fitting, the fit is made on
+TONE_TIE = 1e-6            # added before rounding the mapped levels (see match_tone)
 # Images sent to the API are shrunk beyond this size, to keep uploads fast
 API_MAX_BYTES = 8 * 1024 * 1024
 # Reference images only convey content and style; full resolution isn't needed
@@ -403,20 +409,37 @@ def _feather(area: Image.Image, radius: int, band: Image.Image | None) -> Image.
 
 
 def whole_pieces(original: Image.Image, result: Image.Image, area: Image.Image, radius: int,
-                 band: Image.Image | None):
+                 band: Image.Image | None, core: Image.Image | None = None):
     """The area with the changed words that reach it taken whole, and a function that sets the
-    feathered weights over the other changed words near it to all or nothing.
+    feathered weights over everything else that changed near it to all or nothing.
 
-    The feathered edge blends the output into the original. Where the two only differ a little
-    (text the model redrew, aligned by register), that shows nothing; where they differ a lot, it
-    shows both at once: the old number through the new one, a word half rewritten. Models often
-    rewrite a whole word or line when a region covers part of it. So pieces of strong change
-    near the area (above PIECE_WEAK, with a core above PIECE_CORE) are merged along lines into
-    runs (letters less than a feather radius apart), and each run comes from one side: runs
-    reaching the area are added to it whole; the others take the side most of their weight is
-    on. Runs that go on past PIECE_ZONE feather radii or off the image (a whole changed
-    background) are left as they are, and so are copied marks (``band``). When the model copied
-    the outlines, they are its edge, as in grow_area: pieces are looked at only up to them.
+    The feathered edge blends the output into the original. Where the two differ only a little
+    (a slight change of tone), that shows nothing; where they differ more, it shows both at once:
+    the old number through the new one, a word half rewritten, a word the model only redrew a
+    pixel or two off or in another weight drawn twice, crisp letters over soft ones. So the
+    feathered weights are made all or nothing over every piece that changed, and the blend is
+    left only where the two images agree:
+
+    - rewritten words (pieces of strong change, above PIECE_WEAK with a core above PIECE_CORE,
+      after a blur that smooths away the edge jitter of redrawn text) are merged along lines into
+      runs (letters less than a feather radius apart). Runs reaching the area are added to it
+      whole; models often rewrite a whole word or line when a region covers part of it;
+    - everything else that changed beyond a pixel's shift (tolerant_diff), and rewritten runs
+      that go on past PIECE_ZONE feather radii, is merged along lines the same way. Lines the
+      area's edge cuts come from the output, the others (a line just above or below the region
+      included) from the side most of their weight is on;
+    - a line running past the zone (a line of text across the image) is first cut at the word
+      spaces both images have, where a cut shows nothing. A piece of it that reaches the area and
+      still runs past the zone, a line of text the model moved along (a word that got longer
+      pushes the rest of its line), is cut on each side of the area at the word space where the
+      cut covers the least ink and leaves the widest space (see _cut_line). One that isn't text
+      (a background that changed all over) is left as it is.
+
+    ``core`` is the region and the new content that belongs to it (``area`` without what was
+    added to it only for being near: a piece of a line just above the region, say); a line its
+    edge cuts is what reaches the area, and nothing is taken back from it. Copied marks
+    (``band``) are never taken. When the model copied the outlines, they are its edge, as in
+    grow_area: pieces are looked at only up to them.
     """
     w, h = area.size
     a = np.asarray(area) > 0
@@ -430,46 +453,76 @@ def whole_pieces(original: Image.Image, result: Image.Image, area: Image.Image, 
     box = (max(0, int(xs.min()) - 4), max(0, int(ys.min()) - 4),
            min(w, int(xs.max()) + 5), min(h, int(ys.max()) + 5))
     x0, y0, x1, y1 = box
+    o_rgb, r_rgb = (np.asarray(im.convert("RGB").crop(box)) for im in (original, result))
     blur = ImageFilter.GaussianBlur(PIECE_BLUR)
-    o, r = (np.asarray(im.convert("RGB").crop(box).filter(blur), np.int16)
-            for im in (original, result))
+    o, r = (np.asarray(Image.fromarray(im).filter(blur), np.int16) for im in (o_rgb, r_rgb))
     diff = np.abs(o - r).max(axis=2)
     z = zone[y0:y1, x0:x1]
-    weak = (diff >= PIECE_WEAK) & z
-    if band is not None:
-        weak &= ~(np.asarray(band)[y0:y1, x0:x1] > 0)
-    labels = _label8(weak)
+    keep = z & ~(np.asarray(band)[y0:y1, x0:x1] > 0) if band is not None else z
+    weak = (diff >= PIECE_WEAK) & keep
+    sharp = (tolerant_diff(o_rgb, r_rgb) >= PIECE_WEAK) & keep
+    labels = _label8(weak | sharp)
     cored = np.zeros(int(labels.max()) + 1, bool)
     cored[labels[(diff >= PIECE_CORE) & weak]] = True
     cored[0] = False
     pieces = cored[labels]
-    if not pieces.any():
-        return area, None
-    # letters along a line: within a feather radius across, a pixel up or down
-    runs = _label8(_dilate_axis(_dilate_axis(pieces, radius, 1), 1, 0)) * pieces
     edge = z & ~_erode_closed(z, 1)  # the image's edge too: the zone may cover all of a small one
-    open_runs = np.unique(runs[edge])
-    reach = np.unique(runs[_dilate(a[y0:y1, x0:x1], 2)])
-    taken = np.isin(runs, reach) & ~np.isin(runs, open_runs) & pieces
+    # rewritten words, merged along lines
+    runs = _lines(pieces, radius)
+    open_runs = np.isin(runs, np.unique(runs[edge])) & pieces
+    taken = np.isin(runs, np.unique(runs[_dilate(a[y0:y1, x0:x1], 2)])) & ~open_runs & pieces
+    grown = a.copy()
     if taken.any():
-        grown = a.copy()
         grown[y0:y1, x0:x1] |= _dilate(taken, 1)
         area = _bool_image(grown)
-    rest = np.where(np.isin(runs, open_runs) | taken, 0, runs)
+    rest = np.where(open_runs | taken, 0, runs)
+    # everything else that changed, line by line; a line running past the zone cut at its spaces
+    other = sharp & ~(pieces & ~open_runs)
+    lines = _lines(other, radius)
+    long = np.isin(lines, np.unique(lines[edge])) & other
+    seg = _split_at_spaces(np.where(long, lines, 0), o_rgb, r_rgb)
+    seg = np.where(long, seg, np.where(lines > 0, lines + int(seg.max()), 0))
+    # reaching the area: in its core, where the core's edge cuts it (one only near it needn't be)
+    inside = (np.asarray(core)[y0:y1, x0:x1] > 0) if core is not None else grown[y0:y1, x0:x1]
+    if taken.any():
+        inside = inside | grown[y0:y1, x0:x1] & ~a[y0:y1, x0:x1]  # and the words taken whole
+    reaching = np.isin(seg, np.unique(seg[inside])) & (seg > 0)
+    # what reaches the area and still runs past the zone can't come from the output whole
+    cut = np.where(np.isin(seg, np.unique(seg[edge])) & reaching, seg, 0)
+    seg = np.where(cut > 0, 0, seg)
+    n0 = int(rest.max())
+    groups = np.where(rest > 0, rest, np.where(seg > 0, seg + n0, 0))
+    n = int(groups.max()) + 1
+    forced = np.zeros(n, bool)  # these come from the output: they reach the area
+    forced[np.unique(groups[inside & (groups > n0)])] = True
+    forced[0] = False
+    if n == 1 and not cut.any():
+        return area, None
+    cut_ids = [int(k) for k in np.unique(cut) if k]
+    whole_o = whole_r = None  # the two images whole, for a line cut past the zone
+    if cut_ids:
+        whole_o, whole_r = np.asarray(original.convert("RGB")), np.asarray(result.convert("RGB"))
 
     def settle(soft: Image.Image) -> Image.Image:
         s = np.asarray(soft)[y0:y1, x0:x1].astype(np.int64)
-        inside = rest[(s > 0) & (s < 255)]
-        ids = np.unique(inside[inside > 0])
-        if not len(ids):
-            return soft
-        counts = np.bincount(rest.ravel(), minlength=int(rest.max()) + 1)
-        sums = np.bincount(rest.ravel(), weights=s.ravel(), minlength=int(rest.max()) + 1)
-        whole = np.zeros(len(counts), bool)
+        feathered = (s > 0) & (s < 255)
+        ids = np.unique(groups[feathered])
+        ids = ids[ids > 0]
+        counts = np.bincount(groups.ravel(), minlength=n)
+        sums = np.bincount(groups.ravel(), weights=s.ravel(), minlength=n)
+        whole = np.zeros(n, bool)
         whole[ids] = True
-        result_side = whole & (2 * sums >= 255 * counts)
-        on = _dilate(result_side[rest], 1)
-        off = _dilate((whole & ~result_side)[rest], 1) & ~on
+        result_side = whole & ((2 * sums >= 255 * counts) | forced)
+        on_seed = result_side[groups]
+        off_seed = (whole & ~result_side)[groups]
+        beyond: list[tuple[int, int, int, int]] = []
+        for k in cut_ids:
+            line = cut == k
+            if (line & feathered).any():
+                beyond += _cut_line(line, s, whole_o, whole_r, (x0, y0), line & edge, radius,
+                                    on_seed, off_seed)
+        on = _dilate(on_seed, 1)
+        off = _dilate(off_seed, 1) & ~on & ~inside  # the area itself is the output's
         if not (on.any() or off.any()):
             return soft
         out = np.where(on, 255, np.where(off, 0, s)).astype(np.uint8)
@@ -478,9 +531,200 @@ def whole_pieces(original: Image.Image, result: Image.Image, area: Image.Image, 
         out = np.where(_dilate(on | off, 2), smooth, out)
         full = np.asarray(soft).copy()
         full[y0:y1, x0:x1] = out
+        for top, bottom, left, right in beyond:  # a line taken whole past the zone
+            full[top:bottom, left:right] = 255
         return Image.fromarray(full)
 
     return area, settle
+
+
+def _cut_line(line: np.ndarray, s: np.ndarray, whole_o: np.ndarray, whole_r: np.ndarray,
+              at: tuple[int, int], at_zone: np.ndarray, radius: int, on: np.ndarray,
+              off: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Set ``on`` (from the output) and ``off`` (from the original) over a line of text that
+    reaches the area (where the weights ``s`` are 255) and runs past the zone; ``line``, ``s``,
+    ``at_zone`` and the seeds are the zone's box, at ``at`` in the images ``whole_o`` and
+    ``whole_r``. On each side of the area the line is cut at a column, the part towards the area
+    from the output, the rest from the original.
+
+    The cut goes through a word space of each image (PIECE_SPACE of the line's height or wider),
+    so whole words come from either side and none is lost or doubled: a word that got longer
+    pushes the rest of its line along, by more than a word space as often as not. Of those
+    columns, the one leaving the widest space between the output's words and the original's (up
+    to a word space), then the nearest the area. Past the zone too, as far as the line runs on
+    with nothing crossing the edges of a band around it (its end, as a rule, where the two images
+    meet again): the output is then taken up to there over the band, and those boxes are returned
+    (top, bottom, left, right; ends exclusive, on the images) to set to 255. Where the band's
+    edges are clear, all of it is set, not only what changed: the fringes of the other image's
+    letters would show. Without such a column, and for something that isn't a line of text, the
+    side is left as it is."""
+    ys, xs = np.nonzero(line)
+    top, bottom = int(ys.min()), int(ys.max())
+    left, right = int(xs.min()), int(xs.max())
+    height = bottom - top + 1
+    if height > PIECE_LINE * radius or right - left + 1 < 2 * height:
+        return []
+    bx, by = at
+    width = whole_o.shape[1]  # columns are counted on the images from here on
+    rows = slice(by + top, by + bottom + 1)
+    need = max(2, round(PIECE_SPACE * height))
+    ink_o, ink_r = _column_ink(whole_o[rows]), _column_ink(whole_r[rows])
+    spaces = _wide_runs(ink_o == 0, need) & _wide_runs(ink_r == 0, need)
+    lo, hi = bx + left, bx + right
+
+    def clear_at(y: int) -> np.ndarray:
+        """Where row ``y`` is its background (its median) in both images."""
+        if not 0 <= y < whole_o.shape[0]:
+            return np.zeros(width, bool)
+        out = np.ones(width, bool)
+        for im in (whole_o, whole_r):
+            row = im[y].astype(np.int16)
+            out &= np.abs(row - np.median(row, axis=0)).max(axis=1) < PIECE_FLAT
+        return out
+
+    # the band: as narrow as leaves the line's letters inside it where the zone has it
+    band, clear = None, np.zeros(width, bool)
+    for m in range(2, max(2, height // 3) + 1):
+        edges = clear_at(by + top - m) & clear_at(by + bottom + m)
+        if edges[lo:hi + 1].all():
+            band, clear = (by + top - m + 1, by + bottom + m), edges
+            break
+    inner = np.nonzero(s[top:bottom + 1, left:right + 1].max(axis=0) == 255)[0]
+    if len(inner):
+        a0, a1 = lo + int(inner[0]), lo + int(inner[-1])
+    elif s[top:bottom + 1, left].max() >= s[top:bottom + 1, right].max():
+        a0 = a1 = lo - 1  # it reaches the area at its left end
+    else:
+        a0 = a1 = hi + 1
+    cols = np.arange(line.shape[1])[None, :] + bx
+    beyond = []
+    for side in (1, -1):
+        start = a1 if side == 1 else a0
+        part = line & ((cols > start) if side == 1 else (cols < start))
+        if not part.any():
+            continue
+        span = range(start + 1, hi + 1) if side == 1 else range(start - 1, lo - 1, -1)
+        cand = [j for j in span if spaces[j]]
+        far = []
+        if not (part & at_zone).any():
+            cand.append(hi + 1 if side == 1 else lo - 1)  # past the line's end
+        elif band is not None:
+            outward = range(hi + 1, width) if side == 1 else range(lo - 1, -1, -1)
+            for j in outward:
+                if not clear[j]:
+                    break
+                if spaces[j]:
+                    far.append(j)
+        cand += far
+        if not cand:
+            continue  # no word space both images have: left as it is
+
+        def score(j: int, side: int = side, start: int = start) -> tuple:
+            # the space between the two images' words on either side of the cut: the output's
+            # towards the area, the original's beyond
+            before = np.nonzero((ink_r if side == 1 else ink_o)[:max(j, 0)])[0]
+            after = np.nonzero((ink_o if side == 1 else ink_r)[j + 1:])[0]
+            space = ((j + 1 + after[0]) if len(after) else width) - (
+                before[-1] if len(before) else -1) - 1
+            return (max(0, need - space), abs(j - start), j)
+
+        best = min(cand, key=score)
+        if band is None:  # the line's changed pixels only
+            inside = (cols < best) if side == 1 else (cols > best)
+            on |= part & inside
+            off |= part & ~inside
+        else:  # all of the band: no trace of the other image's letters is left beside them
+            rows_in = np.zeros((line.shape[0], 1), bool)
+            rows_in[max(0, band[0] - by):max(0, band[1] - by)] = True
+            if side == 1:
+                on |= rows_in & (cols > start) & (cols < best)
+                off |= rows_in & (cols >= best)
+            else:
+                on |= rows_in & (cols < start) & (cols > best)
+                off |= rows_in & (cols <= best)
+        if best in far:
+            beyond.append((band[0], band[1], hi + 1, best) if side == 1 else
+                          (band[0], band[1], best + 1, lo))
+    return beyond
+
+
+def _wide_runs(flat: np.ndarray, need: int) -> np.ndarray:
+    """The entries of ``flat`` in runs of at least ``need`` set entries."""
+    padded = np.concatenate([[False], flat, [False]]).astype(np.int8)
+    step = np.diff(padded)
+    out = np.zeros(len(flat), bool)
+    for a, b in zip(np.nonzero(step == 1)[0], np.nonzero(step == -1)[0], strict=True):
+        if b - a >= need:
+            out[a:b] = True
+    return out
+
+
+def _lines(pieces: np.ndarray, gap: int) -> np.ndarray:
+    """``pieces`` merged along lines (within ``gap`` across, a pixel up or down), labelled; 0 off
+    the pieces."""
+    return _label8(_dilate_axis(_dilate_axis(pieces, gap, 1), 1, 0)) * pieces
+
+
+def _split_at_spaces(lines: np.ndarray, o_rgb: np.ndarray, r_rgb: np.ndarray) -> np.ndarray:
+    """Each line (labels) cut at the word spaces both images have: columns where the line has
+    nothing, and where each image has no ink across the line's height for at least a word
+    space's width (PIECE_SPACE of the line's height). A cut there shows nothing. Returns the
+    pieces' labels, one per stretch between cuts."""
+    out = np.zeros_like(lines)
+    count = 0
+    for k in np.unique(lines):
+        if not k:
+            continue
+        ys, xs = np.nonzero(lines == k)
+        top, bottom, left, right = ys.min(), ys.max(), xs.min(), xs.max()
+        need = max(2, round(PIECE_SPACE * (bottom - top + 1)))
+        rows = slice(top, bottom + 1)
+        busy = np.zeros(right - left + 1, bool)
+        busy[xs - left] = True
+        gap = (~busy & _wide_runs(_column_ink(o_rgb[rows, left:right + 1]) == 0, need)
+               & _wide_runs(_column_ink(r_rgb[rows, left:right + 1]) == 0, need))
+        # a stretch starts at a busy column after a gap (or at the line's start)
+        number = np.zeros(right - left + 1, np.int32)
+        seen_gap, current = True, count
+        for c in range(right - left + 1):
+            if gap[c]:
+                seen_gap = True
+            elif busy[c]:
+                if seen_gap:
+                    current += 1
+                    seen_gap = False
+                number[c] = current
+        out[ys, xs] = number[xs - left]
+        count = current
+    return out
+
+
+def tolerant_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Per pixel of two RGB arrays of the same size: how far each is from the nearest of the
+    other's 3x3 neighbours (the larger of the two ways, the largest channel), so a shift of a
+    pixel or less counts as no change; the edge pixels compare with the edge repeated."""
+    a, b = a.astype(np.int16), b.astype(np.int16)
+    h, w = a.shape[:2]
+
+    def nearest(p: np.ndarray, q: np.ndarray) -> np.ndarray:
+        padded = np.pad(q, ((1, 1), (1, 1), (0, 0)), mode="edge")
+        best = None
+        for dy in range(3):
+            for dx in range(3):
+                d = np.abs(p - padded[dy:dy + h, dx:dx + w]).max(axis=2)
+                best = d if best is None else np.minimum(best, d)
+        return best
+
+    return np.maximum(nearest(a, b), nearest(b, a))
+
+
+def _column_ink(rgb: np.ndarray) -> np.ndarray:
+    """Per column of an RGB array: its pixels at least PIECE_FLAT from the column's median, in
+    any channel. A column across a letter has some (the background above or below it, or the
+    letter); one in a word space has none."""
+    im = rgb.astype(np.int16)
+    middle = np.median(im, axis=0)
+    return (np.abs(im - middle).max(axis=2) >= PIECE_FLAT).sum(axis=0)
 
 
 def copied_band(echo: Image.Image, mask: Image.Image) -> Image.Image:
@@ -1074,7 +1318,9 @@ def match_tone(original: Image.Image, result: Image.Image, mask: Image.Image) ->
         offset = float(np.clip(offset, -TONE_MAX_OFFSET, TONE_MAX_OFFSET))
         for v in range(256):
             trust = 1.0 if lo <= v <= hi else max(0.0, 1 - max(v - hi, lo - v) / TONE_FADE)
-            lut.append(min(255, max(0, round(v + trust * (gain * v + offset - v)))))
+            # a tie goes up: the browser build's fit can differ in the last bits, and a gain of
+            # 1.1 with an offset of -24.4 ties at every tenth level
+            lut.append(min(255, max(0, round(v + trust * (gain * v + offset - v) + TONE_TIE))))
     if all(lut[c * 256 + v] == v for c in range(3) for v in range(256)):
         return result
     fixed = _rgb(result).point(lut)
@@ -1163,15 +1409,19 @@ def paste_weights(original: Image.Image, result: Image.Image, mask: Image.Image,
         strong = delta > threshold
         if blocked is not None:
             strong &= ~_dilate(blocked, reach)
+
+        def full_size(bits: np.ndarray) -> Image.Image:
+            return ImageChops.lighter(_bool_image(bits).resize(size, Image.Resampling.BILINEAR)
+                                      .point(lambda v: 255 if v >= 128 else 0), mask)
+        # the region and the new content that belongs to it
+        core = full_size(area)
         # strong changes the feather would half cover anyway are taken whole
         area = area | (strong & _dilate(area, math.ceil(2 * radius / scale)))
-        area_img = ImageChops.lighter(
-            _bool_image(area).resize(size, Image.Resampling.BILINEAR).point(
-                lambda v: 255 if v >= 128 else 0), mask)
+        area_img = full_size(area)
     band = copied_band(echo, mask) if echo is not None else None
     pieces = None
     if note != NOTE_SPILL_TOO_LARGE:
-        area_img, pieces = whole_pieces(original, result, area_img, radius, band)
+        area_img, pieces = whole_pieces(original, result, area_img, radius, band, core)
     soft = _feather(area_img, radius, band)
     if pieces is not None:
         soft = pieces(soft)

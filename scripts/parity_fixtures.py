@@ -7,7 +7,7 @@ inputs and outputs as PNG and JSON under web/.parity/ (not committed);
 
     python scripts/parity_fixtures.py               # synthetic cases (what CI runs)
     python scripts/parity_fixtures.py --real DIR    # also real model outputs: DIR/<case>/
-        {original,result,annot}.png and regions.json (see _real_cases)
+        {original,result,annot}.png and regions.json, or {original,output,mask,annot}.png
 """
 
 import argparse
@@ -196,11 +196,13 @@ def paste_cases(out: Path, real: Path | None) -> None:
     cases = []
 
     def record(name: str, original: Image.Image, raw: Image.Image, regions: list[dict],
-               annotated: Image.Image | None, overall: bool = False) -> None:
+               annotated: Image.Image | None, overall: bool = False,
+               mask: Image.Image | None = None) -> None:
         """``raw`` as the model returned it: registered onto the original, then pasted back."""
         d = out / name
         d.mkdir(exist_ok=True)
-        mask = imaging.union_mask(original.size, regions)
+        if mask is None:
+            mask = imaging.union_mask(original.size, regions)
         original.save(d / "original.png")
         raw.save(d / "raw.png")
         box = imaging.registration_box(original, raw, mask)
@@ -288,6 +290,30 @@ def paste_cases(out: Path, real: Path | None) -> None:
     record("text5_reflow", sum_page, shorter, [{"shapes": [
         {"type": "rect", "x": 345, "y": 300, "w": 125, "h": 60}], "instruction": "x"}], None)
 
+    # A word changed in a paragraph: the model redrew the lines around it a pixel or two off and
+    # softer, and pushed the rest of the edited line along by more than a word space
+    def paragraph(edited: str, push: int, dx: int, dy: int) -> Image.Image:
+        im = Image.new("RGB", (1536, 1024), (255, 255, 255))
+        d = ImageDraw.Draw(im)
+        font = ImageFont.load_default(size=30)
+        words = "the quarterly report shows steady growth across all regions while costs".split()
+        for k in range(9):
+            line = " ".join(words[(k + j) % len(words)] for j in range(11))
+            if k == 4:
+                d.text((60 + dx, 120 + k * 48 + dy), "costs remained", font=font, fill=(40, 40, 40))
+                d.text((300 + dx, 120 + k * 48 + dy), edited, font=font, fill=(40, 40, 40))
+                d.text((390 + push + dx, 120 + k * 48 + dy), line, font=font, fill=(40, 40, 40))
+            else:
+                d.text((60 + dx, 120 + k * 48 + dy), line, font=font, fill=(40, 40, 40))
+        return im
+
+    page = paragraph("flat", 0, 0, 0)
+    redrawn = paragraph("yearly", 11, 1, 1).filter(ImageFilter.GaussianBlur(0.8))
+    record("text6_paragraph", page, redrawn, [{"shapes": [
+        {"type": "rect", "x": 290, "y": 310, "w": 100, "h": 44}], "instruction": "x"}],
+        imaging.annotate(page, [{"shapes": [{"type": "rect", "x": 290, "y": 310, "w": 100,
+                                             "h": 44}]}]))
+
     # A sticker on transparency: the model returns the hidden part white, the edit inside
     sticker = scene((640, 480), 77).convert("RGBA")
     yy, xx = np.mgrid[0:480, 0:640]
@@ -300,6 +326,17 @@ def paste_cases(out: Path, real: Path | None) -> None:
     record("alpha_sticker", sticker, flat, regions, None)
 
     for d in sorted(real.iterdir()) if real else []:
+        if (d / "output.png").exists():  # as a job's paste-back got it
+            def read(name: str, mode: str, d: Path = d) -> Image.Image | None:
+                path = d / name
+                if not path.exists():
+                    return None
+                return imaging.open_image(path.read_bytes()).convert(mode)
+            original, output = read("original.png", "RGB"), read("output.png", "RGB")
+            if imaging.same_aspect(original.size, output.size):
+                record(f"real_{d.name}", original, output, [], read("annot.png", "RGB"),
+                       mask=read("mask.png", "L"))
+            continue
         if not (d / "regions.json").exists():
             continue
         original = imaging.open_image((d / "original.png").read_bytes())

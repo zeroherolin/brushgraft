@@ -84,6 +84,7 @@ export interface Spec {
     tone_max_offset: number;
     tone_min_span: number;
     tone_fade: number;
+    tone_tie: number;
     tone_keep: number;
     api_max_bytes: number;
     ref_max_pixels: number;
@@ -100,6 +101,9 @@ export interface Spec {
     piece_weak: number;
     piece_core: number;
     piece_zone: number;
+    piece_flat: number;
+    piece_space: number;
+    piece_line: number;
     /** the farthest a shape's coordinates may lie from the image, in px */
     max_coord: number;
     /** a small edit of a large image is sent as a close-up: see imaging.ZOOM_* */
