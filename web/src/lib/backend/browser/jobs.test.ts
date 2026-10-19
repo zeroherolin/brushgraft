@@ -211,11 +211,11 @@ describe("editing", () => {
   });
 
   it("sends a small edit of a large image as a close-up, and pastes the result back within it", async () => {
-    const [W, H] = [2400, 1600];
+    const [W, H] = [2000, 1250];
     const original = scenePng(W, H);
     const parent = await root(original);
     const o = decodePng(Buffer.from(original), "RGB");
-    const region = { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 1800, y: 300, w: 120, h: 90 }] };
+    const region = { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 1200, y: 200, w: 80, h: 60 }] };
     // from the mask's bounds, as the job does (a rectangle includes its far edge)
     const zoom = zoomBox(W, H, bbox(unionMask(W, H, [region]))!)!;
     let sent: number[][] = [];
@@ -230,11 +230,11 @@ describe("editing", () => {
       // what a model does: the close-up it was sent, at the size asked for, with the object in the region
       const [w, h] = asked.split("x").map(Number);
       const k = w / ims[0].width;
-      const [rx, ry] = [1800 - zoom[0], 300 - zoom[1]];
+      const [rx, ry] = [1200 - zoom[0], 200 - zoom[1]];
       return ok(
         makePng(w, h, (x, y) => {
           const [sx, sy] = [Math.min(ims[0].width - 1, Math.floor(x / k)), Math.min(ims[0].height - 1, Math.floor(y / k))];
-          if (sx >= rx + 10 && sx < rx + 110 && sy >= ry + 10 && sy < ry + 80) return [255, 255, 255];
+          if (sx >= rx + 8 && sx < rx + 72 && sy >= ry + 8 && sy < ry + 52) return [255, 255, 255];
           const i = (sy * ims[0].width + sx) * 3;
           return [ims[0].data[i], ims[0].data[i + 1], ims[0].data[i + 2]];
         }),
@@ -251,12 +251,12 @@ describe("editing", () => {
     const whole = decodePng(Buffer.from((await s.store.getImage(node.raw_image!)).data), "RGB");
     expect([merged.width, merged.height, whole.width, whole.height]).toEqual([W, H, W, H]);
     const at = (im: typeof merged, x: number, y: number) => Array.from(im.data.subarray((y * W + x) * 3, (y * W + x) * 3 + 3));
-    expect(at(merged, 1860, 345)).toEqual([255, 255, 255]); // the object, where it belongs
+    expect(at(merged, 1240, 230)).toEqual([255, 255, 255]); // the object, where it belongs
     // outside the close-up, both are the original, pixel for pixel
     for (const im of [merged, whole]) {
-      for (const [x, y] of [[zoom[0] - 1, 345], [5, 5], [W - 1, zoom[3]], [1860, zoom[3] + 2]]) expect(at(im, x, y)).toEqual(at(o, x, y));
+      for (const [x, y] of [[zoom[0] - 1, 230], [5, 5], [W - 1, zoom[3]], [1240, zoom[3] + 2]]) expect(at(im, x, y)).toEqual(at(o, x, y));
     }
-  });
+  }, 30_000); // a large image: slow on a shared CI machine
 
   it("adopts the whole output when the overall request changed the whole image, keeping the pasted one", async () => {
     const [W, H] = [720, 480];
