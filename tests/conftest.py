@@ -119,8 +119,10 @@ def project(client):
     return client.post("/api/projects", json={"name": "Test"}).json()
 
 
-def wait_job(client, project_id, job_id, timeout=10) -> dict:
-    """Wait for a job to finish (it runs in the thread pool); return the job."""
+def wait_job(client, project_id, job_id, timeout=60) -> dict:
+    """Wait for a job to finish (it runs in the thread pool); return the job. The limit only
+    catches a job that never ends: an edit sent in parts pastes back on a large image, under 4 s
+    here and three times that on a shared CI machine."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         tree = client.get(f"/api/projects/{project_id}/tree").json()
