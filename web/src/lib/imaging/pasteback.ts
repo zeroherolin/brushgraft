@@ -8,8 +8,8 @@ import {
   cloneBits, type Bits,
 } from "./bits";
 import {
-  bbox, composite, crop, darker, gaussianBlur, blurReach, lighter, newRaster, paste, point, resize, resizeNearest,
-  toGray, toRgb, toRgba, copyRaster, type Raster,
+  bbox, composite, crop, darker, gaussianBlur, blurReach, lighter, newRaster, onBackdrop, paste, point, resize, resizeNearest,
+  toGray, toRgb, toRgba, copyRaster, WHITE, type Raster,
 } from "./raster";
 import { clamp, mean, median, percentile, percentilesOfBytes, roundHalfEven } from "./stats";
 
@@ -738,29 +738,104 @@ function growArea(
 // ---------------------------------------------------------------------------
 // The output against the original
 // ---------------------------------------------------------------------------
-/** Whether ``result`` keeps the original's framing: fine detail away from the region still lines up. */
+/**
+ * Whether ``result`` keeps the original's framing: detail away from the region still lines up,
+ * fine or a few times coarser (a model's few pixels askew in places pass, a reframed output
+ * doesn't). Only grain away from the region: nothing to judge by, aligned. imaging.aligned.
+ */
 export function aligned(original: Raster, result: Raster, mask: Raster): boolean {
   const scale = scaleFor(original.width, original.height);
-  const detail = (im: Raster) => {
-    const g = small(toGray(im), scale);
-    const blurred = gaussianBlur(g, 3);
-    return Float64Array.from(g.data, (v, i) => v - blurred.data[i]);
-  };
   const far = farFrom(original, smallBits(mask, scale), scale);
-  if (count(far) < 0.05 * far.d.length) return true;
-  const da = detail(original);
-  const db = detail(result);
-  let ab = 0;
-  let aa = 0;
-  let bb = 0;
-  for (let i = 0; i < far.d.length; i++) {
-    if (!far.d[i]) continue;
-    ab += da[i] * db[i];
-    aa += da[i] * da[i];
-    bb += db[i] * db[i];
+  const n = count(far);
+  if (n < 0.05 * far.d.length) return true;
+  const g = [small(toGray(original), scale), small(toGray(result), scale)];
+  /** what lies between two blurs (0: none), away from the region */
+  const detail = (im: Raster, fine: number, coarse: number): Float64Array => {
+    const sharp = fine === 0 ? im : gaussianBlur(im, fine);
+    const blurred = gaussianBlur(im, coarse);
+    const out = new Float64Array(n);
+    for (let i = 0, k = 0; i < far.d.length; i++) if (far.d[i]) out[k++] = sharp.data[i] - blurred.data[i];
+    return out;
+  };
+  const corr = (a: Float64Array, b: Float64Array): number => {
+    let ab = 0;
+    let aa = 0;
+    let bb = 0;
+    for (let i = 0; i < a.length; i++) {
+      ab += a[i] * b[i];
+      aa += a[i] * a[i];
+      bb += b[i] * b[i];
+    }
+    const norm = Math.sqrt(aa * bb);
+    return norm === 0 ? 1 : ab / norm;
+  };
+  const a = detail(g[0], 0, 3);
+  let energy = 0;
+  for (const v of a) energy += v * v;
+  if (Math.sqrt(energy / n) < K.align_min_detail) return true;
+  return corr(a, detail(g[1], 0, 3)) >= K.align_min_corr || corr(detail(g[0], 1.5, 6), detail(g[1], 1.5, 6)) >= K.align_coarse_corr;
+}
+
+/**
+ * The color the model painted where the original is transparent, away from the regions (``seed``,
+ * at 1/scale): the same nearly everywhere there; null without such an area, or when the model drew
+ * something there. imaging.backdrop_of.
+ */
+export function backdropOf(original: Raster, result: Raster, seed: Bits, scale: number): [number, number, number] | null {
+  if (original.channels !== 4) return null;
+  const alpha = newRaster(original.width, original.height, 1);
+  for (let i = 0; i < alpha.data.length; i++) alpha.data[i] = original.data[i * 4 + 3];
+  const a = small(alpha, scale);
+  const clear = and(erode(fromGray(a.data.map((v) => (v === 0 ? 1 : 0)), a.width, a.height), 4), not(dilate(seed, Math.floor(K.align_margin / scale))));
+  const n = count(clear);
+  if (n < K.backdrop_min_pixels) return null;
+  const rs = small(toRgb(result), scale);
+  const seen = [new Uint8Array(n), new Uint8Array(n), new Uint8Array(n)];
+  for (let i = 0, k = 0; i < clear.d.length; i++) {
+    if (!clear.d[i]) continue;
+    for (let c = 0; c < 3; c++) seen[c][k] = rs.data[i * 3 + c];
+    k++;
   }
-  const norm = Math.sqrt(aa * bb);
-  return norm === 0 || ab / norm >= K.align_min_corr;
+  const color = seen.map((v) => v.slice().sort()[n >> 1]) as [number, number, number];
+  let near = 0;
+  for (let k = 0; k < n; k++) {
+    const off = Math.max(Math.abs(seen[0][k] - color[0]), Math.abs(seen[1][k] - color[1]), Math.abs(seen[2][k] - color[2]));
+    if (off <= K.backdrop_tolerance) near++;
+  }
+  return near >= K.backdrop_share * n ? color : null;
+}
+
+/**
+ * ``result`` (RGBA) with the model's ``backdrop`` taken out where the original isn't opaque: each
+ * pixel as opaque as the original's or as far as its color went from the backdrop, whichever is
+ * more, and the color that over the backdrop gives the output's. imaging.keyed.
+ */
+export function keyed(original: Raster, result: Raster, backdrop: readonly [number, number, number]): Raster {
+  const o = toRgba(original);
+  const r = toRgb(result);
+  const out = newRaster(o.width, o.height, 4);
+  const d = [0, 0, 0];
+  for (let p = 0; p < o.width * o.height; p++) {
+    let share = 0;
+    for (let c = 0; c < 3; c++) {
+      d[c] = r.data[p * 3 + c] - backdrop[c];
+      const span = Math.max(d[c] > 0 ? 255 - backdrop[c] : backdrop[c], K.key_min_span);
+      share = Math.max(share, Math.floor((510 * Math.abs(d[c]) + span) / (2 * span)));
+    }
+    if (share <= K.key_noise) share = 0;
+    const alpha = Math.max(o.data[p * 4 + 3], share);
+    for (let c = 0; c < 3; c++) {
+      out.data[p * 4 + c] = alpha > 0 ? clamp(backdrop[c] + Math.floor((510 * d[c] + alpha) / (2 * alpha)), 0, 255) : o.data[p * 4 + c];
+    }
+    out.data[p * 4 + 3] = alpha;
+  }
+  return out;
+}
+
+/** The paste-back weights for ``area``: grown by about two feather radii, then blurred by one (keeping what stays above 2.3%). */
+export function feather(area: Raster, radius: number): Raster {
+  const spread = point(gaussianBlur(area, radius), (v) => (v > 5 ? 255 : 0));
+  return gaussianBlur(lighter(spread, area), radius);
 }
 
 /** ``result`` with the model's overall tone drift undone (robust per-channel gain and offset). */
@@ -910,7 +985,11 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
     }
   }
   const toned = matchTone(original, result, mask);
-  const delta = changeMap(original, toned, scale);
+  // Where the original is transparent the model painted a backdrop: compared over it, only what it
+  // drew there counts as change
+  const backdrop = backdropOf(original, toned, seed, scale);
+  const seen = backdrop ? onBackdrop(original, backdrop) : original;
+  const delta = changeMap(seen, toned, scale);
   const outside = not(dilate(seed, Math.ceil(K.spill_near / scale)));
   const nOutside = count(outside);
   let drift: number;
@@ -926,7 +1005,8 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
   const radius = featherRadius(width, height);
   const reach = Math.ceil((5 * radius) / scale);
   let blocked: Bits | null = null;
-  const echo = annotated ? echoedMarks(original, annotated, toned) : null;
+  // (the annotated copy shows a transparent original over white)
+  const echo = annotated ? echoedMarks(onBackdrop(original, WHITE), annotated, toned) : null;
   if (echo) {
     blocked = smallBits(echo, scale);
     // The model drew the outlines in, so they are its edge: nothing past them is the region's
@@ -956,12 +1036,12 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
   const band = echo ? copiedBand(echo, mask) : null;
   let settle: Settle | null = null;
   if (grown.note !== NOTE.spill_too_large) {
-    const pieces = wholePieces(original, toned, areaImg, radius, band, core);
+    const pieces = wholePieces(seen, toned, areaImg, radius, band, core);
     areaImg = pieces.area;
     settle = pieces.settle;
   }
 
-  const res = original.channels === 4 ? toRgba(toned) : toRgb(toned);
+  const res = backdrop ? keyed(original, toned, backdrop) : original.channels === 4 ? toRgba(toned) : toRgb(toned);
   const box = bbox(areaImg);
   const note = changedOverall ? NOTE.overall_change : grown.note;
   if (!box) return { toned: res, soft: null, x0: 0, y0: 0, note };
@@ -972,10 +1052,7 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
   let y0 = Math.max(0, box[1] - margin);
   const x1 = Math.min(width, box[2] + margin);
   const y1 = Math.min(height, box[3] + margin);
-  const area = crop(areaImg, x0, y0, x1, y1);
-  // Grow by about two feather radii, then blur by one (keep what stays above 2.3%)
-  const spread = point(gaussianBlur(area, radius), (v) => (v > 5 ? 255 : 0));
-  let soft = gaussianBlur(lighter(spread, area), radius);
+  let soft = feather(crop(areaImg, x0, y0, x1, y1), radius);
   // the outlines lie within the feathered edge: where the model copied them, the original goes back
   if (band) soft = darker(soft, point(crop(band, x0, y0, x1, y1), (v) => 255 - v));
   if (settle) ({ soft, x0, y0 } = settle(soft, x0, y0));

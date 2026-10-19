@@ -11,6 +11,7 @@ original, leaving the pixels outside the region and the new content untouched
 
 import io
 import math
+import warnings
 from collections.abc import Sequence
 
 import numpy as np
@@ -19,8 +20,8 @@ from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageFilter, ImageFont, 
 import promptbrush as pb
 
 from brushgraft.errors import UserError
-from brushgraft.store import (NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_REFRAMED, NOTE_SPILL_GROWN,
-                              NOTE_SPILL_TOO_LARGE)
+from brushgraft.store import (MAX_IMAGE_PIXELS, NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_REFRAMED,
+                              NOTE_SPILL_GROWN, NOTE_SPILL_TOO_LARGE)
 
 # Region colors by index; the web UI uses the same list (see /api/config)
 REGION_COLORS = ("#ff3b30", "#007aff", "#34c759", "#ff9500", "#af52de",
@@ -51,7 +52,19 @@ SPILL_ESCALATE = 4         # thresholds tried (x1.6 each) before growth counts a
 SPILL_NOTE_GROWTH = 0.1    # only report growth beyond 10% of the region
 # Judging the output against the original takes the area this far from the region
 ALIGN_MARGIN = 120         # px
-ALIGN_MIN_CORR = 0.5       # fine-detail correlation below this: the output was reframed
+ALIGN_MIN_CORR = 0.5       # fine-detail correlation below this, and
+ALIGN_COARSE_CORR = 0.75   # coarser detail's below this: the output was reframed (see aligned)
+ALIGN_MIN_DETAIL = 1.0     # levels: fine detail weaker than this (RMS) is grain, nothing to go by
+# Transparent originals: models paint a backdrop where the original is transparent (mostly white).
+# It counts as one where, away from the regions, this share of those pixels lies this close to
+# its median color; differences from it weaker than KEY_NOISE are compression noise
+BACKDROP_SHARE = 0.9
+BACKDROP_TOLERANCE = 24    # levels, in each channel
+BACKDROP_MIN_PIXELS = 64   # at the analysis scale: fewer tell nothing
+KEY_NOISE = 12             # levels
+KEY_MIN_SPAN = 128         # levels: the way from the backdrop to black or white counts as at least
+#                            this (a backdrop of 254 doesn't make a speck of 255 solid)
+WHITE = (255, 255, 255)
 # Putting the output on the original's pixel grid (register): offsets are measured on patches
 # away from the regions, first on a copy about REGISTER_COARSE px across, then at full size
 REGISTER_COARSE = 384      # px: the long side of the copy the first search runs on
@@ -106,6 +119,8 @@ ZOOM_MIN_PIXELS = 768 * 768      # and covers at least this many of the image's 
 ZOOM_MAX_SHARE = 0.35            # used only when it is at most this share of the image
 ZOOM_OUTPUT_PIXELS = 1536 * 1024  # asked for at least this size, scaled back down: finer detail
 ZOOM_MAX_PARTS = 4               # close-ups per edit at most (each is a request)
+CLOSE_UP_NEAR = 4                # feather radii: put into the whole image's output, a close-up adds
+#                                  what lies this near its regions
 
 
 def region_color(index: int) -> str:
@@ -281,7 +296,7 @@ def annotate(image: Image.Image, regions: Sequence[dict],
     the original back along them. The number sits just outside the outline,
     touching it, near the top-left unless that would cover a region.
     """
-    out = image.convert("RGB")
+    out = on_backdrop(image, WHITE)
     w, h = out.size
     badge = annotation_badge(out.size)
     font = ImageFont.load_default(size=round(badge * 1.3))
@@ -1251,20 +1266,93 @@ def aligned(original: Image.Image, result: Image.Image, mask: Image.Image) -> bo
     tells: in an aligned output the edges sit where the original has them
     (correlation near 1, even when the colors drifted), in a reframed one they
     don't (near 0).
+
+    Fine detail alone also turns away an output a model drew a few pixels askew in
+    places (measured: 4-8 px on a 6000 px photo and on a scanned page, in a pattern no
+    scale and shift undo, so register leaves it), which pastes back well. Detail a few
+    times coarser isn't disturbed by that, while an output zoomed or shifted by several
+    percent matches at neither scale. Where the original has only grain away from the
+    region (blank paper, a flat backdrop), there is nothing to judge by: aligned.
     """
     scale = _scale_for(original.size)
-
-    def detail(im: Image.Image) -> np.ndarray:
-        g = _small(im.convert("L"), scale)
-        return (np.asarray(g, np.float64)
-                - np.asarray(g.filter(ImageFilter.GaussianBlur(3)), np.float64))
-
     far = _far(original, np.asarray(_small(mask, scale)) > 0, scale)
     if far.sum() < 0.05 * far.size:
         return True  # the region is nearly everything: nothing to compare
-    a, b = detail(original)[far], detail(result)[far]
-    norm = float(np.sqrt((a * a).sum() * (b * b).sum()))
-    return norm == 0 or float((a * b).sum()) / norm >= ALIGN_MIN_CORR
+    small = [_small(im.convert("L"), scale) for im in (original, result)]
+
+    def detail(g: Image.Image, fine: float, coarse: float) -> np.ndarray:
+        """What lies between two blurs of ``g`` (0: none), away from the region."""
+        sharp = g if fine == 0 else g.filter(ImageFilter.GaussianBlur(fine))
+        return (np.asarray(sharp, np.float64)
+                - np.asarray(g.filter(ImageFilter.GaussianBlur(coarse)), np.float64))[far]
+
+    def corr(a: np.ndarray, b: np.ndarray) -> float:
+        norm = float(np.sqrt((a * a).sum() * (b * b).sum()))
+        return 1.0 if norm == 0 else float((a * b).sum()) / norm
+
+    a = detail(small[0], 0, 3)
+    if float(np.sqrt((a * a).sum() / a.size)) < ALIGN_MIN_DETAIL:
+        return True
+    return (corr(a, detail(small[1], 0, 3)) >= ALIGN_MIN_CORR
+            or corr(detail(small[0], 1.5, 6), detail(small[1], 1.5, 6)) >= ALIGN_COARSE_CORR)
+
+
+def on_backdrop(image: Image.Image, backdrop: tuple[int, int, int]) -> Image.Image:
+    """``image`` as RGB, over ``backdrop`` where it is transparent (as is when opaque)."""
+    if not image.has_transparency_data:
+        return _rgb(image)
+    px = np.asarray(image.convert("RGBA"), np.int64)
+    alpha = px[..., 3:]
+    over = (px[..., :3] * alpha + np.array(backdrop, np.int64) * (255 - alpha) + 127) // 255
+    return Image.fromarray(over.astype(np.uint8), "RGB")
+
+
+def backdrop_of(original: Image.Image, result: Image.Image, seed: np.ndarray,
+                scale: int) -> tuple[int, int, int] | None:
+    """The color the model painted where the original is transparent, away from the regions
+    (``seed``, at 1/scale): the same nearly everywhere there. None when the original has no
+    such area, or the model drew something there (a scene behind a product)."""
+    if not original.has_transparency_data:
+        return None
+    alpha = np.asarray(_small(original.convert("RGBA").getchannel("A"), scale))
+    clear = _erode(alpha == 0, 4) & ~_dilate(seed, ALIGN_MARGIN // scale)
+    n = int(clear.sum())
+    if n < BACKDROP_MIN_PIXELS:
+        return None
+    seen = np.asarray(_small(_rgb(result), scale), np.int64)[clear]
+    color = tuple(int(np.sort(seen[:, c])[n // 2]) for c in range(3))
+    near = int((np.abs(seen - np.array(color)).max(axis=1) <= BACKDROP_TOLERANCE).sum())
+    return color if near >= BACKDROP_SHARE * n else None
+
+
+def keyed(original: Image.Image, result: Image.Image,
+          backdrop: tuple[int, int, int]) -> Image.Image:
+    """``result`` (RGBA) with the model's ``backdrop`` taken out where the original isn't opaque.
+
+    A model can't return transparency: it paints a backdrop there, which pasted back would
+    cover the transparent background with an opaque patch. Each pixel's opacity is the most
+    of the original's and how far its color went from the backdrop towards black or white
+    (the share in its most changed channel, as GIMP's Color to Alpha does; the way counts as
+    at least KEY_MIN_SPAN, so noise on a backdrop just short of white isn't made solid): the
+    backdrop becomes transparent again, while new content drawn there, a shadow say, stays
+    as solid as it is. Its color is then what, laid over the backdrop at that opacity, gives the
+    output's (an unchanged edge pixel of the original gets its own color back). Opaque
+    pixels of the original stay opaque, so a light part of the object (a white cap on a
+    white backdrop) isn't lost; something new and as light as the backdrop, drawn where the
+    original is transparent, is.
+    """
+    px = np.asarray(original.convert("RGBA"), np.int64)
+    c = np.asarray(_rgb(result), np.int64)
+    bg = np.array(backdrop, np.int64)
+    d = c - bg
+    span = np.maximum(np.where(d > 0, 255 - bg, bg), KEY_MIN_SPAN)
+    # each channel's share of the way from the backdrop to black or white, rounded
+    share = ((510 * np.abs(d) + span) // (2 * span)).max(axis=-1)
+    share = np.where(share <= KEY_NOISE, 0, share)
+    alpha = np.maximum(px[..., 3], share)
+    lifted = bg + (510 * d + alpha[..., None]) // (2 * np.maximum(alpha, 1)[..., None])
+    color = np.where(alpha[..., None] > 0, np.clip(lifted, 0, 255), px[..., :3])
+    return Image.fromarray(np.dstack([color, alpha]).astype(np.uint8), "RGBA")
 
 
 def match_tone(original: Image.Image, result: Image.Image, mask: Image.Image) -> Image.Image:
@@ -1357,7 +1445,10 @@ def paste_back(original: Image.Image, result: Image.Image, mask: Image.Image,
       the original is untouched, pixel for pixel;
     - but nothing that changed is blended half and half: a changed word that
       reaches the area is taken whole, and one in the feathered edge comes
-      wholly from one side (see whole_pieces).
+      wholly from one side (see whole_pieces);
+    - where the original is transparent, the backdrop the model painted there
+      is measured, the original is compared over it, and it is made transparent
+      again in what is pasted (see keyed).
     """
     toned, weights, note = paste_weights(original, result, mask, annotated, overall)
     if toned is None:
@@ -1384,7 +1475,11 @@ def paste_weights(original: Image.Image, result: Image.Image, mask: Image.Image,
         changed_overall = (far.sum() >= 0.05 * far.size and float(
             (change_map(original, result, scale)[far] > OVERALL_DELTA).mean()) > OVERALL_SHARE)
     result = match_tone(original, result, mask)
-    delta = change_map(original, result, scale)
+    # Where the original is transparent the model painted a backdrop: compared over it, only what
+    # it drew there counts as change
+    backdrop = backdrop_of(original, result, seed, scale)
+    seen = on_backdrop(original, backdrop) if backdrop else original
+    delta = change_map(seen, result, scale)
     outside = ~_dilate(seed, math.ceil(SPILL_NEAR / scale))
     drift = (float(np.median(delta[outside])) if outside.sum() > 0.02 * outside.size
              else float(np.percentile(delta, 20)))
@@ -1393,7 +1488,9 @@ def paste_weights(original: Image.Image, result: Image.Image, mask: Image.Image,
     radius = feather_radius(size)
     reach = math.ceil(5 * radius / scale)
     blocked = None
-    echo = echoed_marks(original, annotated, result) if annotated is not None else None
+    # (the annotated copy shows a transparent original over white)
+    echo = (echoed_marks(on_backdrop(original, WHITE), annotated, result)
+            if annotated is not None else None)
     if echo is not None:
         blocked = np.asarray(_small(echo, scale)) > 0
         # The model drew the outlines in, so they are its edge: nothing past them is the
@@ -1421,10 +1518,12 @@ def paste_weights(original: Image.Image, result: Image.Image, mask: Image.Image,
     band = copied_band(echo, mask) if echo is not None else None
     pieces = None
     if note != NOTE_SPILL_TOO_LARGE:
-        area_img, pieces = whole_pieces(original, result, area_img, radius, band, core)
+        area_img, pieces = whole_pieces(seen, result, area_img, radius, band, core)
     soft = _feather(area_img, radius, band)
     if pieces is not None:
         soft = pieces(soft)
+    if backdrop:
+        result = keyed(original, result, backdrop)
     return result, soft, NOTE_OVERALL if changed_overall else note
 
 
@@ -1435,7 +1534,8 @@ def blend(base: Image.Image, top: Image.Image, weights: Image.Image) -> Image.Im
                            base if base.mode == mode else base.convert(mode), weights)
 
 
-def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = False) -> dict:
+def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = False,
+                ask_whole: bool = True) -> dict:
     """Put back the outputs of an edit sent in parts onto the original, ``full``.
 
     ``pieces`` are (the close-up, or None for the whole image; the output as it came; the mask
@@ -1445,49 +1545,89 @@ def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = Fals
 
     A close-up shows only part of the image. When the overall request changed all of one (a
     change of light, say) or one can't be pasted back, the whole image must be sent as well:
-    without its output, this returns {"ask": "overall" or "unusable"}. Otherwise it returns
-    {"merged": the pasted-back image, "raw": the whole output, "note"}, the whole output being
-    the whole image's output with the close-ups pasted in, or else the original with each
-    close-up's output put in its place. When the whole image's output can't be pasted back,
-    "merged" is None: use that output as it came.
+    without its output, this returns {"ask": "overall" or "unusable"}; unless ``ask_whole`` is
+    false (the whole image's request failed): the close-ups that can be are pasted back. Otherwise
+    it returns
+    {"merged": the pasted-back image, "raw": the whole output, "note", "parts"}, the whole
+    output being the whole image's output with the close-ups pasted in, or else the original
+    with each close-up's output put in its place. When the whole image's output can't be
+    pasted back, "merged" and "raw" are None: use that output as it came.
+
+    "parts" has, per piece in the order given, what it alone made, to be looked at on its own:
+    {"raw": (box, image), "merged": (box, image) or None, "note"}: its output, and its regions
+    pasted back onto the original (None when they can't be), each to be put on the original at
+    its box (left, top, right, bottom). A close-up's are the close-up's size.
     """
     mode = "RGBA" if full.has_transparency_data else "RGB"
     full = full if full.mode == mode else full.convert(mode)
     whole = None
     ups = []
     ask = None
-    for box, output, mask, annotated in sorted(pieces, key=lambda p: p[0] is not None):
+    parts: list[dict] = []
+    for box, output, mask, annotated in pieces:
         original = full if box is None else full.crop(box)
+        at = box or (0, 0, *full.size)
         if not same_aspect(original.size, output.size):
+            parts.append({"raw": (at, output.convert(mode).resize(
+                original.size, Image.Resampling.LANCZOS)), "merged": None,
+                "note": NOTE_ASPECT_MISMATCH})
             if box is None:
-                return {"merged": None, "raw": None, "note": NOTE_ASPECT_MISMATCH}
-            ask = ask or "unusable"
+                whole = False
+            else:
+                ask = ask or "unusable"
             continue
         result = register(original, output, mask)
         toned, weights, note = paste_weights(original, result, mask, annotated, overall)
+        if box is not None and weights is not None:
+            weights = fade_inside(weights, box, full.size)
+        part = {"raw": (at, result.convert(mode)), "merged": None, "note": note}
+        parts.append(part)
+        if toned is None:
+            if box is None:
+                whole = False
+            else:
+                ask = ask or "unusable"
+            continue
+        pasted = blend(original, toned, weights)
         if box is None:
-            if toned is None:
-                return {"merged": None, "raw": None, "note": note}
-            whole = result, toned, weights, note
-        elif toned is None:
-            ask = ask or "unusable"
+            area = weights.getbbox() or (0, 0, 1, 1)
+            part["merged"] = (area, pasted.crop(area))
+            if whole is None:
+                whole = result, toned, weights, note
         else:
+            part["merged"] = (box, pasted)
             if note == NOTE_OVERALL:
                 ask = "overall"
             ups.append((box, result, mask, toned, weights, note))
-    if whole is None and ask:
+    if whole is False:  # the whole image's output can't be pasted back: it is used as it came
+        bad = next(p for p, piece in zip(parts, pieces, strict=True) if piece[0] is None)
+        return {"merged": None, "raw": None, "note": bad["note"], "parts": parts}
+    if whole is None and ask and ask_whole:
         return {"ask": ask}
 
     merged = full.copy() if whole is None else blend(full, whole[1], whole[2])
     raw = full.copy() if whole is None else whole[0].convert(mode)
     notes = []
     for box, result, mask, toned, weights, note in ups:
-        merged.paste(blend(merged.crop(box), toned, weights), box[:2])
         if whole is None:
+            merged.paste(blend(merged.crop(box), toned, weights), box[:2])
             raw.paste(result, box[:2])
-        else:  # the close-up's regions, in the whole output's tones
-            part = raw.crop(box)
-            raw.paste(blend(part, match_tone(part, result, mask), weights), box[:2])
+        else:
+            # The whole image's output is there too (it was sent all the regions): the close-up
+            # is weighed against what it goes onto, so the two outputs' takes on a region never
+            # blend into each other (a word drawn twice), and it adds only what lies at its
+            # regions: what else it shows differently (its own change of light) stays out
+            near = _feather(_bool_image(_dilate(np.asarray(mask) > 0, CLOSE_UP_NEAR
+                                                * feather_radius(mask.size))),
+                            feather_radius(mask.size), None)
+            for base in (merged, raw):
+                part = base.crop(box)
+                over, onto, _ = paste_weights(part, result, mask)
+                if over is None:  # the two don't line up: as onto the original
+                    over, onto = match_tone(part, result, mask), weights
+                else:
+                    onto = fade_inside(onto, box, full.size)
+                base.paste(blend(part, over, ImageChops.darker(onto, near)), box[:2])
         notes.append(note)
     if whole and whole[3] == NOTE_OVERALL:
         note = NOTE_OVERALL
@@ -1495,7 +1635,25 @@ def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = Fals
         # a close-up's own overall change is drift when the whole image's output has none
         notes += [whole[3]] if whole else []
         note = max((n for n in notes if n != NOTE_OVERALL), key=_PART_NOTES.index, default="")
-    return {"merged": merged, "raw": raw, "note": note}
+    return {"merged": merged, "raw": raw, "note": note, "parts": parts}
+
+
+def fade_inside(weights: Image.Image, box: tuple[int, int, int, int],
+                size: tuple[int, int]) -> Image.Image:
+    """The paste weights of a close-up at ``box`` on an image of ``size``, brought down to nothing
+    at its edges within the image, over twice the feather radius: the output ends there and the
+    image doesn't, so an area grown up to one would end in a hard seam."""
+    w, h = weights.size
+    inner = (box[0] > 0, box[1] > 0, box[2] < size[0], box[3] < size[1])
+    if not any(inner):
+        return weights
+    reach = 2 * feather_radius((w, h))
+    x, y = np.arange(w), np.arange(h)
+    tx = np.minimum(np.where(inner[0], x, reach), np.where(inner[2], w - 1 - x, reach))
+    ty = np.minimum(np.where(inner[1], y, reach), np.where(inner[3], h - 1 - y, reach))
+    ramp = np.minimum(np.minimum.outer(ty, tx), reach)
+    v = np.asarray(weights, np.int64)
+    return Image.fromarray(((2 * v * ramp + reach) // (2 * reach)).astype(np.uint8), "L")
 
 
 # The notes of a version made in parts, weakest first: it shows the strongest
@@ -1505,8 +1663,19 @@ _PART_NOTES = ("", NOTE_SPILL_GROWN, NOTE_SPILL_TOO_LARGE)
 # ---------------------------------------------------------------------------
 # Encoding
 # ---------------------------------------------------------------------------
+def check_pixels(width: int, height: int) -> None:
+    """Refuse an image larger than MAX_IMAGE_PIXELS, before it is decoded."""
+    if width * height > MAX_IMAGE_PIXELS:
+        raise UserError("image_too_large", f"The image is {width} × {height}; at most "
+                        f"{MAX_IMAGE_PIXELS // 1_000_000} megapixels can be used",
+                        width=width, height=height, max_mp=MAX_IMAGE_PIXELS // 1_000_000)
+
+
 def open_image(data: bytes) -> Image.Image:
-    im = Image.open(io.BytesIO(data))
+    with warnings.catch_warnings():  # Pillow's own warning: ours (just below) says it better
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        im = Image.open(io.BytesIO(data))
+    check_pixels(*im.size)
     im.load()
     if im.mode.startswith("I"):
         # 16-bit grayscale: Pillow's own conversion clips to 0..255, turning most of it white.
@@ -1574,36 +1743,31 @@ def normalize_upload(data: bytes) -> bytes:
 
 
 def for_api(data: bytes, max_pixels: int = pb.MAX_PIXELS) -> bytes:
-    """Shrink an image that is too large to send.
+    """An image as it is sent to the model.
 
-    Returned unchanged when within both the pixel and byte limits; otherwise
-    scaled down to at most ``max_pixels``, as PNG if it has transparency and
-    high-quality JPEG if not, and a transparent one further when its PNG is
-    still over the byte limit. Opaque inputs of the same size give outputs of
-    the same size, so the original and its annotated copy stay aligned.
+    Returned unchanged when opaque and within both the pixel and byte limits. A transparent
+    one is sent over white, as PNG while that fits: models can't return transparency and
+    read it inconsistently (some see the colors stored under it, often black, and a dark
+    shadow drawn over that would be lost when the paste-back takes the backdrop out again);
+    the annotated copy shows it over white too. One too large is scaled down to at most
+    ``max_pixels``, as high-quality JPEG. Inputs of the same size give outputs of the same
+    size, so the original and its annotated copy stay aligned.
     """
     im = open_image(data)
     w, h = im.size
-    if w * h <= max_pixels and len(data) <= API_MAX_BYTES:
+    clear = im.has_transparency_data
+    if w * h <= max_pixels and len(data) <= API_MAX_BYTES and not clear:
         return data
+    im = on_backdrop(im, WHITE) if clear else im.convert("RGB")
+    buf = io.BytesIO()
     if w * h > max_pixels:
         k = math.sqrt(max_pixels / (w * h))
         im = im.resize((max(1, int(w * k)), max(1, int(h * k))),
                        Image.Resampling.LANCZOS)
-    if im.has_transparency_data:
-        im = im.convert("RGBA")
-        buf = io.BytesIO()
+    elif clear:  # lossless while it fits
         im.save(buf, "PNG")
-        out = buf.getvalue()
-        if len(out) > API_MAX_BYTES:
-            # a noisy transparent image takes about 3 bytes a pixel even as PNG
-            k = math.sqrt(API_MAX_BYTES / len(out)) * 0.97
-            im = im.resize((max(1, int(im.width * k)), max(1, int(im.height * k))),
-                           Image.Resampling.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, "PNG")
-            out = buf.getvalue()
-        return out
-    buf = io.BytesIO()
-    im.convert("RGB").save(buf, "JPEG", quality=94)
+        if buf.tell() <= API_MAX_BYTES:
+            return buf.getvalue()
+        buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=94)
     return buf.getvalue()

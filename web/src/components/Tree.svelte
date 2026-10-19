@@ -4,7 +4,7 @@
   import ImageUp from "@lucide/svelte/icons/image-up";
   import Star from "@lucide/svelte/icons/star";
   import X from "@lucide/svelte/icons/x";
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import { app } from "../lib/app.svelte";
   import { shortVersion } from "../lib/format";
@@ -50,11 +50,14 @@
 
   // Expand ancestors that hide the selected version, and scroll it into view; for a job on screen,
   // the version it was made from opens too, to show the job's row under it
+  // Only when the selection changes: a tree reload (a version deleted below) leaves the scroll and
+  // what was collapsed by hand alone
   $effect(() => {
     const id = app.selectedId;
     const job = app.jobId;
     if (!id && !job) return;
-    for (const node of job ? app.lineage : app.lineage.slice(0, -1)) collapsed.delete(node.id);
+    const lineage = untrack(() => app.lineage);
+    for (const node of job ? lineage : lineage.slice(0, -1)) collapsed.delete(node.id);
     requestAnimationFrame(() => {
       const row = job ? `[data-job="${job}"]` : `[data-node="${id}"]`;
       document.querySelector(row)?.scrollIntoView({ block: "nearest" });

@@ -14,6 +14,10 @@
 
   const job = $derived(node.job_id ? (app.jobs[node.job_id] ?? null) : null);
   const parentVer = $derived(node.parent_id ? app.versions[node.parent_id] : "");
+  // what each request of an edit sent in several made on its own, by request
+  const parts = $derived(new Map(node.parts.map((p, i) => [p.request, { ...p, index: i }])));
+  const shown = $derived(app.shownPart?.nodeId === node.id ? app.shownPart : null);
+  const regionList = (regions: number[] | undefined) => (regions ?? []).map((k) => k + 1).join(t("common.listSep"));
 </script>
 
 <!-- open: shown on its own (the phone sheet's details), under a heading of its own already -->
@@ -82,20 +86,56 @@
 
   {#if job}
     <details class="sent">
-      <summary>{t("info.sent")}</summary>
+      <summary>{job.requests.length > 1 ? t("info.sentRequests", { n: job.requests.length }) : t("info.sent")}</summary>
       {#if job.requests.length}
         <!-- an edit sent in parts: close-ups of its regions, and the whole image when needed -->
-        {#each job.requests as r, i (i)}
-          <p class="request">
-            {job.requests.length > 1 ? t("info.requestOf", { k: i + 1, n: job.requests.length }) : ""}{r.box
-              ? t("info.closeUp", { w: r.box[2] - r.box[0], h: r.box[3] - r.box[1], x: r.box[0], y: r.box[1] })
-              : t("info.wholeImage")}
-          </p>
-          <pre>{r.prompt}</pre>
-          {#if r.annot_image}
-            <button class="link" onclick={() => openImage(r.annot_image!)}>{t("info.annotated")}</button>
-          {/if}
-        {/each}
+        <ol class="requests">
+          {#each job.requests as r, i (i)}
+            {@const made = parts.get(i)}
+            <li class="request">
+              <p class="head">
+                {#if job.requests.length > 1}<span class="label">{t("info.request", { k: i + 1 })}</span>{/if}
+                <span
+                  >{r.box
+                    ? t("info.closeUp", { w: r.box[2] - r.box[0], h: r.box[3] - r.box[1], x: r.box[0], y: r.box[1] })
+                    : t("info.wholeImage")}{#if r.regions?.length}{t("info.ofRegions", { list: regionList(r.regions), n: r.regions.length })}{/if}</span
+                >
+              </p>
+              <pre>{r.prompt}</pre>
+              {#if made?.usage?.total_tokens || made?.note}
+                <p class="help">
+                  {#if made.usage?.total_tokens}{t("info.tokens", { n: made.usage.total_tokens.toLocaleString() })}{/if}{#if made.usage?.total_tokens && made.note}{t(
+                      "common.dot",
+                    )}{/if}{#if made.note}{app.noteText(made.note)}{/if}
+                </p>
+              {/if}
+              <div class="request-actions">
+                {#if made}
+                  <span class="label" id="view-{node.id}-{i}">{t("info.view")}</span>
+                  <div class="segmented" role="group" aria-labelledby="view-{node.id}-{i}">
+                    <button
+                      aria-pressed={shown?.part.request === i && shown.kind === "merged"}
+                      class:on={shown?.part.request === i && shown.kind === "merged"}
+                      disabled={!made.merged_image}
+                      title={made.merged_image ? t("info.viewMergedTitle") : t("info.viewMergedNone")}
+                      onclick={() => app.showPart(node, made.index, "merged")}>{t("info.adoptMerged")}</button
+                    >
+                    <button
+                      aria-pressed={shown?.part.request === i && shown.kind === "raw"}
+                      class:on={shown?.part.request === i && shown.kind === "raw"}
+                      disabled={!made.raw_image}
+                      title={t("info.viewRawTitle")}
+                      onclick={() => app.showPart(node, made.index, "raw")}>{t("info.adoptRaw")}</button
+                    >
+                  </div>
+                {/if}
+                {#if r.annot_image}
+                  <button class="link" onclick={() => openImage(r.annot_image!)}>{t("info.annotated")}</button>
+                {/if}
+              </div>
+            </li>
+          {/each}
+        </ol>
       {:else}
         <pre>{job.full_prompt}</pre>
         {#if job.annot_image}
@@ -192,8 +232,48 @@
     white-space: pre-wrap;
   }
 
+  .requests {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
   .request {
-    margin: 10px 0 -2px;
+    margin-top: 10px;
+  }
+
+  .request + .request {
+    padding-top: 10px;
+    border-top: 1px solid var(--rule);
+  }
+
+  .request .head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 6px;
+    margin: 0;
+    color: var(--ink-2);
+    font-size: var(--fs-s);
+  }
+
+  .request .head .label {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .request pre {
+    margin: 6px 0;
+  }
+
+  .request-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    margin-top: 6px;
+  }
+
+  .request-actions .label {
     color: var(--ink-2);
     font-size: var(--fs-s);
   }

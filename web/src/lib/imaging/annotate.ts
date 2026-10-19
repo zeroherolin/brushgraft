@@ -6,7 +6,7 @@ import type { Region } from "../types";
 import { erode, erodeClosed, fromGray, newBits, roundDilate, type Bits } from "./bits";
 import type { Codec } from "./codec";
 import { annotationBadge, annotationStroke, bitsToGray, scaleFor, smallBits } from "./pasteback";
-import { bbox, copyRaster, crop, resize, toRgb, type Raster } from "./raster";
+import { bbox, copyRaster, crop, onBackdrop, resize, toRgb, WHITE, type Raster } from "./raster";
 import { regionMask, unionMask } from "./shapes";
 import { roundHalfEven } from "./stats";
 
@@ -130,7 +130,8 @@ export function annotationLayout(width: number, height: number, regions: Region[
  * shown: it keeps its number and color.
  */
 export async function annotate(codec: Codec, image: Raster, regions: Region[], numbers?: number[]): Promise<Raster> {
-  const out = copyRaster(toRgb(image));
+  // a transparent image over white, as it is usually shown
+  const out = image.channels === 4 ? onBackdrop(image, WHITE) : copyRaster(toRgb(image));
   const { width: w, height: h } = out;
   const badge = annotationBadge(w, h);
   const occupied = unionMask(w, h, regions);

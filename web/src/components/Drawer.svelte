@@ -1,11 +1,12 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import { modal } from "../lib/focus";
 
   let { label, onclose, children }: { label: string; onclose: () => void; children: Snippet } = $props();
 </script>
 
 <div class="scrim" role="presentation" onclick={onclose}></div>
-<div class="drawer" role="dialog" aria-modal="true" aria-label={label}>
+<div class="drawer" role="dialog" aria-modal="true" aria-label={label} {@attach modal()}>
   {@render children()}
 </div>
 

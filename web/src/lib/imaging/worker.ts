@@ -9,7 +9,7 @@ export type WorkerRequest =
   | { id: number; op: "normalize"; data: Uint8Array }
   | { id: number; op: "prepare"; parent?: Uint8Array; regions: Region[]; refs: Uint8Array[]; zoom?: boolean }
   | { id: number; op: "merge"; parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean }
-  | { id: number; op: "mergeParts"; parent: Uint8Array; pieces: Piece[]; overall: boolean }
+  | { id: number; op: "mergeParts"; parent: Uint8Array; pieces: Piece[]; overall: boolean; askWhole?: boolean }
   | { id: number; op: "placeParts"; parent: Uint8Array; pieces: Pick<Piece, "box" | "result">[] }
   | { id: number; op: "thumb"; data: Uint8Array }
   | { id: number; op: "forApi"; data: Uint8Array; maxPixels?: number };
@@ -34,7 +34,9 @@ async function run(req: WorkerRequest): Promise<{ value: unknown; transfer: Arra
     }
     case "mergeParts": {
       const out = await mergeParts(browserCodec, req);
-      const transfer = [out.merged, out.raw].filter((b): b is Uint8Array => !!b).map((b) => b.buffer as ArrayBuffer);
+      const transfer = [out.merged, out.raw, ...(out.parts ?? []).flatMap((p) => [p.raw, p.merged])]
+        .filter((b): b is Uint8Array => !!b)
+        .map((b) => b.buffer as ArrayBuffer);
       return { value: out, transfer };
     }
     case "placeParts": {

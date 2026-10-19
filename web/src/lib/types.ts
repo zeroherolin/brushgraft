@@ -73,11 +73,27 @@ export interface TreeNode {
   merged_image: string | null;
   /** a note code, see note.* in the locales */
   note: string;
+  /** for an edit sent in several requests: what each made on its own, to be looked at */
+  parts: NodePart[];
   label: string;
   starred: boolean;
   width: number;
   height: number;
   created_at: number;
+}
+
+/** What one request of an edit sent in parts made: images to put on the parent's image at [x, y]. */
+export interface NodePart {
+  /** its index in the job's requests */
+  request: number;
+  note: string;
+  usage: Record<string, number> | null;
+  /** its output, lined up with the original */
+  raw_image: string | null;
+  raw_at: [number, number] | null;
+  /** its regions pasted back; null when they couldn't be */
+  merged_image: string | null;
+  merged_at: [number, number] | null;
 }
 
 export interface JobError {
@@ -96,6 +112,8 @@ export interface SentRequest {
   prompt: string;
   /** the close-up sent; null for the whole image */
   box: [number, number, number, number] | null;
+  /** the regions it showed, by index (missing from older records) */
+  regions?: number[];
   size: string;
   /** the annotated image sent */
   annot_image: string | null;

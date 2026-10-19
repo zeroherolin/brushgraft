@@ -2,6 +2,7 @@
   import { onDestroy } from "svelte";
   import { app, describeJob } from "../lib/app.svelte";
   import { t } from "../lib/i18n.svelte";
+  import { spec } from "../lib/backend/spec";
   import { elapsed } from "../lib/format";
   import type { Job } from "../lib/types";
   import JobErrors from "./JobErrors.svelte";
@@ -33,7 +34,7 @@
 <div class="queue" role="dialog" aria-label={t("queue.title")}>
   <div class="head">
     <span>{t("queue.title")}</span>
-    <span class="muted">{t("queue.limit")}</span>
+    <span class="muted">{t("queue.limit", { max: spec.http.max_parallel })}</span>
   </div>
   {#if !jobs.length}
     <p class="empty">{t("queue.empty")}</p>

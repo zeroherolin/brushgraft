@@ -19,9 +19,9 @@ from brushgraft.config import Settings
 from brushgraft.errors import NotFound, UserError
 from brushgraft.events import EventBus
 from brushgraft.prompts import Lang, compile_prompt
-from brushgraft.store import (ASSET_REF, NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_PASTE_FAILED,
-                              NOTE_REFRAMED, NOTE_SPILL_GROWN, NOTE_SPILL_TOO_LARGE, Store,
-                              add_usage)
+from brushgraft.store import (ASSET_REF, NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_PART_FAILED,
+                              NOTE_PASTE_FAILED, NOTE_REFRAMED, NOTE_SPILL_GROWN,
+                              NOTE_SPILL_TOO_LARGE, Store, add_usage)
 
 LOG_LINES_PER_JOB = 200
 
@@ -42,7 +42,8 @@ class _Part:
     def record(self) -> dict:
         """As jobs.requests lists it."""
         return {"prompt": self.prompt, "box": list(self.box) if self.box else None,
-                "size": self.size, "annot_image": self.annot_image}
+                "regions": list(self.regions), "size": self.size,
+                "annot_image": self.annot_image}
 
 
 class _Once:
@@ -101,6 +102,7 @@ _NOTE_LOG = {
     NOTE_REFRAMED: "The model redrew the scene (different framing); not pasted back",
     NOTE_SPILL_GROWN: "New content went past the region; grew the paste-back area",
     NOTE_SPILL_TOO_LARGE: "New content spread too far; pasted back the region only",
+    NOTE_PART_FAILED: "Some requests failed; their regions are left as they were",
 }
 _ASK_LOG = {
     "overall": "The overall request changed the whole close-up; sending the whole image as well",
@@ -131,6 +133,14 @@ def _outcome(future: Future, variant: str) -> tuple[pb.Generation | None, dict |
         return None, _error("interrupted", "", variant)
     except Exception as exc:  # never let a worker exception vanish
         return None, _error("internal", f"{type(exc).__name__}: {exc}", variant)
+
+
+def _total(usages: Sequence[dict | None]) -> dict | None:
+    """Usages summed (numbers only)."""
+    total = None
+    for usage in usages:
+        total = add_usage(total, usage)
+    return total
 
 
 def _api_error_code(exc: pb.ImageAPIError) -> str:
@@ -322,7 +332,11 @@ class JobRunner:
         started = time.monotonic()
         with pb.log_sink(sink):
             run = self._run_parts if req.parts else self._run_whole
-            nodes, error, usage = run(req, variant, sink)
+            try:
+                nodes, error, usage = run(req, variant, sink)
+            except Exception as exc:  # a bug, or the disk: the job must still settle
+                nodes, usage = [], None
+                error = _error("internal", f"{type(exc).__name__}: {exc}", variant)
             if error:
                 pb.log("error", f"{_ERROR_LOG[error['code']]}{': ' if error['detail'] else ''}"
                                 f"{error['detail']}")
@@ -333,6 +347,10 @@ class JobRunner:
             job = self.store.record_attempt(req.job_id, ok=bool(nodes), error=error, usage=usage)
         except NotFound:  # the project was deleted meanwhile
             return
+        except Exception as exc:  # the database is locked or the disk full: try once more, bare
+            pb.log("error", f"Couldn't record the outcome ({type(exc).__name__}: {exc})")
+            job = self.store.record_attempt(req.job_id, ok=bool(nodes), error=_error(
+                "save_failed", f"{type(exc).__name__}: {exc}", variant))
         for node in nodes:
             self.bus.publish({"type": "node", "node": node})
         self.bus.publish({"type": "job", "job": job})
@@ -373,8 +391,12 @@ class JobRunner:
         raw = self.store.put_image(data)["sha"]
         if req.mask is None or req.parent is None:
             return self.store.add_node(image=raw, **common)
-        original = imaging.open_image(req.parent)
-        result = imaging.open_image(data)
+        try:
+            original = imaging.open_image(req.parent)
+            result = imaging.open_image(data)
+        except Exception as exc:  # the image is paid for: kept as it came
+            pb.log("warn", f"{_NOTE_LOG[NOTE_PASTE_FAILED]} ({type(exc).__name__}: {exc})")
+            return self.store.add_node(image=raw, note=NOTE_PASTE_FAILED, **common)
         if not imaging.same_aspect(original.size, result.size):
             pb.log("warn", f"Output is {result.width}x{result.height}, a different "
                            "aspect ratio from the original; not pasted back")
@@ -404,43 +426,50 @@ class JobRunner:
     def _run_parts(self, req: _Request, variant: str, sink: Callable[[str, str], None]
                    ) -> tuple[list[dict], dict | None, dict | None]:
         """The parts of an edit, all at once (and the whole image after them if a close-up
-        calls for it), put back together into one version."""
+        calls for it), put back together into one version. When some fail, the others (paid
+        for) still make the version, with their regions only, and the error is recorded."""
         parts = list(req.parts)
-        outputs, usage, error = self._send_parts(req, parts, variant, sink)
-        if error:
+        numbers = list(range(len(parts)))  # each part's place in jobs.requests
+        outputs, usages, error = self._send_parts(req, parts, variant, sink)
+        usage = _total(usages)
+        if not any(outputs):
             return [], error, usage
         full = imaging.open_image(req.parent)
         try:
-            done = imaging.merge_parts(full, self._pieces(parts, outputs), req.overall)
+            done = imaging.merge_parts(full, self._pieces(parts, outputs), req.overall,
+                                       ask_whole=not error)
             if "ask" in done:
                 pb.log("info", _ASK_LOG[done["ask"]])
                 part = req.whole.get()
                 try:
-                    self.store.add_job_request(req.job_id, part.record())
+                    numbers.append(self.store.add_job_request(req.job_id, part.record()))
                 except NotFound:  # the project was deleted meanwhile
-                    pass
-                more, more_usage, error = self._send_parts(req, [part], variant, sink)
-                usage = add_usage(usage, more_usage)
-                if error:
-                    return [], error, usage
+                    numbers.append(len(parts))
+                more, more_usages, error = self._send_parts(req, [part], variant, sink)
+                usage = add_usage(usage, _total(more_usages))
                 parts.append(part)
                 outputs += more
-                done = imaging.merge_parts(full, self._pieces(parts, outputs), req.overall)
+                usages += more_usages
+                done = imaging.merge_parts(full, self._pieces(parts, outputs), req.overall,
+                                           ask_whole=False)
         except Exception as exc:  # the images are paid for: never lose them to a paste-back problem
             pb.log("warn", f"{_NOTE_LOG[NOTE_PASTE_FAILED]} ({type(exc).__name__}: {exc})")
             try:
-                return [self._save_unmerged(req, full, parts, outputs)], None, usage
+                return [self._save_unmerged(req, full, parts, outputs)], error, usage
             except Exception as exc2:
                 return [], _error("save_failed", f"{type(exc2).__name__}: {exc2}", variant), usage
+        if error:
+            done["note"] = NOTE_PART_FAILED
         try:
-            return [self._save_parts(req, done, parts, outputs)], None, usage
+            return [self._save_parts(req, done, parts, outputs, numbers, usages)], error, usage
         except Exception as exc:
             return [], _error("save_failed", f"{type(exc).__name__}: {exc}", variant), usage
 
     def _send_parts(self, req: _Request, parts: Sequence[_Part], variant: str,
                     sink: Callable[[str, str], None]
-                    ) -> tuple[list[bytes], dict | None, dict | None]:
-        """Send ``parts`` at once: (each one's image, the usage summed, the first error)."""
+                    ) -> tuple[list[bytes | None], list[dict | None], dict | None]:
+        """Send ``parts`` at once: (each one's image, None where it failed; each one's usage;
+        the first error)."""
         futures = []
         for i, part in enumerate(parts):
             label = f"Request {i + 1}/{len(parts)}: " if len(parts) > 1 else ""
@@ -453,28 +482,34 @@ class JobRunner:
             futures.append(self._send(req, part.prompt, part.images, part.size,
                                       lambda level, msg, label=label: sink(level, label + msg),
                                       what))
-        outputs, usage, error = [], None, None
+        outputs, usages, error = [], [], None
         for future in futures:  # all of them, so none is still running after the error
             gen, failed = _outcome(future, variant)
-            if gen:
-                usage = add_usage(usage, gen.usage)
-                if not gen.images:
-                    failed = _error("no_image", "", variant)
-                else:
-                    outputs.append(gen.images[0])
+            if gen and not gen.images:
+                failed = _error("no_image", "", variant)
+            outputs.append(gen.images[0] if gen and gen.images else None)
+            usages.append(gen.usage if gen else None)
             error = error or failed
-        return outputs, usage, error
+        return outputs, usages, error
 
     @staticmethod
-    def _pieces(parts: Sequence[_Part], outputs: Sequence[bytes]) -> list[tuple]:
+    def _pieces(parts: Sequence[_Part], outputs: Sequence[bytes | None]) -> list[tuple]:
+        """The parts that came back, as merge_parts takes them."""
         return [(p.box, imaging.open_image(data), imaging.open_image(p.mask),
-                 imaging.open_image(p.annot)) for p, data in zip(parts, outputs, strict=True)]
+                 imaging.open_image(p.annot))
+                for p, data in zip(parts, outputs, strict=True) if data is not None]
 
     def _save_parts(self, req: _Request, done: dict, parts: Sequence[_Part],
-                    outputs: Sequence[bytes]) -> dict:
+                    outputs: Sequence[bytes | None], numbers: Sequence[int],
+                    usages: Sequence[dict | None]) -> dict:
+        # the parts that came back, as merge_parts saw them
+        back = [i for i, o in enumerate(outputs) if o is not None]
+        parts, outputs = [parts[i] for i in back], [outputs[i] for i in back]
+        numbers, usages = [numbers[i] for i in back], [usages[i] for i in back]
         job = self.store.get_job(req.job_id)
         common = {"project_id": job["project_id"], "parent_id": job["parent_id"],
-                  "job_id": job["id"]}
+                  "job_id": job["id"],
+                  "parts": self._part_records(done["parts"], numbers, usages)}
         note = done["note"]
         if done["merged"] is None:  # the whole image's output can't be pasted back: use it
             data = next(o for p, o in zip(parts, outputs, strict=True) if p.box is None)
@@ -486,7 +521,7 @@ class JobRunner:
             return self.store.add_node(image=self.store.put_image(data)["sha"], note=note,
                                        **common)
         if note:
-            pb.log("info", _NOTE_LOG[note])
+            pb.log("warn" if note == NOTE_PART_FAILED else "info", _NOTE_LOG[note])
         raw = self.store.put_image(imaging.png_bytes(done["raw"]))["sha"]
         final = self.store.put_image(imaging.png_bytes(done["merged"]))["sha"]
         if note == NOTE_OVERALL:  # adopt the whole output; the pasted-back one stays beside it
@@ -494,12 +529,34 @@ class JobRunner:
                                        **common)
         return self.store.add_node(image=final, raw_image=raw, note=note, **common)
 
+    def _part_records(self, made: Sequence[dict], numbers: Sequence[int],
+                      usages: Sequence[dict | None]) -> list[dict]:
+        """What each request made on its own, as nodes.parts records it (see Store.add_node)."""
+        if len(made) < 2:  # one request: the version is what it made
+            return []
+
+        def stored(placed: tuple | None) -> tuple:
+            if placed is None:
+                return None, None
+            (x0, y0, *_), im = placed
+            return self.store.put_image(imaging.png_bytes(im))["sha"], [x0, y0]
+
+        records = []
+        for k, part, usage in zip(numbers, made, usages, strict=True):
+            raw, raw_at = stored(part["raw"])
+            merged, merged_at = stored(part["merged"])
+            records.append({"request": k, "note": part["note"], "usage": _total([usage]),
+                            "raw_image": raw, "raw_at": raw_at, "merged_image": merged,
+                            "merged_at": merged_at})
+        return records
+
     def _save_unmerged(self, req: _Request, full: Image.Image, parts: Sequence[_Part],
                        outputs: Sequence[bytes]) -> dict:
         """The outputs put in place as they came: the whole image's first, then the close-ups."""
         job = self.store.get_job(req.job_id)
         image = full.convert("RGBA" if full.has_transparency_data else "RGB")
-        placed = sorted(zip(parts, outputs, strict=True), key=lambda p: p[0].box is not None)
+        placed = sorted(((p, o) for p, o in zip(parts, outputs, strict=True) if o is not None),
+                        key=lambda p: p[0].box is not None)
         for part, data in placed:
             x0, y0, x1, y1 = part.box or (0, 0, *full.size)
             out = imaging.open_image(data)

@@ -15,6 +15,7 @@ Image files never change and identical content is stored once. Images no
 longer referenced after a delete are removed on the next start.
 """
 
+import contextlib
 import hashlib
 import io
 import json
@@ -34,10 +35,15 @@ import promptbrush as pb
 from brushgraft.errors import NotFound, UserError
 
 DB_FILE = "brushgraft.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # A reference to an asset, in a job's refs (anything else is a version's id)
 ASSET_REF = "asset:"
 THUMB_EDGE = 384
+# The largest image taken in (an upload, a project file, a model's output): 100 MP decodes to
+# 400 MB. Pillow alone stops only at 179 MP, and a file of a few hundred KB can claim that many
+MAX_IMAGE_PIXELS = 100_000_000
+# Pillow warns past its own limit, and stops at twice it: ours is checked first, with a clear error
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 # Codes stored in nodes.note; the web UI shows them in the user's language.
 NOTE_SPILL_GROWN = "spill_grown"          # paste-back area grown to keep new content
@@ -47,6 +53,9 @@ NOTE_REFRAMED = "reframed"                # same aspect but redrawn; not pasted 
 NOTE_PASTE_FAILED = "paste_failed"        # pasting back failed; the whole output is kept
 NOTE_OVERALL = "overall_change"           # the overall request changed the whole image; whole
                                           # output adopted, the pasted-back one kept beside it
+NOTE_PART_FAILED = "part_failed"          # of an edit sent in several requests, some failed:
+                                          # their regions are left as they were
+NOTE_TOO_LARGE = "too_large"              # too large to paste back in this browser; whole output
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -79,7 +88,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     mask_image   TEXT,                      -- region mask (white = selected)
     annot_image  TEXT,                      -- annotated copy sent to the model
     requests     TEXT NOT NULL DEFAULT '[]', -- JSON: an edit sent in parts, each request
-                                            -- [{prompt, box, size, annot_image}] (see jobs.py)
+                                            -- [{prompt, box, regions, size, annot_image}]
     status       TEXT NOT NULL,             -- queued | running | done | failed
     done         INTEGER NOT NULL DEFAULT 0,
     failed       INTEGER NOT NULL DEFAULT 0,
@@ -97,6 +106,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     raw_image    TEXT REFERENCES images(sha),  -- the model's whole output (if pasted back)
     merged_image TEXT REFERENCES images(sha),  -- the pasted-back result (if pasted back)
     note         TEXT NOT NULL DEFAULT '',     -- a NOTE_* code
+    parts        TEXT NOT NULL DEFAULT '[]',   -- JSON: for an edit sent in several requests, what
+                                               -- each made on its own (see add_node)
     label        TEXT NOT NULL DEFAULT '',     -- uploaded file name or user label
     starred      INTEGER NOT NULL DEFAULT 0,
     created_at   REAL NOT NULL
@@ -113,7 +124,7 @@ CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project_id);
 CREATE INDEX IF NOT EXISTS jobs_parent ON jobs(parent_id);
 """
 
-_JSON_FIELDS = ("regions", "refs", "ref_images", "requests", "errors", "usage")
+_JSON_FIELDS = ("regions", "refs", "ref_images", "requests", "errors", "usage", "parts")
 
 
 def new_id() -> str:
@@ -154,13 +165,32 @@ class Store:
         if version > SCHEMA_VERSION:
             raise RuntimeError(f"{home / DB_FILE} was created by a newer "
                                "brushgraft; upgrade to open it")
-        self._db.executescript(_SCHEMA)
-        if version == 1:
-            self._migrate_from_1()
-        if version in (1, 2):
-            # version 3: jobs.requests
-            self._db.execute("ALTER TABLE jobs ADD COLUMN requests TEXT NOT NULL DEFAULT '[]'")
-        self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        if version == 0:  # a new workspace
+            self._db.executescript(_SCHEMA)
+            self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif version < SCHEMA_VERSION:
+            # all or nothing: a migration cut short would otherwise run again on a half-changed
+            # database and fail on a column it already added
+            self._db.execute("BEGIN")
+            try:
+                for statement in _SCHEMA.split(";"):
+                    if statement.strip():
+                        self._db.execute(statement)
+                if version == 1:
+                    self._migrate_from_1()
+                if version in (1, 2):
+                    # version 3: jobs.requests
+                    self._db.execute(
+                        "ALTER TABLE jobs ADD COLUMN requests TEXT NOT NULL DEFAULT '[]'")
+                if version in (1, 2, 3):
+                    # version 4: nodes.parts
+                    self._db.execute(
+                        "ALTER TABLE nodes ADD COLUMN parts TEXT NOT NULL DEFAULT '[]'")
+                self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
 
     def _migrate_from_1(self) -> None:
         """Version 2 adds the asset library (made by _SCHEMA) and jobs.ref_images: filled in
@@ -201,15 +231,27 @@ class Store:
                             "Only PNG, JPEG, WebP and GIF images are supported")
         with Image.open(io.BytesIO(data)) as im:
             width, height = im.size
+        if width * height > MAX_IMAGE_PIXELS:
+            raise UserError("image_too_large", f"The image is {width} × {height}; at most "
+                            f"{MAX_IMAGE_PIXELS // 1_000_000} megapixels can be used",
+                            width=width, height=height, max_mp=MAX_IMAGE_PIXELS // 1_000_000)
         sha = hashlib.sha256(data).hexdigest()
         path = self._image_file(sha, ext)
-        if not path.exists():
+        # a copy cut short by a power cut (the rename got to the disk, the data didn't) is replaced
+        if not path.exists() or path.stat().st_size != len(data):
             path.parent.mkdir(exist_ok=True)
             # Write then rename, so a crash never leaves half an image behind
             fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".part")
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            _publish(tmp, path)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _publish(tmp, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
         self._exec("INSERT OR IGNORE INTO images VALUES (?, ?, ?, ?, ?)",
                    (sha, ext, width, height, len(data)))
         return {"sha": sha, "width": width, "height": height}
@@ -257,6 +299,12 @@ class Store:
                     UNION SELECT json_extract(r.value, '$.annot_image')
                         FROM jobs, json_each(jobs.requests) r
                         WHERE json_extract(r.value, '$.annot_image') IS NOT NULL
+                    UNION SELECT json_extract(p.value, '$.raw_image')
+                        FROM nodes, json_each(nodes.parts) p
+                        WHERE json_extract(p.value, '$.raw_image') IS NOT NULL
+                    UNION SELECT json_extract(p.value, '$.merged_image')
+                        FROM nodes, json_each(nodes.parts) p
+                        WHERE json_extract(p.value, '$.merged_image') IS NOT NULL
                     UNION SELECT image FROM assets)
             """)]
             for sha in unused:
@@ -322,14 +370,19 @@ class Store:
 
     def project_images(self, project_id: str) -> dict[str, bytes]:
         """Every image the project's versions and jobs refer to: {sha: bytes}."""
+        return {sha: self.read_image(sha) for sha in self.project_image_shas(project_id)}
+
+    def project_image_shas(self, project_id: str) -> set[str]:
+        """Every image the project's versions and jobs refer to."""
         tree = self.project_tree(project_id)
         shas: set[str] = set()
         for n in tree["nodes"]:
-            shas.update(s for s in (n["image"], n["raw_image"], n["merged_image"]) if s)
+            shas.update(s for s in (n["image"], n["raw_image"], n["merged_image"],
+                                    *part_images(n)) if s)
         for j in tree["jobs"]:
             shas.update(s for s in (j["mask_image"], j["annot_image"], *j["ref_images"],
                                     *(r["annot_image"] for r in j["requests"])) if s)
-        return {sha: self.read_image(sha) for sha in shas}
+        return shas
 
     def import_project(self, project: dict, nodes: list[dict], jobs: list[dict],
                        images: dict[str, bytes]) -> dict:
@@ -369,11 +422,11 @@ class Store:
                 for n in nodes:
                     self._db.execute(
                         """INSERT INTO nodes (id, project_id, parent_id, job_id, image, raw_image,
-                           merged_image, note, label, starred, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           merged_image, note, parts, label, starred, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (n["id"], pid, n["parent_id"], n["job_id"], n["image"], n["raw_image"],
-                         n["merged_image"], n["note"], n["label"], int(n["starred"]),
-                         n["created_at"]))
+                         n["merged_image"], n["note"], json.dumps(n["parts"]), n["label"],
+                         int(n["starred"]), n["created_at"]))
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
@@ -431,16 +484,22 @@ class Store:
     def add_node(self, *, project_id: str, image: str,
                  parent_id: str | None = None, job_id: str | None = None,
                  raw_image: str | None = None, merged_image: str | None = None,
-                 note: str = "", label: str = "") -> dict:
+                 note: str = "", label: str = "", parts: list[dict] | None = None) -> dict:
         """Add a version. With ``raw_image`` (the model's whole output) there is a pasted-back
-        result too: ``merged_image``, by default ``image`` itself."""
+        result too: ``merged_image``, by default ``image`` itself.
+
+        ``parts``, for an edit sent in several requests: what each made on its own, to be looked
+        at, as {"request": its index in jobs.requests, "note", "raw_image", "raw_at",
+        "merged_image", "merged_at"}: its output, and its regions pasted back onto the original
+        (null when they can't be), each an image to put on the parent's image at [x, y].
+        """
         nid = new_id()
         merged = (merged_image or image) if raw_image else None
         self._exec("""INSERT INTO nodes (id, project_id, parent_id, job_id,
-                      image, raw_image, merged_image, note, label, created_at)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                      image, raw_image, merged_image, note, parts, label, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                    (nid, project_id, parent_id, job_id, image, raw_image,
-                    merged, note, label, time.time()))
+                    merged, note, json.dumps(parts or []), label, time.time()))
         self.touch_project(project_id)
         return self.get_node(nid)
 
@@ -579,14 +638,16 @@ class Store:
                  job_id))
             return self.get_job(job_id)
 
-    def add_job_request(self, job_id: str, request: dict) -> None:
+    def add_job_request(self, job_id: str, request: dict) -> int:
         """Record a request a job sent besides those it was made with (the whole image, for an
-        edit sent in close-ups), once."""
+        edit sent in close-ups), once; return its index in jobs.requests."""
         with self._lock:
             requests = self.get_job(job_id)["requests"]
-            if request not in requests:
-                self._db.execute("UPDATE jobs SET requests = ? WHERE id = ?",
-                                 (json.dumps(requests + [request], ensure_ascii=False), job_id))
+            if request in requests:
+                return requests.index(request)
+            self._db.execute("UPDATE jobs SET requests = ? WHERE id = ?",
+                             (json.dumps(requests + [request], ensure_ascii=False), job_id))
+            return len(requests)
 
     def delete_job(self, job_id: str) -> None:
         """Delete a job with the nodes it produced (and their subtrees)."""
@@ -600,7 +661,9 @@ class Store:
                 raise UserError("branch_busy",
                                 "A version in this branch is still generating; "
                                 "delete it once that finishes")
-            self._db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            # its versions first, the deepest first (see _delete_subtrees), then the job
+            self._delete_subtrees(outputs, then=lambda: self._db.execute(
+                "DELETE FROM jobs WHERE id = ?", (job_id,)))
 
     def recover_interrupted(self) -> int:
         """On start, settle jobs left unfinished: done if any image came back."""
@@ -625,6 +688,11 @@ SELECT n.*, i.width, i.height FROM nodes n JOIN images i ON i.sha = n.image
 _ASSET_SELECT = """
 SELECT a.*, i.width, i.height FROM assets a JOIN images i ON i.sha = a.image
 """
+
+
+def part_images(node: dict) -> list[str]:
+    """The images a version's parts refer to (see Store.add_node)."""
+    return [s for p in node.get("parts") or () for s in (p["raw_image"], p["merged_image"]) if s]
 
 
 def _decode(row: sqlite3.Row) -> dict:

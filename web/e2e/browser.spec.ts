@@ -207,7 +207,7 @@ test("the asset library: any project uses an asset as a reference; history keeps
   await expect(library.locator(".grid li")).toHaveCount(1);
   await page.locator(".tree .row").nth(1).locator(".select").click();
   const ref = page.locator(".made .refs .thumb");
-  await expect(ref).toHaveAttribute("aria-label", /an asset since deleted/);
+  await expect(ref).toHaveAttribute("aria-label", /a deleted asset/);
   await expect.poll(() => ref.locator("img").evaluate((i: HTMLImageElement) => i.naturalWidth)).toBeGreaterThan(0);
 
   // the library as a pack: out, and back in, skipping what is there
@@ -851,5 +851,46 @@ test("a small edit of a large image goes as a close-up, and its result lands whe
   await page.locator(".tree .row").nth(1).click();
   await page.locator("details.info > summary").click();
   await page.locator("details.sent > summary").click();
-  await expect(page.locator("details.sent .request")).toHaveText(/^Close-up \d+ × \d+ at \(\d+, \d+\)$/);
+  await expect(page.locator("details.sent .request .head")).toHaveText(/^\s*Close-up \d+ × \d+ at \(\d+, \d+\), region 1\s*$/);
+});
+
+test("regions far apart go as one edit in several requests, each of which can be looked at", async ({ page }) => {
+  await setUp(page);
+  await saveKey(page);
+  const [W, H] = [3000, 2000];
+  const big = new PNG({ width: W, height: H });
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const n = Math.sin(x * 0.05) * Math.cos(y * 0.04) * 40 + ((x * 7 + y * 13) % 11) * 2;
+      big.data.set([Math.min(255, 110 + x * 0.04 + n), Math.min(255, 130 + y * 0.05 - n), Math.min(255, 90 + n * 0.5), 255], (y * W + x) * 4);
+    }
+  }
+  await page.locator("input[type=file][accept*='image']").first().setInputFiles({ name: "big.png", mimeType: "image/png", buffer: PNG.sync.write(big) });
+  await expect(page.locator(".tree .row")).toHaveCount(1);
+  const P = await imageToPage(page, [W, H]);
+  await page.keyboard.press("m");
+  await drag(page, [P(300, 300), P(420, 390)]);
+  await page.keyboard.press("Escape"); // deselect: the next drag is a new region
+  await drag(page, [P(2500, 1550), P(2620, 1640)]);
+  await page.locator(".regions textarea").first().fill("a red lamp");
+  await page.locator(".regions textarea").nth(1).fill("a red cup");
+  const before = (await apiLog()).length;
+  await page.keyboard.press("Control+Enter");
+  await expect(page.locator(".tree .row")).toHaveCount(2, { timeout: 30_000 });
+  expect((await apiLog()).slice(before).filter((l) => l.op === "edit")).toHaveLength(2);
+
+  await page.locator(".tree .row").nth(1).click();
+  await page.locator("details.info > summary").click();
+  const sent = page.locator("details.sent");
+  await sent.locator("summary").click();
+  await expect(sent.locator("summary")).toHaveText("Requests sent (2)");
+  await expect(sent.locator(".request .head")).toHaveText([/^\s*Request 1\s*Close-up .*, region 1\s*$/, /^\s*Request 2\s*Close-up .*, region 2\s*$/]);
+  const caption = page.locator(".caption .text");
+  await sent.locator(".request").nth(0).getByRole("button", { name: "Pasted back" }).click();
+  await expect(caption).toContainText("(viewing request 1: pasted-back result)");
+  await sent.locator(".request").nth(1).getByRole("button", { name: "Whole output" }).click();
+  await expect(caption).toContainText("(viewing request 2: whole output)");
+  await expect(sent.locator(".request").nth(1).getByRole("button", { name: "Whole output" })).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.press("Escape");
+  await expect(caption).not.toContainText("viewing request");
 });

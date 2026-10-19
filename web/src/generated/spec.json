@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "promptbrush_version": "0.1.0",
+  "promptbrush_version": "0.1.1",
   "models": [
     {
       "name": "gpt-image-2.5-sunburst",
@@ -128,11 +128,23 @@
       521,
       522,
       523,
-      524,
-      525,
-      526,
-      527
+      524
     ],
+    "safe_retry_status": [
+      429,
+      502,
+      503,
+      520,
+      521,
+      522,
+      523
+    ],
+    "uncertain_retries": 1,
+    "quota_codes": [
+      "billing_hard_limit_reached",
+      "insufficient_quota"
+    ],
+    "max_download_bytes": 67108864,
     "connect_timeout": 15,
     "timeout_generate": 300,
     "timeout_edit": 360,
@@ -205,7 +217,9 @@
     "aspect_mismatch": "aspect_mismatch",
     "reframed": "reframed",
     "paste_failed": "paste_failed",
-    "overall_change": "overall_change"
+    "overall_change": "overall_change",
+    "part_failed": "part_failed",
+    "too_large": "too_large"
   },
   "archive": {
     "format": "brushgraft-project",
@@ -234,6 +248,14 @@
     "spill_note_growth": 0.1,
     "align_margin": 120,
     "align_min_corr": 0.5,
+    "align_coarse_corr": 0.75,
+    "align_min_detail": 1.0,
+    "backdrop_share": 0.9,
+    "backdrop_tolerance": 24,
+    "backdrop_min_pixels": 64,
+    "key_noise": 12,
+    "key_min_span": 128,
+    "close_up_near": 4,
     "tone_max_gain": 0.15,
     "tone_max_offset": 30.0,
     "tone_min_span": 80,
@@ -241,6 +263,7 @@
     "tone_tie": 1e-06,
     "tone_keep": 60,
     "api_max_bytes": 8388608,
+    "max_image_pixels": 100000000,
     "ref_max_pixels": 2359296,
     "overall_delta": 20.0,
     "overall_share": 0.2,

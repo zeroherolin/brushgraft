@@ -23,6 +23,10 @@
   const context = $derived(t("composer.context", { fig: "\u0000" }).split("\u0000"));
   // "Custom…" starts from the size in use, which may itself be a preset: remember the choice
   let pickedCustom = $state(false);
+  // the model name field stays while it is typed in, even when what is typed so far is a listed
+  // model's name (gpt-image-2 on the way to gpt-image-2-turbo)
+  let typingModel = $state(false);
+  const customModel = $derived(typingModel || app.isCustomModel);
   const customSize = $derived(pickedCustom || !app.config?.size_presets.includes(app.size));
 
   const keyMissing = $derived(!app.config?.settings.api_key_set);
@@ -86,6 +90,7 @@
                 <button
                   class="badge"
                   style:background={app.regionColor(i)}
+                  style:color={app.regionInk(i)}
                   aria-label={t("composer.selectRegion", { k: i + 1 })}
                   onclick={() => (app.selectedRegion = i)}>{i + 1}</button
                 >
@@ -172,9 +177,10 @@
         <label for="model">{t("composer.model")}</label>
         <select
           id="model"
-          value={app.isCustomModel ? CUSTOM : app.model}
+          value={customModel ? CUSTOM : app.model}
           onchange={(e) => {
             const v = e.currentTarget.value;
+            typingModel = v === CUSTOM;
             app.model = v === CUSTOM ? "" : v;
             app.persistPrefs();
           }}
@@ -185,7 +191,7 @@
           <option value={CUSTOM}>{t("composer.otherModel")}</option>
         </select>
       </div>
-      {#if app.isCustomModel}
+      {#if customModel}
         <div class="field">
           <label for="custom-model">{t("composer.modelName")}</label>
           <input

@@ -74,42 +74,62 @@ export function retryAfter(resp: Response, now = Date.now()): number {
   return Number.isFinite(seconds) ? Math.min(Math.max(seconds, 0), H.max_retry_after) : 0;
 }
 
-/** Back off and retry on a connection error, a timeout or a retryable status; the last response or error is returned/thrown. */
+/**
+ * Back off and retry on a connection error, a timeout or a retryable status, as promptbrush's
+ * request_with_retry: a POST (paid for) is sent again freely only when it was refused before any
+ * work began (safe_retry_status), else at most uncertain_retries times (a page can't tell a
+ * connection never made from one dropped after the request went out, so a network error counts as
+ * uncertain); an exhausted quota isn't retried. The last response or error is returned/thrown.
+ */
 async function requestWithRetry(url: string, init: RequestInit, readTimeout: number, o: CallOptions): Promise<Response> {
   const doFetch = o.fetch ?? fetch;
   const sleep = o.sleep ?? defaultSleep;
   const log = o.log ?? (() => {});
-  let last: unknown;
+  const paid = (init.method ?? "GET").toUpperCase() === "POST";
+  let uncertain = 0;
+  const jitter = () => (o.sleep ? 0 : Math.random()); // none in tests, which check the waits
   for (let attempt = 1; attempt <= H.max_retries; attempt++) {
+    let retry = attempt < H.max_retries;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), (H.connect_timeout + readTimeout) * 1000);
     const signal = o.signal ? AbortSignal.any([o.signal, timeout.signal]) : timeout.signal;
     try {
       const resp = await doFetch(url, { ...init, signal });
-      if (H.retry_status.includes(resp.status) && attempt < H.max_retries) {
-        const wait = Math.max(H.retry_backoff ** attempt, retryAfter(resp));
-        log("retry", `HTTP ${resp.status}, retrying in ${wait.toFixed(0)}s (${attempt}/${H.max_retries - 1})`);
-        await sleep(wait);
-        continue;
-      }
       // The body can stall too: read it inside the timeout, then hand over a finished response
       const body = await resp.arrayBuffer();
-      return new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+      const done = new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+      if (!H.retry_status.includes(resp.status) || !retry) return done;
+      if (resp.status === 429 && H.quota_codes.includes(errorCode(jsonOf(body)))) return done;
+      if (paid && !H.safe_retry_status.includes(resp.status) && ++uncertain > H.uncertain_retries) return done;
+      const wait = Math.max(H.retry_backoff ** attempt, retryAfter(resp)) + jitter();
+      log("retry", `HTTP ${resp.status}, retrying in ${wait.toFixed(0)}s (${attempt}/${H.max_retries - 1})`);
+      await sleep(wait);
     } catch (e) {
       if (o.signal?.aborted) throw e;
-      last = timeout.signal.aborted ? new Error(`Timed out after ${H.connect_timeout + readTimeout}s`) : e;
-      if (attempt < H.max_retries) {
-        const wait = H.retry_backoff ** attempt;
-        const kind = timeout.signal.aborted ? "Timeout" : "Connection error";
-        log("retry", `${kind}, retrying in ${wait.toFixed(0)}s (${attempt}/${H.max_retries - 1})`);
-        await sleep(wait);
+      const last = timeout.signal.aborted ? new Error(`Timed out after ${H.connect_timeout + readTimeout}s`) : e;
+      if (paid) retry = retry && ++uncertain <= H.uncertain_retries;
+      if (!retry) {
+        log("error", `Request failed: ${last instanceof Error ? last.message : String(last)}`);
+        throw new NetworkError(last instanceof Error ? last.message : String(last));
       }
+      const wait = H.retry_backoff ** attempt + jitter();
+      const kind = timeout.signal.aborted ? "Timeout" : "Connection error";
+      log("retry", `${kind}, retrying in ${wait.toFixed(0)}s (${attempt}/${H.max_retries - 1})`);
+      await sleep(wait);
     } finally {
       clearTimeout(timer);
     }
   }
-  log("error", `Still failing after ${H.max_retries - 1} retries`);
-  throw new NetworkError(last instanceof Error ? last.message : String(last));
+  throw new Error("unreachable");
+}
+
+/** The JSON in a response body, or null. */
+function jsonOf(body: ArrayBuffer): unknown {
+  try {
+    return JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return null;
+  }
 }
 
 type Part = { name: string; value: string | { data: Uint8Array; type: string; filename: string } };
@@ -159,18 +179,21 @@ async function decodeImages(result: Record<string, unknown>, o: CallOptions, los
       if (typeof it.b64_json === "string" && it.b64_json) {
         data = b64(it.b64_json);
       } else if (typeof it.url === "string" && it.url) {
-        log("info", `Downloading image: ${it.url}`);
+        if (!/^https?:\/\//i.test(it.url)) throw new Error("not an http(s) link");
+        // the link without its query: a signed link's signature stays out of the log
+        log("info", `Downloading image: ${it.url.split("?")[0]}`);
         try {
           const resp = await requestWithRetry(it.url, { method: "GET" }, H.timeout_download, o);
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           data = new Uint8Array(await resp.arrayBuffer());
+          if (data.length > H.max_download_bytes) throw new Error(`too large (${data.length.toLocaleString("en")} bytes)`);
         } catch (e) {
           lost.push(it.url);
           throw e;
         }
       }
       // what an expired link or a relay's error page answers with, rather than an image
-      if (data && !detectExt(data)) throw new Error(`not an image: ${brief(new TextDecoder().decode(data.slice(0, 2000)))}`);
+      if (data && !detectExt(data)) throw new Error(`not an image (${data.length.toLocaleString("en")} bytes)`);
     } catch (e) {
       log("error", `Failed to fetch image ${i}: ${e instanceof Error ? e.message : e}`);
       continue;

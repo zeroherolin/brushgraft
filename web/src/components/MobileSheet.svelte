@@ -2,6 +2,7 @@
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import ChevronUp from "@lucide/svelte/icons/chevron-up";
   import { app, describeJob } from "../lib/app.svelte";
+  import { modal } from "../lib/focus";
   import { fig } from "../lib/format";
   import { t } from "../lib/i18n.svelte";
   import Composer from "./Composer.svelte";
@@ -24,7 +25,13 @@
 
 {#if app.sheetOpen}
   <div class="scrim" role="presentation" onclick={() => (app.sheetOpen = false)}></div>
-  <div class="sheet" role="dialog" aria-modal="true" aria-label={app.viewedJob ? t("job.label") : t("composer.label")}>
+  <div
+    class="sheet"
+    role="dialog"
+    aria-modal="true"
+    aria-label={app.viewedJob ? t("job.label") : t("composer.label")}
+    {@attach modal(() => document.querySelector<HTMLElement>(".peek .primary"))}
+  >
     <div class="sheet-head">
       <span class="grip" aria-hidden="true"></span>
       {#if app.selected && !app.viewedJob}
@@ -47,7 +54,13 @@
       <ChevronUp size={16} />
       <span class="text">{summary}</span>
     </button>
-    <button class="primary" onclick={() => (app.sheetOpen = true)}>{app.viewedJob ? t("sheet.view") : editing ? t("sheet.edit") : t("sheet.write")}</button>
+    <button
+      class="primary"
+      onclick={() => {
+        infoOpen = false; // Edit opens the edit panel, whatever was shown last
+        app.sheetOpen = true;
+      }}>{app.viewedJob ? t("sheet.view") : editing ? t("sheet.edit") : t("sheet.write")}</button
+    >
   </div>
 {/if}
 

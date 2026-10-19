@@ -3,7 +3,7 @@
 // of their bytes, so identical content is kept once.
 
 import { detectExt, sniff, type Ext } from "../../imaging/formats";
-import type { Asset, Job, JobError, Project, Region, SentRequest, TreeNode } from "../../types";
+import type { Asset, Job, JobError, NodePart, Project, Region, SentRequest, TreeNode } from "../../types";
 import { notFound, userError } from "../errors";
 import { spec } from "../spec";
 
@@ -18,7 +18,13 @@ export interface ImageRow {
   height: number;
   bytes: number;
   data: ArrayBuffer;
+  /** when it was last stored (ms): collectGarbage leaves recent ones to what is about to use them */
+  added?: number;
 }
+
+// An image stored this recently may be about to be referred to (a job saving its result, an
+// import, another tab): collectGarbage leaves it
+const GARBAGE_GRACE_MS = 6 * 60 * 60 * 1000;
 
 interface ThumbRow {
   sha: string;
@@ -71,7 +77,8 @@ export const isQuotaError = (e: unknown): boolean => e instanceof DOMException &
 export class BrowserStore {
   #db: Promise<IDBDatabase>;
 
-  constructor(factory: IDBFactory = indexedDB, name = DB_NAME) {
+  /** ``graceMs``: how recently stored an image collectGarbage leaves (tests set 0) */
+  constructor(factory: IDBFactory = indexedDB, name = DB_NAME, private graceMs = GARBAGE_GRACE_MS) {
     this.#db = new Promise((resolve, reject) => {
       const open = factory.open(name, DB_VERSION);
       open.onupgradeneeded = (event) => {
@@ -136,9 +143,12 @@ export class BrowserStore {
     const sha = await sha256(data);
     await this.#tx(["images"], "readwrite", async (tx) => {
       const images = tx.objectStore("images");
-      if ((await done(images.count(sha))) === 0) {
+      const old = await done<ImageRow | undefined>(images.get(sha));
+      if (old) {
+        await done(images.put({ ...old, added: Date.now() })); // stored again: about to be used again
+      } else {
         const copy = data.buffer.byteLength === data.byteLength && data.byteOffset === 0 ? data.buffer.slice(0) : data.slice().buffer;
-        const row: ImageRow = { sha, ext: info.ext, width: info.width, height: info.height, bytes: data.length, data: copy as ArrayBuffer };
+        const row: ImageRow = { sha, ext: info.ext, width: info.width, height: info.height, bytes: data.length, data: copy as ArrayBuffer, added: Date.now() };
         await done(images.put(row));
       }
     });
@@ -165,14 +175,20 @@ export class BrowserStore {
     await this.#tx(["thumbs"], "readwrite", (tx) => done(tx.objectStore("thumbs").put({ sha, type, data } satisfies ThumbRow)));
   }
 
-  /** Delete images no node, job or asset refers to; returns how many. */
+  /**
+   * Delete images no node, job or asset refers to; returns how many. While a job is under way (in any
+   * tab) nothing is deleted, and an image stored in the last few hours is kept: what stored it may
+   * not have referred to it yet (a result being pasted back, an import).
+   */
   async collectGarbage(): Promise<number> {
     return this.#tx(["images", "thumbs", "nodes", "jobs", "assets"], "readwrite", async (tx) => {
       const used = new Set<string>();
       for (const n of await done<NodeRow[]>(tx.objectStore("nodes").getAll())) {
-        for (const sha of [n.image, n.raw_image, n.merged_image]) if (sha) used.add(sha);
+        for (const sha of [n.image, n.raw_image, n.merged_image, ...partImages(n)]) if (sha) used.add(sha);
       }
-      for (const j of await done<JobRow[]>(tx.objectStore("jobs").getAll())) {
+      const jobs = await done<JobRow[]>(tx.objectStore("jobs").getAll());
+      if (jobs.some((j) => ACTIVE.has(j.status))) return 0;
+      for (const j of jobs) {
         for (const sha of [j.mask_image, j.annot_image, ...(j.ref_images ?? []), ...(j.requests ?? []).map((r) => r.annot_image)]) {
           if (sha) used.add(sha);
         }
@@ -180,8 +196,11 @@ export class BrowserStore {
       for (const a of await done<AssetRow[]>(tx.objectStore("assets").getAll())) used.add(a.image);
       const images = tx.objectStore("images");
       let n = 0;
+      const since = Date.now() - this.graceMs;
       for (const sha of (await done(images.getAllKeys())) as string[]) {
         if (used.has(sha)) continue;
+        const row = await done<ImageRow | undefined>(images.get(sha));
+        if (row?.added && row.added > since) continue;
         images.delete(sha);
         tx.objectStore("thumbs").delete(sha);
         n++;
@@ -272,7 +291,7 @@ export class BrowserStore {
       const nodes = await done<NodeRow[]>(tx.objectStore("nodes").index("project_id").getAll(id));
       const jobs = await done<JobRow[]>(tx.objectStore("jobs").index("project_id").getAll(id));
       return {
-        nodes: nodes.sort((a, b) => a.created_at - b.created_at),
+        nodes: nodes.sort((a, b) => a.created_at - b.created_at).map(publicNode),
         jobs: jobs.sort((a, b) => a.created_at - b.created_at).map(publicJob),
       };
     });
@@ -353,7 +372,7 @@ export class BrowserStore {
   async getNode(id: string): Promise<TreeNode> {
     const n = await this.#tx(["nodes"], "readonly", (tx) => done<NodeRow | undefined>(tx.objectStore("nodes").get(id)));
     if (!n) throw notFound("version", id);
-    return n;
+    return publicNode(n);
   }
 
   /** Add a version. With ``rawImage``, ``image`` is the pasted-back result. */
@@ -367,10 +386,14 @@ export class BrowserStore {
     mergedImage?: string | null;
     note?: string;
     label?: string;
+    parts?: NodePart[];
   }): Promise<TreeNode> {
     return this.#tx(["projects", "nodes", "images"], "readwrite", async (tx) => {
-      const info = await done<ImageRow | undefined>(tx.objectStore("images").get(p.image));
+      const images = tx.objectStore("images");
+      const info = await done<ImageRow | undefined>(images.get(p.image));
       if (!info) throw notFound("image", p.image);
+      for (const sha of [p.rawImage, p.mergedImage]) if (sha && !(await done(images.count(sha)))) throw notFound("image", sha);
+      if (!(await done(tx.objectStore("projects").count(p.projectId)))) throw notFound("project", p.projectId);
       const node: NodeRow = {
         id: newId(),
         project_id: p.projectId,
@@ -380,6 +403,7 @@ export class BrowserStore {
         raw_image: p.rawImage ?? null,
         merged_image: p.rawImage ? (p.mergedImage ?? p.image) : null,
         note: p.note ?? "",
+        parts: p.parts ?? [],
         label: p.label ?? "",
         starred: false,
         width: info.width,
@@ -418,7 +442,7 @@ export class BrowserStore {
         if (info) [node.width, node.height] = [info.width, info.height];
       }
       await done(nodes.put(node));
-      return node;
+      return publicNode(node);
     });
   }
 
@@ -487,10 +511,12 @@ export class BrowserStore {
           throw userError("parent_changed", "This version's image changed while the request was being prepared; send it again");
         }
       }
-      await done(tx.objectStore("jobs").put(row));
+      // deleted while the request was prepared: nothing is sent (and billed)
       const projects = tx.objectStore("projects");
       const project = await done<Project | undefined>(projects.get(row.project_id));
-      if (project) await done(projects.put({ ...project, updated_at: now() }));
+      if (!project) throw notFound("project", row.project_id);
+      await done(tx.objectStore("jobs").put(row));
+      await done(projects.put({ ...project, updated_at: now() }));
     });
     return publicJob(row);
   }
@@ -533,15 +559,20 @@ export class BrowserStore {
     });
   }
 
-  /** Record a request a job sent besides those it was made with (the whole image, for an edit sent in close-ups), once. */
-  async addJobRequest(id: string, request: SentRequest): Promise<void> {
-    await this.#tx(["jobs"], "readwrite", async (tx) => {
+  /**
+   * Record a request a job sent besides those it was made with (the whole image, for an edit sent in
+   * close-ups), once; returns its index in the job's requests.
+   */
+  async addJobRequest(id: string, request: SentRequest): Promise<number> {
+    return this.#tx(["jobs"], "readwrite", async (tx) => {
       const store = tx.objectStore("jobs");
       const j = await done<JobRow | undefined>(store.get(id));
       if (!j) throw notFound("job", id);
       const requests = j.requests ?? [];
-      if (requests.some((r) => JSON.stringify(r) === JSON.stringify(request))) return;
+      const known = requests.findIndex((r) => JSON.stringify(r) === JSON.stringify(request));
+      if (known >= 0) return known;
       await done(store.put({ ...j, requests: [...requests, request] }));
+      return requests.length;
     });
   }
 
@@ -632,6 +663,13 @@ function fillRefImages(tx: IDBTransaction): void {
 }
 
 /** a job without the bookkeeping field the UI doesn't know */
+/** The images a version's parts refer to. */
+export const partImages = (n: { parts?: NodePart[] }): string[] =>
+  (n.parts ?? []).flatMap((p) => [p.raw_image, p.merged_image]).filter((s): s is string => !!s);
+
+/** a version as the UI knows it (parts are missing from versions from before edits were sent in parts) */
+const publicNode = (n: NodeRow): TreeNode => ({ ...n, parts: n.parts ?? [] });
+
 function publicJob(row: JobRow): Job {
   const { owner: _owner, ...job } = row;
   void _owner;

@@ -12,11 +12,13 @@ Errors answer with ``{"detail", "code", "params"}``: ``detail`` is English,
 """
 
 import asyncio
+import hashlib
 import json
 import re
 import secrets
 import shutil
 import tempfile
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
@@ -27,6 +29,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StringConstraints
+from starlette.background import BackgroundTask
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -41,7 +44,23 @@ from brushgraft.prompts import MAX_INSTRUCTION, MAX_PROMPT, MAX_REGIONS, MAX_SHA
 from brushgraft.store import Store, new_id
 
 STATIC_DIR = Path(__file__).parent / "static"
-COOKIE = "brushgraft_token"
+# The session cookie's name: one per workspace (cookies are shared by every port of a host, and a
+# second workspace's server, on another port, mustn't log this one's tab out)
+COOKIE_PREFIX = "brushgraft_"
+# Sent with every reply: the local server's page loads nothing from elsewhere, and isn't framed
+SECURITY_HEADERS = [
+    (b"content-security-policy", "; ".join([
+        "default-src 'none'", "script-src 'self'", "style-src 'self'",
+        "img-src 'self' blob: data:", "connect-src 'self'", "worker-src 'self'",
+        "manifest-src 'none'", "base-uri 'none'", "form-action 'none'", "object-src 'none'",
+        "frame-ancestors 'none'"]).encode()),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+]
+# What changes things comes from this server's own page (or a tool, which sends no such header):
+# a page elsewhere, even on another port of this host, can't post a form here
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # Body size limit, enforced before multipart parsing writes temp files
@@ -176,8 +195,40 @@ class SessionIn(BaseModel):
 # ---------------------------------------------------------------------------
 # Access control
 # ---------------------------------------------------------------------------
+def cookie_name(token: str) -> str:
+    return COOKIE_PREFIX + hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def _cross_site(conn: HTTPConnection) -> bool:
+    """Whether a request that changes things was sent by a page of another origin."""
+    if conn.scope["method"] in SAFE_METHODS:
+        return False
+    site = conn.headers.get("sec-fetch-site")
+    if site is not None:
+        return site not in ("same-origin", "none")
+    origin = conn.headers.get("origin")  # older browsers: the origin must be this host
+    return origin is not None and origin.split("://", 1)[-1] != conn.headers.get("host", "")
+
+
+class _ImagesOnDisk(Mapping):
+    """{sha: bytes} read from the store as each image is asked for."""
+
+    def __init__(self, store: Store, shas: set[str]):
+        self.store, self.shas = store, sorted(shas)
+
+    def __getitem__(self, sha: str) -> bytes:
+        return self.store.read_image(sha)
+
+    def __iter__(self):
+        return iter(self.shas)
+
+    def __len__(self) -> int:
+        return len(self.shas)
+
+
 class _Guard:
-    """Check the Host header, the request size and the access token.
+    """Check the Host header, the request size, where a change comes from and the access token;
+    add the security headers.
 
     A plain ASGI middleware rather than @app.middleware: the latter can't
     cancel a streaming response (the event stream), which stalls shutdown.
@@ -187,11 +238,21 @@ class _Guard:
                  allowed_hosts: frozenset[str] | None):
         self.app = app
         self.token = token.encode()
+        self.cookie = cookie_name(token)
         self.allowed_hosts = allowed_hosts
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+
+        async def with_headers(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                message["headers"] = [*message.get("headers", []), *SECURITY_HEADERS]
+            await send(message)
+
+        await self._check(scope, receive, with_headers)
+
+    async def _check(self, scope: Scope, receive: Receive, send: Send) -> None:
         conn = HTTPConnection(scope)
         if self.allowed_hosts is not None:
             host = conn.headers.get("host", "")
@@ -207,8 +268,11 @@ class _Guard:
             if archive_path:
                 return await _archive_too_large(path)(scope, receive, send)
             return await _upload_too_large(413)(scope, receive, send)
+        if path.startswith("/api/") and _cross_site(conn):
+            return await _error(403, "cross_site", "Requests from other sites are refused")(
+                scope, receive, send)
         if path.startswith("/api/") and path != "/api/session":
-            presented = conn.cookies.get(COOKIE) or \
+            presented = conn.cookies.get(self.cookie) or \
                 conn.headers.get("authorization", "").removeprefix("Bearer ")
             if not secrets.compare_digest(presented.encode(), self.token):
                 return await _error(
@@ -280,7 +344,7 @@ def create_app(store: Store, settings: Settings, token: str, *,
     def open_session(body: SessionIn, response: Response):
         if not secrets.compare_digest(body.token.encode(), token.encode()):
             return _error(401, "token_invalid", "Wrong access token")
-        response.set_cookie(COOKIE, token, max_age=365 * 86400, httponly=True,
+        response.set_cookie(cookie_name(token), token, max_age=365 * 86400, httponly=True,
                             samesite="strict")
 
     @app.get("/api/config")
@@ -352,11 +416,21 @@ def create_app(store: Store, settings: Settings, token: str, *,
     def export_project(project_id: str):
         project = store.get_project(project_id)
         tree = store.project_tree(project_id)
-        data = archive.to_bytes(project, tree["nodes"], tree["jobs"],
-                                store.project_images(project_id), __version__)
+        shas = store.project_image_shas(project_id)
+        archive.check_exportable({sha: store.image_info(sha)["bytes"] for sha in shas})
+        # written to a temporary file, an image at a time: a project can be a gigabyte
+        out = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        try:
+            with out:
+                archive.write_archive(out, project, tree["nodes"], tree["jobs"],
+                                      _ImagesOnDisk(store, shas), __version__)
+        except BaseException:
+            Path(out.name).unlink(missing_ok=True)
+            raise
         name = re.sub(r"[^\w.-]+", "_", project["name"]).strip("_")[:60] or "project"
-        return Response(data, media_type="application/zip",
-                        headers={"Content-Disposition": attachment(f"brushgraft-{name}.zip")})
+        return FileResponse(out.name, media_type="application/zip",
+                            headers={"Content-Disposition": attachment(f"brushgraft-{name}.zip")},
+                            background=BackgroundTask(Path(out.name).unlink, missing_ok=True))
 
     @app.post("/api/projects/import", status_code=201)
     def import_project(file: Annotated[UploadFile, File()]):

@@ -16,9 +16,9 @@
   --well: #dfe1e5;
   --ink: #1d2125;
   --ink-2: #565e68;
-  --ink-3: #8a919a;
+  --ink-3: #6b727b;
   --rule: #e1e4e8;
-  --rule-2: #c8cdd3;
+  --rule-2: #949ba4;
   --accent: #2c5a8c;
   --accent-ink: #ffffff;
   --accent-soft: #e6edf5;
@@ -57,9 +57,9 @@
     --well: #2c2f34;
     --ink: #e3e5e8;
     --ink-2: #a0a7b0;
-    --ink-3: #6f7680;
+    --ink-3: #8f969f;
     --rule: #2f3338;
-    --rule-2: #464b52;
+    --rule-2: #6a7078;
     --accent: #8db0d8;
     --accent-ink: #0f1620;
     --accent-soft: #233041;
@@ -83,9 +83,9 @@
   --well: #2c2f34;
   --ink: #e3e5e8;
   --ink-2: #a0a7b0;
-  --ink-3: #6f7680;
+  --ink-3: #8f969f;
   --rule: #2f3338;
-  --rule-2: #464b52;
+  --rule-2: #6a7078;
   --accent: #8db0d8;
   --accent-ink: #0f1620;
   --accent-soft: #233041;
@@ -299,6 +299,7 @@ kbd {
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
 }

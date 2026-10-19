@@ -24,13 +24,14 @@ async function sample(): Promise<ArchiveContent> {
   return {
     project: { name: "P", created_at: 1, updated_at: 2 },
     nodes: [
-      { id: "n1", parent_id: null, job_id: null, image: sa, raw_image: null, merged_image: null, note: "", label: "x.png", starred: true, created_at: 1 },
-      { id: "n2", parent_id: "n1", job_id: "j1", image: sb, raw_image: sa, merged_image: sb, note: "reframed", label: "", starred: false, created_at: 2 },
+      { id: "n1", parent_id: null, job_id: null, image: sa, raw_image: null, merged_image: null, note: "", parts: [], label: "x.png", starred: true, created_at: 1 },
+      { id: "n2", parent_id: "n1", job_id: "j1", image: sb, raw_image: sa, merged_image: sb, note: "reframed", label: "", starred: false, created_at: 2,
+        parts: [{ request: 1, note: "spill_grown", usage: { total_tokens: 4 }, raw_image: sb, raw_at: [10, 20], merged_image: null, merged_at: null }] },
     ],
     jobs: [{
       id: "j1", parent_id: "n1", kind: "edit", prompt: "p", full_prompt: "fp", regions: [{ shapes: [{ type: "rect", x: 1, y: 2, w: 3, h: 4 }], instruction: "i" }],
       refs: ["n1", "asset:a1"], ref_images: [sa, sb], model: "m", size: "1536x1024", n: 1, composite: true, mask_image: null, annot_image: null,
-      requests: [{ prompt: "fp", box: [10, 20, 30, 40], size: "1536x1024", annot_image: sb }, { prompt: "fp", box: null, size: "1536x1024", annot_image: null }],
+      requests: [{ prompt: "fp", box: [10, 20, 30, 40], regions: [0], size: "1536x1024", annot_image: sb }, { prompt: "fp", box: null, regions: [0], size: "1536x1024", annot_image: null }],
       status: "done", done: 1, failed: 0,
       errors: [], usage: { total_tokens: 3 }, created_at: 1, finished_at: 2,
     }],

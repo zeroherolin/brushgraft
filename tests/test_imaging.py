@@ -263,6 +263,32 @@ class TestPasteBack:
         shifted = ImageChops.offset(self.original, 37, 21)
         assert imaging.paste_back(self.original, shifted, self.mask)[1] == NOTE_REFRAMED
 
+    def test_blank_paper_away_from_the_region_is_not_taken_for_a_reframe(self):
+        # a scanned page: only grain away from the date, which the model drew afresh (and the
+        # page 3 px to the right): nothing to judge the framing by
+        def page(text, dx, seed):
+            grain = np.random.default_rng(seed).normal(236, 1.2, (360, 480))
+            im = Image.fromarray(np.clip(grain, 0, 255).astype(np.uint8)).convert("RGB")
+            ImageDraw.Draw(im).text((210 + dx, 165), text, fill=(30, 30, 30),
+                                    font=ImageFont.load_default(size=28))
+            return im
+        merged, note = imaging.paste_back(page("2025", 0, 1), page("2026", 3, 2), self.mask)
+        assert merged is not None and note != NOTE_REFRAMED
+
+    def test_an_output_a_few_pixels_askew_in_places_still_pastes_back(self):
+        # drawn up to 6 px off in a wavy pattern no scale and shift undo: the fine detail no
+        # longer lines up, the coarser does. Zoomed by 8%, it is another framing
+        original = scene((900, 600), seed=3)
+        mask = imaging.region_mask(original.size, [{"type": "rect", "x": 400, "y": 250,
+                                                    "w": 100, "h": 80}])
+        yy, xx = np.mgrid[0:600, 0:900]
+        sx = np.clip(np.rint(xx + 6 * np.sin(yy / 30)), 0, 899).astype(int)
+        sy = np.clip(np.rint(yy + 6 * np.cos(xx / 35)), 0, 599).astype(int)
+        askew = Image.fromarray(np.asarray(original)[sy, sx])
+        assert imaging.aligned(original, askew, mask)
+        zoomed = original.crop((36, 24, 864, 576)).resize(original.size, Image.Resampling.LANCZOS)
+        assert not imaging.aligned(original, zoomed, mask)
+
     def test_flat_images_are_never_refused(self):
         flat = Image.new("RGB", self.SIZE, (128, 128, 128))
         result = Image.new("RGB", self.SIZE, (128, 128, 128))
@@ -270,6 +296,123 @@ class TestPasteBack:
         merged, note = imaging.paste_back(flat, result, self.mask)
         assert merged is not None and note == ""
         assert merged.getpixel((250, 180)) == (250, 40, 40)
+
+
+class TestTransparency:
+    """A transparent original: models paint a backdrop there (mostly white), which must not
+    come back as an opaque patch."""
+    SIZE = (480, 360)
+    REGION = {"type": "rect", "x": 300, "y": 120, "w": 120, "h": 120}
+
+    def setup_method(self):
+        art = scene(self.SIZE).convert("RGBA")
+        shows = Image.new("L", self.SIZE, 0)
+        ImageDraw.Draw(shows).ellipse((60, 40, 360, 320), fill=255)  # a sticker
+        art.putalpha(shows)
+        self.original = art
+        self.mask = imaging.region_mask(self.SIZE, [self.REGION])
+        # what the model returns: white where the original is transparent
+        out = Image.new("RGB", self.SIZE, (255, 255, 255))
+        out.paste(art.convert("RGB"), mask=shows)
+        self.result = out
+
+    def test_the_backdrop_the_model_painted_is_transparent_again(self):
+        ImageDraw.Draw(self.result).rectangle((320, 150, 350, 200), fill=(200, 30, 30))
+        merged, note = imaging.paste_back(self.original, self.result, self.mask)
+        assert merged.mode == "RGBA"
+        px = np.asarray(merged)
+        assert px[130, 410, 3] == 0                     # region, over transparency: still clear
+        assert tuple(px[170, 335]) == (200, 30, 30, 255)  # new content inside: as drawn
+        assert px[200, 200, 3] == 255                   # the sticker itself untouched
+        # pixel for pixel the original beyond the area
+        assert (px[:, :250] == np.asarray(self.original)[:, :250]).all()
+
+    def test_what_the_model_drew_over_the_backdrop_keeps_its_own_opacity(self):
+        # a soft dark shadow and a light object reaching past the sticker's edge
+        shadow = Image.new("L", self.SIZE, 0)
+        ImageDraw.Draw(shadow).rectangle((380, 200, 415, 235), fill=128)
+        self.result.paste((0, 0, 0), mask=shadow)
+        merged, _ = imaging.paste_back(self.original, self.result, self.mask)
+        r, g, b, a = merged.getpixel((400, 220))
+        assert 110 <= a <= 145 and max(r, g, b) <= 6  # half see-through black, not gray
+
+    def test_noise_on_a_backdrop_just_short_of_white_stays_clear(self):
+        # measured: a backdrop of (254, 255, 255) with specks of 255 in it
+        px = np.asarray(self.result).copy()
+        clear = np.asarray(self.original.getchannel("A")) == 0
+        px[clear] = (254, 255, 255)
+        px[clear & (np.indices(clear.shape).sum(axis=0) % 3 == 0)] = (255, 255, 255)
+        merged, _ = imaging.paste_back(self.original, Image.fromarray(px), self.mask)
+        assert np.asarray(merged)[..., 3][clear].max() == 0
+
+    def test_a_light_part_of_the_object_stays_opaque(self):
+        light = self.original.copy()
+        ImageDraw.Draw(light).rectangle((300, 150, 340, 200), fill=(245, 245, 245, 255))
+        result = self.result.copy()
+        ImageDraw.Draw(result).rectangle((300, 150, 340, 200), fill=(245, 245, 245))
+        merged, _ = imaging.paste_back(light, result, self.mask)
+        assert merged.getpixel((320, 170))[3] == 255
+
+    def test_a_scene_the_model_drew_behind_is_no_backdrop(self):
+        behind = scene(self.SIZE, seed=9)
+        behind.paste(self.original.convert("RGB"), mask=self.original.getchannel("A"))
+        toned = imaging.match_tone(self.original, behind, self.mask)
+        seed = np.asarray(imaging._small(self.mask, 2)) > 0
+        assert imaging.backdrop_of(self.original, toned, seed, 2) is None
+        assert imaging.backdrop_of(self.original, self.result, seed, 2) == (255, 255, 255)
+
+    def test_the_annotated_copy_shows_it_over_white(self):
+        clear = Image.new("RGBA", (200, 150), (0, 0, 0, 0))
+        out = imaging.annotate(clear, [{"shapes": [{"type": "rect", "x": 80, "y": 60, "w": 30,
+                                                    "h": 30}]}])
+        assert out.mode == "RGB" and out.getpixel((5, 140)) == (255, 255, 255)
+
+
+class TestMergeParts:
+    """An edit sent in parts put together: close-ups, and the whole image's output."""
+    SIZE = (2400, 1600)
+
+    def setup_method(self):
+        self.full = scene(self.SIZE, seed=4)
+        self.regions = [{"shapes": [{"type": "rect", "x": 300, "y": 260, "w": 90, "h": 70}]}]
+        self.box = imaging.zoom_parts(self.SIZE, [(300, 260, 391, 331)])[0][0]
+
+    def close_up(self, glow: bool) -> tuple:
+        view = self.full.crop(self.box)
+        shown = imaging.shift_regions(self.regions, -self.box[0], -self.box[1])
+        mask = imaging.union_mask(view.size, shown)
+        out = view.copy()
+        ImageDraw.Draw(out).rectangle(mask.getbbox(), fill=(30, 90, 200))
+        if glow:  # its own change of light, in the corner towards the rest of the image
+            w, h = view.size
+            ImageDraw.Draw(out).rectangle((w * 2 // 3, h * 2 // 3, w, h), fill=(255, 200, 120))
+        return self.box, out, mask, imaging.annotate(view, shown)
+
+    def test_a_close_up_fades_out_at_its_edges_inside_the_image(self):
+        box, out, mask, annotated = self.close_up(glow=True)
+        done = imaging.merge_parts(self.full, [(box, out, mask, annotated)])
+        merged = np.asarray(done["merged"])
+        x1, y1 = box[2] - 1, box[3] - 1  # its last column and row lie inside the image
+        assert (merged[box[1]:y1 + 1, x1] == np.asarray(self.full)[box[1]:y1 + 1, x1]).all()
+        assert (merged[y1, box[0]:x1 + 1] == np.asarray(self.full)[y1, box[0]:x1 + 1]).all()
+        assert tuple(merged[290, 340]) == (30, 90, 200)
+
+    def test_put_into_the_whole_output_a_close_up_adds_only_what_is_near_its_regions(self):
+        whole = self.full.point(lambda v: min(255, v + 6))  # the whole image's, a little lighter
+        ImageDraw.Draw(whole).rectangle((300, 260, 390, 330), fill=(40, 100, 190))
+        box, out, mask, annotated = self.close_up(glow=True)
+        done = imaging.merge_parts(self.full, [
+            (None, whole, imaging.union_mask(self.SIZE, self.regions),
+             imaging.annotate(self.full, self.regions)), (box, out, mask, annotated)])
+        raw = np.asarray(done["raw"])
+        # the glow lies far from the region: the whole output is kept there
+        corner = (slice(box[3] - 60, box[3] - 20), slice(box[2] - 60, box[2] - 20))
+        assert pixel_diff(Image.fromarray(raw[corner]),
+                          Image.fromarray(np.asarray(whole)[corner])).max() <= 2
+        # the region: the close-up's, in the whole output's (lighter) tones
+        assert np.abs(raw[290, 340].astype(int) - (36, 96, 206)).max() <= 2
+        # the whole image's own output is kept as it came, for its request's view
+        assert done["parts"][0]["raw"][1].getpixel((340, 290)) == (40, 100, 190)
 
 
 class TestGrowth:
@@ -750,6 +893,15 @@ class TestZoom:
 
 
 class TestNormalizeUpload:
+    def test_an_image_too_large_to_use_is_refused_before_it_is_decoded(self):
+        # 13000 x 13000 flat PNG: a few hundred KB, 676 MB once decoded
+        buf = io.BytesIO()
+        Image.new("L", (13000, 13000)).save(buf, "PNG")
+        assert len(buf.getvalue()) < 1_000_000
+        with pytest.raises(UserError) as exc:
+            imaging.normalize_upload(buf.getvalue())
+        assert exc.value.code == "image_too_large" and exc.value.params["max_mp"] == 100
+
     def test_png_kept_byte_for_byte(self):
         data = make_png()
         assert imaging.normalize_upload(data) is data
@@ -848,12 +1000,17 @@ class TestForApi:
         assert a.format == "JPEG"
         assert abs(a.size[0] / a.size[1] - 4 / 3) < 0.02
 
-    def test_transparency_kept_as_png(self):
-        data = make_png((400, 300), (0, 0, 0, 0), mode="RGBA")
-        out = Image.open(io.BytesIO(imaging.for_api(data, max_pixels=10_000)))
-        assert (out.format, out.mode) == ("PNG", "RGBA")
+    def test_a_transparent_image_goes_over_white_as_png(self):
+        # models read transparency inconsistently (the black stored under it, say): sent as it
+        # is usually shown, and as the annotated copy shows it
+        rgba = np.zeros((300, 400, 4), np.uint8)
+        rgba[100:200, 100:300] = (200, 30, 30, 255)
+        out = Image.open(io.BytesIO(imaging.for_api(imaging.png_bytes(Image.fromarray(rgba)))))
+        assert (out.format, out.mode, out.size) == ("PNG", "RGB", (400, 300))
+        assert out.getpixel((10, 10)) == (255, 255, 255)
+        assert out.getpixel((150, 150)) == (200, 30, 30)
 
-    def test_transparent_image_too_large_even_as_png_is_scaled_to_the_byte_limit(self, monkeypatch):
+    def test_a_transparent_image_too_large_even_as_png_goes_as_jpeg_of_its_size(self, monkeypatch):
         monkeypatch.setattr(imaging, "API_MAX_BYTES", 200_000)
         rgba = np.random.default_rng(1).integers(0, 256, (300, 400, 4), np.uint8)
         rgba[..., 3] = np.where(np.arange(400) < 100, 0, 255)
@@ -861,5 +1018,5 @@ class TestForApi:
         assert len(data) > 200_000
         out = imaging.for_api(data)
         im = Image.open(io.BytesIO(out))
-        assert len(out) <= 200_000 and im.mode == "RGBA"
-        assert abs(im.width / im.height - 4 / 3) < 0.02
+        # the same size as the annotated copy, which is opaque and goes as it is
+        assert len(out) <= 200_000 and (im.format, im.size) == ("JPEG", (400, 300))

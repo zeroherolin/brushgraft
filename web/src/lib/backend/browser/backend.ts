@@ -13,7 +13,7 @@ import type { Backend, JobRequest, SettingsUpdate, StorageInfo, Subscription } f
 import { testConnection } from "./imageapi";
 import { JobRunner } from "./jobs";
 import { BrowserSettings } from "./settings";
-import { BrowserStore, isQuotaError, newId } from "./store";
+import { BrowserStore, isQuotaError, newId, partImages } from "./store";
 import { UrlCache } from "./urls";
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
@@ -225,9 +225,20 @@ export class BrowserBackend implements Backend {
     const { project, nodes, jobs } = await this.#store.everything(id);
     const images = new Map<string, Uint8Array>();
     const need = new Set<string>();
-    for (const n of nodes) for (const s of [n.image, n.raw_image, n.merged_image]) if (s) need.add(s);
+    for (const n of nodes) for (const s of [n.image, n.raw_image, n.merged_image, ...partImages(n)]) if (s) need.add(s);
     for (const j of jobs) {
       for (const s of [j.mask_image, j.annot_image, ...j.ref_images, ...j.requests.map((r) => r.annot_image)]) if (s) need.add(s);
+    }
+    // a file that couldn't be read back is refused (archive.check_exportable)
+    const sizes = await Promise.all([...need].map(async (sha) => (await this.#store.imageInfo(sha)).bytes));
+    const total = sizes.reduce((a, b) => a + b, 0);
+    const A = spec.archive;
+    if (total > A.max_total_bytes || sizes.some((n) => n > A.max_file_bytes)) {
+      const gb = (n: number) => Math.round((n / 1024 ** 3) * 10) / 10;
+      throw userError("export_too_large", `The project's images take ${gb(total)} GB; a project file can hold at most ${gb(A.max_total_bytes)} GB`, {
+        size_gb: gb(total),
+        max_gb: gb(A.max_total_bytes),
+      });
     }
     for (const sha of need) images.set(sha, new Uint8Array((await this.#store.getImage(sha)).data));
     const archiveNodes = nodes.map(({ project_id: _p, width: _w, height: _h, ...rest }) => (void [_p, _w, _h], rest));
@@ -280,7 +291,7 @@ export class BrowserBackend implements Backend {
     return guarded(
       (async () => {
         const image = await this.#store.putImage(data);
-        const node = await this.#store.addNode({ projectId, image: image.sha, label: file.name.split(/[\\/]/).pop()!.slice(0, 200) });
+        const node = await this.#store.addNode({ projectId, image: image.sha, label: [...file.name.split(/[\\/]/).pop()!].slice(0, 200).join("") }); // code points, as Python counts
         this.#publish({ type: "node", node });
         return node;
       })(),

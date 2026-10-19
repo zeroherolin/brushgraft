@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { spec } from "../spec";
 import { createImage, ImageAPIError, NetworkError, testConnection } from "./imageapi";
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
@@ -87,12 +88,24 @@ describe("createImage", () => {
     expect(s.waits[2]).toBeLessThanOrEqual(40);
   });
 
-  it("retries network errors, and gives up as a NetworkError", async () => {
+  it("sends a paid request again once after a network error (it may have been made), and gives up as a NetworkError", async () => {
     const boom = new TypeError("Failed to fetch");
     const s = scripted(boom, boom, boom, boom, boom);
     await expect(createImage("p", { model: "m", size: "1024x1024" }, s.options)).rejects.toBeInstanceOf(NetworkError);
-    expect(s.calls).toHaveLength(5);
-    expect(s.waits).toEqual([2, 4, 8, 16]);
+    expect(s.calls).toHaveLength(1 + spec.http.uncertain_retries);
+    expect(s.waits).toEqual([2]);
+  });
+
+  it("sends a paid request again freely when it was refused (503), once after a 524, never on an exhausted quota", async () => {
+    const busy = scripted(json("busy", 503), json("busy", 503), json({ data: [{ b64_json: b64(PNG) }] }));
+    expect((await createImage("p", { model: "m", size: "1024x1024" }, busy.options)).images).toHaveLength(1);
+    expect(busy.calls).toHaveLength(3);
+    const slow = scripted(json("timeout", 524), json("timeout", 524), json("timeout", 524));
+    await expect(createImage("p", { model: "m", size: "1024x1024" }, slow.options)).rejects.toMatchObject({ status: 524 });
+    expect(slow.calls).toHaveLength(2);
+    const broke = scripted(json({ error: { code: "insufficient_quota", message: "no credit" } }, 429), json("x", 200));
+    await expect(createImage("p", { model: "m", size: "1024x1024" }, broke.options)).rejects.toMatchObject({ status: 429 });
+    expect(broke.calls).toHaveLength(1);
   });
 
   it("returns the last response once retries run out", async () => {
@@ -133,7 +146,8 @@ describe("createImage", () => {
     expect(g.lost).toEqual(["https://img.example/b.png"]);
     expect(s.logs.some((l) => l.includes("Failed to fetch image 3"))).toBe(true);
     expect(s.logs.some((l) => l.includes("Image 4 has no usable data"))).toBe(true);
-    expect(s.logs.some((l) => l.includes("Failed to fetch image 5: not an image: <html>Link expired"))).toBe(true);
+    expect(s.logs.some((l) => l.includes("Failed to fetch image 5: not an image"))).toBe(true);
+    expect(s.logs.some((l) => l.includes("Link expired"))).toBe(false); // what the page said isn't repeated
   });
 
   it("rejects an invalid size for strict models before sending", async () => {

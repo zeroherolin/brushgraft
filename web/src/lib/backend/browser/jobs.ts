@@ -8,7 +8,7 @@ import { sameAspect } from "../../imaging/pasteback";
 import type { PartsMerged, PreparedPart } from "../../imaging/ops";
 import { zoomSize } from "../../imaging/zoom";
 import {
-  ASSET_REF, type Job, type JobError, type LogLine, type Region, type SentRequest, type ServerEvent, type Shape, type TreeNode,
+  ASSET_REF, type Job, type JobError, type LogLine, type NodePart, type Region, type SentRequest, type ServerEvent, type Shape, type TreeNode,
 } from "../../types";
 import { ApiError, userError } from "../errors";
 import { charCount, compilePrompt } from "../prompts";
@@ -42,6 +42,8 @@ const NOTE_LOG: Record<string, string> = {
   [spec.notes.reframed]: "The model redrew the scene (different framing); not pasted back",
   [spec.notes.spill_grown]: "New content went past the region; grew the paste-back area",
   [spec.notes.spill_too_large]: "New content spread too far; pasted back the region only",
+  [spec.notes.part_failed]: "Some requests failed; their regions are left as they were",
+  [spec.notes.too_large]: "Too large to paste back in this browser; kept the model's whole output",
 };
 const ASK_LOG: Record<string, string> = {
   overall: "The overall request changed the whole close-up; sending the whole image as well",
@@ -59,7 +61,7 @@ interface Part extends PreparedPart {
 }
 
 /** As job.requests lists it. */
-const record = (p: Part): SentRequest => ({ prompt: p.prompt, box: p.box, size: p.size, annot_image: p.annotSha });
+const record = (p: Part): SentRequest => ({ prompt: p.prompt, box: p.box, regions: p.regions, size: p.size, annot_image: p.annotSha });
 
 interface Prepared {
   jobId: string;
@@ -109,6 +111,10 @@ function failure(e: unknown, variant: string): JobError {
   if (e instanceof ApiError) return error("api_error", e.message, variant);
   return error("internal", `${e instanceof Error ? e.name : "Error"}: ${e instanceof Error ? e.message : e}`, variant);
 }
+
+/** Usages summed (numbers only). */
+const sumUsage = (usages: (Record<string, number> | null | undefined)[]): Record<string, number> | null =>
+  usages.reduce<Record<string, number> | null>((total, u) => addUsage(total, u ?? null), null);
 
 /** At most ``max`` tasks at once; the others wait their turn. */
 class Slots {
@@ -388,15 +394,23 @@ export class JobRunner {
     const common = { projectId: job.project_id, parentId: job.parent_id, jobId: job.id };
     const raw = (await store.putImage(data)).sha;
     if (!req.mask || !req.parent) return store.addNode({ image: raw, ...common });
-    const original = sniff(req.parent)!;
-    const result = sniff(data)!;
+    const original = sniff(req.parent);
+    const result = sniff(data);
+    if (!original || !result) {
+      // the image is paid for: kept as it came
+      log("warn", NOTE_LOG[spec.notes.paste_failed]);
+      return store.addNode({ image: raw, note: spec.notes.paste_failed, ...common });
+    }
     if (!sameAspect([original.width, original.height], [result.width, result.height])) {
       log("warn", `Output is ${result.width}x${result.height}, a different aspect ratio from the original; not pasted back`);
       return store.addNode({ image: raw, note: spec.notes.aspect_mismatch, ...common });
     }
+    if (original.width * original.height > MAX_PASTE_PIXELS) {
+      log("warn", NOTE_LOG[spec.notes.too_large]);
+      return store.addNode({ image: raw, note: spec.notes.too_large, ...common });
+    }
     let merged: Awaited<ReturnType<ImageOps["merge"]>>;
     try {
-      if (original.width * original.height > MAX_PASTE_PIXELS) throw new Error("the image is too large for this browser");
       merged = await images.merge(req.parent, data, req.mask, req.annot, req.overall);
     } catch (e) {
       // the image is paid for: never lose it to a paste-back problem (memory, a damaged file)
@@ -422,48 +436,59 @@ export class JobRunner {
   ): Promise<{ nodes: TreeNode[]; err: JobError | null; usage: Record<string, number> | null }> {
     const { store, images } = this.deps;
     let parts = planned;
+    // each part's place in the job's requests
+    let numbers = planned.map((_, i) => i);
     const sent = await this.#sendParts(req, parts, variant, log);
-    let { outputs, usage } = sent;
-    if (sent.err) return { nodes: [], err: sent.err, usage };
-    const pieces = () => parts.map((p, i) => ({ box: p.box, result: outputs[i], mask: p.mask, annot: p.annot }));
+    let { outputs, usages, err } = sent;
+    let usage = sumUsage(usages);
+    // when some fail, the others (paid for) still make the version, with their regions only
+    if (!outputs.some(Boolean)) return { nodes: [], err, usage };
+    const back = () => parts.flatMap((p, i) => (outputs[i] ? [i] : []));
+    const pieces = () => back().map((i) => ({ box: parts[i].box, result: outputs[i]!, mask: parts[i].mask, annot: parts[i].annot }));
     let done: PartsMerged;
     try {
-      done = await images.mergeParts(req.parent!, pieces(), req.overall);
+      done = await images.mergeParts(req.parent!, pieces(), req.overall, !err);
       if (done.ask) {
         log("info", ASK_LOG[done.ask]);
         const part = await req.whole!();
-        await store.addJobRequest(req.jobId, record(part)).catch(() => {}); // gone: the project was deleted meanwhile
+        // gone: the project was deleted meanwhile
+        const k = await store.addJobRequest(req.jobId, record(part)).catch(() => parts.length);
         const more = await this.#sendParts(req, [part], variant, log);
-        usage = addUsage(usage, more.usage);
-        if (more.err) return { nodes: [], err: more.err, usage };
+        usage = addUsage(usage, sumUsage(more.usages));
+        err = more.err;
         parts = [...parts, part];
+        numbers = [...numbers, k];
         outputs = [...outputs, ...more.outputs];
-        done = await images.mergeParts(req.parent!, pieces(), req.overall);
+        usages = [...usages, ...more.usages];
+        done = await images.mergeParts(req.parent!, pieces(), req.overall, false);
       }
     } catch (e) {
       // the images are paid for: never lose them to a paste-back problem (memory, a damaged file)
       log("warn", `${NOTE_LOG[spec.notes.paste_failed]} (${e instanceof Error ? `${e.name}: ${e.message}` : e})`);
       try {
         const image = (await store.putImage(await images.placeParts(req.parent!, pieces()))).sha;
-        return { nodes: [await this.#addNode(req, { image, note: spec.notes.paste_failed })], err: null, usage };
+        return { nodes: [await this.#addNode(req, { image, note: spec.notes.paste_failed })], err, usage };
       } catch (e2) {
         return { nodes: [], err: this.#saveError(e2, variant), usage };
       }
     }
+    if (err) done.note = spec.notes.part_failed;
     try {
-      return { nodes: [await this.#saveParts(req, done, parts, outputs, log)], err: null, usage };
+      const kept = back();
+      const made = await this.#partRecords(done, kept.map((i) => numbers[i]), kept.map((i) => usages[i]));
+      return { nodes: [await this.#saveParts(req, done, kept.map((i) => parts[i]), kept.map((i) => outputs[i]!), made, log)], err, usage };
     } catch (e) {
       return { nodes: [], err: this.#saveError(e, variant), usage };
     }
   }
 
-  /** Send ``parts`` at once: each one's image, the usage summed, the first error. */
+  /** Send ``parts`` at once: each one's image (null where it failed), each one's usage, the first error. */
   async #sendParts(
     req: Prepared,
     parts: Part[],
     variant: string,
     log: LogFn,
-  ): Promise<{ outputs: Uint8Array[]; usage: Record<string, number> | null; err: JobError | null }> {
+  ): Promise<{ outputs: (Uint8Array | null)[]; usages: (Record<string, number> | null)[]; err: JobError | null }> {
     const results = await Promise.allSettled(
       parts.map((part, i) => {
         const label = parts.length > 1 ? `Request ${i + 1}/${parts.length}: ` : "";
@@ -475,41 +500,63 @@ export class JobRunner {
         return this.#request(req, part.prompt, part.images, part.size, (level, msg) => log(level, label + msg), what);
       }),
     );
-    const outputs: Uint8Array[] = [];
-    let usage: Record<string, number> | null = null;
+    const outputs: (Uint8Array | null)[] = [];
+    const usages: (Record<string, number> | null)[] = [];
     let err: JobError | null = null;
     for (const r of results) {
       if (r.status === "rejected") {
         err ??= failure(r.reason, variant);
+        outputs.push(null);
+        usages.push(null);
         continue;
       }
-      usage = addUsage(usage, r.value.usage);
-      if (r.value.images.length) outputs.push(r.value.images[0]);
-      else err ??= r.value.lost.length ? error("image_unreachable", r.value.lost[0], variant) : error("no_image", "", variant);
+      usages.push(r.value.usage ?? null);
+      outputs.push(r.value.images[0] ?? null);
+      if (!r.value.images.length) err ??= r.value.lost.length ? error("image_unreachable", r.value.lost[0], variant) : error("no_image", "", variant);
     }
-    return { outputs, usage, err };
+    return { outputs, usages, err };
   }
 
-  async #saveParts(req: Prepared, done: PartsMerged, parts: Part[], outputs: Uint8Array[], log: LogFn): Promise<TreeNode> {
+  /** What each request made on its own, as a version records it (none for a single request). */
+  async #partRecords(done: PartsMerged, numbers: number[], usages: (Record<string, number> | null)[]): Promise<NodePart[]> {
+    const made = done.parts ?? [];
+    if (made.length < 2) return [];
+    const { store } = this.deps;
+    const out: NodePart[] = [];
+    for (const [i, p] of made.entries()) {
+      out.push({
+        request: numbers[i],
+        note: p.note,
+        usage: sumUsage([usages[i]]),
+        raw_image: (await store.putImage(p.raw)).sha,
+        raw_at: p.rawAt,
+        merged_image: p.merged ? (await store.putImage(p.merged)).sha : null,
+        merged_at: p.merged ? p.mergedAt : null,
+      });
+    }
+    return out;
+  }
+
+  async #saveParts(req: Prepared, done: PartsMerged, parts: Part[], outputs: Uint8Array[], made: NodePart[], log: LogFn): Promise<TreeNode> {
     const { store } = this.deps;
     const note = done.note;
     if (!done.merged) {
       // the whole image's output can't be pasted back: use it
       const data = outputs[parts.findIndex((p) => p.box === null)];
       log("warn", note === spec.notes.aspect_mismatch ? "The whole image's output has a different aspect ratio from the original; not pasted back" : NOTE_LOG[note]);
-      return this.#addNode(req, { image: (await store.putImage(data)).sha, note });
+      return this.#addNode(req, { image: (await store.putImage(data)).sha, note, parts: made });
     }
     if (note) log("info", NOTE_LOG[note]);
     const raw = (await store.putImage(done.raw!)).sha;
     const final = (await store.putImage(done.merged)).sha;
     if (note === spec.notes.overall_change) {
       // adopt the whole output; the pasted-back one stays beside it
-      return this.#addNode(req, { image: raw, rawImage: raw, mergedImage: final, note });
+      return this.#addNode(req, { image: raw, rawImage: raw, mergedImage: final, note, parts: made });
     }
-    return this.#addNode(req, { image: final, rawImage: raw, note });
+    return this.#addNode(req, { image: final, rawImage: raw, note, parts: made });
   }
 
-  async #addNode(req: Prepared, fields: { image: string; rawImage?: string; mergedImage?: string; note?: string }): Promise<TreeNode> {
+  async #addNode(req: Prepared, fields: { image: string; rawImage?: string; mergedImage?: string; note?: string; parts?: NodePart[] }): Promise<TreeNode> {
     const job = await this.deps.store.getJob(req.jobId);
     return this.deps.store.addNode({ projectId: job.project_id, parentId: job.parent_id, jobId: job.id, ...fields });
   }

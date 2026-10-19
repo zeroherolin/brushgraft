@@ -36,6 +36,13 @@ export interface Spec {
     retry_backoff: number;
     max_retry_after: number;
     retry_status: number[];
+    /** refused before any work began: a paid request can be sent again freely */
+    safe_retry_status: number[];
+    /** how often a paid request is sent again after a failure that may have come once it was made */
+    uncertain_retries: number;
+    /** a 429 with one of these codes is an exhausted quota: waiting doesn't help */
+    quota_codes: string[];
+    max_download_bytes: number;
     connect_timeout: number;
     timeout_generate: number;
     timeout_edit: number;
@@ -62,7 +69,16 @@ export interface Spec {
     assets_version: number;
     max_assets: number;
   };
-  notes: { spill_grown: string; spill_too_large: string; aspect_mismatch: string; reframed: string; paste_failed: string; overall_change: string };
+  notes: {
+    spill_grown: string;
+    spill_too_large: string;
+    aspect_mismatch: string;
+    reframed: string;
+    paste_failed: string;
+    overall_change: string;
+    part_failed: string;
+    too_large: string;
+  };
   imaging: {
     aspect_tolerance: number;
     annot_gap: number;
@@ -80,6 +96,15 @@ export interface Spec {
     spill_note_growth: number;
     align_margin: number;
     align_min_corr: number;
+    align_coarse_corr: number;
+    align_min_detail: number;
+    /** a transparent original: the backdrop a model paints there, see imaging.keyed */
+    backdrop_share: number;
+    backdrop_tolerance: number;
+    backdrop_min_pixels: number;
+    key_noise: number;
+    key_min_span: number;
+    close_up_near: number;
     tone_max_gain: number;
     tone_max_offset: number;
     tone_min_span: number;
@@ -112,6 +137,7 @@ export interface Spec {
     zoom_max_share: number;
     zoom_output_pixels: number;
     zoom_max_parts: number;
+    max_image_pixels: number;
   };
 }
 

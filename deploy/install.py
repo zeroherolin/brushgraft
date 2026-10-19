@@ -178,6 +178,31 @@ def live_release(root):
     return Path(os.path.realpath(link)) if link.is_symlink() else None
 
 
+def carried_list(release):
+    """Where the names of the files ``release`` kept from the one before are listed (beside it,
+    not in it: the site needn't serve the list)."""
+    return release.with_name(f'.carried-{release.name}')
+
+
+def carry(previous, staging, listing):
+    """Copy the hashed files of the live release that the new one lacks: a page opened before
+    the switch still loads the chunks it hasn't yet (the project file reader, say) by their old
+    names. One release back only, so they don't pile up."""
+    old_assets = previous / 'assets' if previous else None
+    if not (old_assets and old_assets.is_dir()):
+        return
+    passed_on = carried_list(previous)
+    skip = set(passed_on.read_text().split()) if passed_on.is_file() else set()
+    names = [p.name for p in old_assets.iterdir() if p.is_file() and p.name not in skip
+             and not (staging / 'assets' / p.name).exists()]
+    if not names:
+        return
+    (staging / 'assets').mkdir(exist_ok=True)
+    for name in names:
+        shutil.copy2(old_assets / name, staging / 'assets' / name)
+    listing.write_text(''.join(f'{name}\n' for name in sorted(names)))
+
+
 def run(args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, text=True, **kwargs)
 
@@ -226,6 +251,7 @@ def install(server, src, domain):
     try:
         shutil.rmtree(staging, ignore_errors=True)
         shutil.copytree(src, staging)
+        carry(previous_live, staging, carried_list(release))
         for path in [staging, *staging.rglob('*')]:
             os.chmod(path, 0o755 if path.is_dir() else 0o644)
         staging.rename(release)
@@ -255,6 +281,7 @@ def install(server, src, domain):
             (server.root / 'current').unlink()
         shutil.rmtree(staging, ignore_errors=True)
         shutil.rmtree(release, ignore_errors=True)
+        carried_list(release).unlink(missing_ok=True)
         if changed_config:
             try:
                 server.reload()
@@ -264,6 +291,7 @@ def install(server, src, domain):
     for old in releases(server.root)[:-KEEP_RELEASES]:
         if old != release and old != previous_live:
             shutil.rmtree(old, ignore_errors=True)
+            carried_list(old).unlink(missing_ok=True)
     for left in (server.root / 'releases').glob('.tmp-*'):  # by an install that was killed
         if time.time() - left.stat().st_mtime > 3600:
             shutil.rmtree(left, ignore_errors=True)

@@ -20,7 +20,7 @@ const ops: ImageOps = {
   normalize: (d) => normalizeUpload(testCodec, d),
   prepare: (parent, regions, refs, zoom) => prepare(testCodec, { parent, regions, refs, zoom }),
   merge: (parent, result, mask, annot, overall) => merge(testCodec, { parent, result, mask, annot, overall }),
-  mergeParts: (parent, pieces, overall) => mergeParts(testCodec, { parent, pieces, overall }),
+  mergeParts: (parent, pieces, overall, askWhole) => mergeParts(testCodec, { parent, pieces, overall, askWhole }),
   placeParts: (parent, pieces) => placeParts(testCodec, { parent, pieces }),
   thumb: (d) => thumbnail(testCodec, d),
 };
@@ -271,7 +271,7 @@ describe("editing", () => {
     expect(sent[0].size).toBe(zoomSize(zoom));
     const stored = await s.store.getJob(job.id);
     expect(stored.size).toBe(fitSize(W, H)); // what the whole image would be sent at
-    expect(stored.requests).toEqual([{ prompt: sent[0].prompt, box: zoom, size: sent[0].size, annot_image: stored.annot_image }]);
+    expect(stored.requests).toEqual([{ prompt: sent[0].prompt, box: zoom, regions: [0], size: sent[0].size, annot_image: stored.annot_image }]);
     expect(s.runner.logs(job.id).some((l) => l.msg.includes("a close-up of"))).toBe(true);
     const node = (await s.store.projectTree(projectId)).nodes.find((n) => n.job_id === job.id)!;
     const merged = decodePng(Buffer.from((await s.store.getImage(node.image)).data), "RGB");
@@ -316,6 +316,36 @@ describe("editing", () => {
     const merged = decodePng(Buffer.from((await s.store.getImage(nodes[0].image)).data), "RGB");
     const at = (x: number, y: number) => Array.from(merged.data.subarray((y * W + x) * 3, (y * W + x) * 3 + 3));
     expect([at(130, 125), at(1430, 975)]).toEqual([[255, 255, 255], [255, 255, 255]]);
+    // what each request made on its own, at its close-up
+    expect(nodes[0].parts.map((p) => [p.request, p.raw_at, p.merged_at, p.usage])).toEqual([
+      [0, zooms[0].slice(0, 2), zooms[0].slice(0, 2), { total_tokens: 7 }],
+      [1, zooms[1].slice(0, 2), zooms[1].slice(0, 2), { total_tokens: 7 }],
+    ]);
+    const first = decodePng(Buffer.from((await s.store.getImage(nodes[0].parts[0].merged_image!)).data), "RGB");
+    expect([first.width, first.height]).toEqual([zooms[0][2] - zooms[0][0], zooms[0][3] - zooms[0][1]]);
+  }, 30_000);
+
+  it("keeps what the other requests made when one fails, with a note and the error", async () => {
+    const [W, H] = [1600, 1100];
+    const original = scenePng(W, H);
+    const parent = await root(original);
+    const o = decodePng(Buffer.from(original), "RGB");
+    const regions = [
+      { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 100, y: 100, w: 60, h: 50 }] },
+      { instruction: "a blue cup", shapes: [{ type: "rect" as const, x: 1400, y: 950, w: 60, h: 50 }] },
+    ];
+    const zooms = zoomParts(W, H, regions.map((r) => bbox(regionMask(W, H, r.shapes)))).map(([z]) => z);
+    const sent: Sent[] = [];
+    s.replies.push(drawing(o, zooms, [[105, 105, 155, 145]], sent), jsonResponse({ error: { message: "bad request" } }, 400));
+    const job = await s.runner.submit(base(projectId, { parent_id: parent.id, prompt: "", regions, size: null, model: "gpt-image-2.5-flare" }));
+    const done = await waitDone(s, job.id);
+    expect([done.status, done.done, done.errors.map((e) => (e as JobError).code)]).toEqual(["done", 1, ["api_error"]]);
+    const node = (await s.store.projectTree(projectId)).nodes.find((n) => n.job_id === job.id)!;
+    expect(node.note).toBe("part_failed");
+    const merged = decodePng(Buffer.from((await s.store.getImage(node.image)).data), "RGB");
+    const at = (im: Raster, x: number, y: number) => Array.from(im.data.subarray((y * W + x) * 3, (y * W + x) * 3 + 3));
+    expect(at(merged, 130, 125)).toEqual([255, 255, 255]);
+    expect(at(merged, 1430, 975)).toEqual(at(o, 1430, 975));
   }, 30_000);
 
   it("sends the whole image as well when the overall request changed all of a close-up", async () => {

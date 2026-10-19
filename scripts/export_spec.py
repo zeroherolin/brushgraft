@@ -17,8 +17,9 @@ import promptbrush as pb
 
 from brushgraft import __version__, archive, imaging, prompts
 from brushgraft.app import SIZE_PRESETS
-from brushgraft.store import (NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_PASTE_FAILED,
-                              NOTE_REFRAMED, NOTE_SPILL_GROWN, NOTE_SPILL_TOO_LARGE)
+from brushgraft.store import (NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_PART_FAILED,
+                              NOTE_PASTE_FAILED, NOTE_REFRAMED, NOTE_SPILL_GROWN,
+                              NOTE_SPILL_TOO_LARGE, NOTE_TOO_LARGE)
 
 OUT = Path(__file__).resolve().parent.parent / "web" / "src" / "generated" / "spec.json"
 
@@ -26,8 +27,11 @@ IMAGING = (
     "ASPECT_TOLERANCE", "ANNOT_GAP", "ECHO_MIN_SHARE", "SPILL_SCALE", "SPILL_MIN_DELTA",
     "SPILL_DRIFT_FACTOR", "SPILL_NEAR", "BRIDGE_RADII", "SPILL_MIN_PATCH", "SPILL_PATCH_SHARE",
     "SPILL_MAX_GROWTH", "SPILL_MAX_SHARE", "SPILL_ESCALATE", "SPILL_NOTE_GROWTH", "ALIGN_MARGIN",
-    "ALIGN_MIN_CORR", "TONE_MAX_GAIN", "TONE_MAX_OFFSET", "TONE_MIN_SPAN", "TONE_FADE", "TONE_TIE",
-    "TONE_KEEP", "API_MAX_BYTES", "REF_MAX_PIXELS", "OVERALL_DELTA", "OVERALL_SHARE",
+    "ALIGN_MIN_CORR", "ALIGN_COARSE_CORR", "ALIGN_MIN_DETAIL", "BACKDROP_SHARE",
+    "BACKDROP_TOLERANCE", "BACKDROP_MIN_PIXELS", "KEY_NOISE", "KEY_MIN_SPAN", "CLOSE_UP_NEAR",
+    "TONE_MAX_GAIN", "TONE_MAX_OFFSET", "TONE_MIN_SPAN", "TONE_FADE", "TONE_TIE",
+    "TONE_KEEP", "API_MAX_BYTES", "MAX_IMAGE_PIXELS", "REF_MAX_PIXELS", "OVERALL_DELTA",
+    "OVERALL_SHARE",
     "REGISTER_COARSE", "REGISTER_REACH", "REGISTER_TILE", "REGISTER_MAX_TILES",
     "REGISTER_MIN_SHIFT", "REGISTER_MAX_SPREAD", "REGISTER_NEAR", "PIECE_BLUR", "PIECE_WEAK",
     "PIECE_CORE", "PIECE_ZONE", "PIECE_FLAT", "PIECE_SPACE", "PIECE_LINE", "MAX_COORD",
@@ -52,7 +56,8 @@ def build() -> dict:
         "max_instruction": prompts.MAX_INSTRUCTION,
         "max_full_prompt": prompts.MAX_FULL_PROMPT,
         "sizes": {
-            "pattern": pb.SIZE_PATTERN.pattern,
+            # JavaScript has no \Z: its $ (without the m flag) is the very end already
+            "pattern": pb.SIZE_PATTERN.pattern.replace(r"\Z", "$"),
             "multiple": pb.SIZE_MULTIPLE,
             "max_edge": pb.MAX_EDGE,
             "min_pixels": pb.MIN_PIXELS,
@@ -65,6 +70,10 @@ def build() -> dict:
             "retry_backoff": pb.RETRY_BACKOFF,
             "max_retry_after": pb.MAX_RETRY_AFTER,
             "retry_status": sorted(pb.RETRY_STATUS),
+            "safe_retry_status": sorted(pb.SAFE_RETRY_STATUS),
+            "uncertain_retries": pb.UNCERTAIN_RETRIES,
+            "quota_codes": sorted(pb.QUOTA_CODES),
+            "max_download_bytes": pb.MAX_DOWNLOAD_BYTES,
             "connect_timeout": pb.CONNECT_TIMEOUT,
             "timeout_generate": pb.TIMEOUT_GENERATE[1],
             "timeout_edit": pb.TIMEOUT_EDIT[1],
@@ -82,6 +91,8 @@ def build() -> dict:
             "reframed": NOTE_REFRAMED,
             "paste_failed": NOTE_PASTE_FAILED,
             "overall_change": NOTE_OVERALL,
+            "part_failed": NOTE_PART_FAILED,
+            "too_large": NOTE_TOO_LARGE,
         },
         "archive": {
             "format": archive.FORMAT,

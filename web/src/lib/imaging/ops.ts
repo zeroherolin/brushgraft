@@ -9,9 +9,10 @@ import type { Region } from "../types";
 import { annotate } from "./annotate";
 import type { Codec } from "./codec";
 import { detectExt, jpegOrientation, sniff } from "./formats";
-import { blendOnto, matchTone, pasteBack, pasteWeights, sameAspect, type PasteWeights } from "./pasteback";
+import { bitsToGray, blendOnto, feather, featherRadius, matchTone, pasteBack, pasteWeights, sameAspect, type PasteWeights } from "./pasteback";
+import { dilate, fromGray } from "./bits";
 import { register } from "./register";
-import { bbox, copyRaster, crop, paste, resize, toRgb, toRgba, type Raster } from "./raster";
+import { bbox, copyRaster, crop, darker, onBackdrop, paste, resize, toRgb, toRgba, WHITE, type Raster } from "./raster";
 import { regionMask, unionMask } from "./shapes";
 import { shiftRegions, zoomParts, type Box } from "./zoom";
 
@@ -57,6 +58,7 @@ export async function normalizeUpload(codec: Codec, data: Uint8Array): Promise<U
   if (!detectExt(data)) throw userError("not_an_image", "Only PNG, JPEG, WebP and GIF images are supported");
   const info = sniff(data);
   if (!info) throw userError("bad_image", "Couldn't read the image: the file is damaged", { detail: "bad header" });
+  checkPixels(info.width, info.height);
   if (KEEP_UPLOAD_FORMATS.has(info.ext) && jpegOrientation(data) === 1) {
     // Decoding proves it can be read; the original bytes are kept
     await decodeChecked(codec, data);
@@ -64,6 +66,14 @@ export async function normalizeUpload(codec: Codec, data: Uint8Array): Promise<U
   }
   // decode() applies the orientation, as browsers do for display
   return codec.encodePng(await decodeChecked(codec, data));
+}
+
+/** Refuse an image larger than max_image_pixels, before it is decoded: brushgraft.imaging.check_pixels. */
+export function checkPixels(width: number, height: number): void {
+  if (width * height > K.max_image_pixels) {
+    const maxMp = Math.floor(K.max_image_pixels / 1_000_000);
+    throw userError("image_too_large", `The image is ${width} × ${height}; at most ${maxMp} megapixels can be used`, { width, height, max_mp: maxMp });
+  }
 }
 
 async function decodeChecked(codec: Codec, data: Uint8Array): Promise<Raster> {
@@ -83,19 +93,23 @@ async function decodeChecked(codec: Codec, data: Uint8Array): Promise<Raster> {
  */
 export async function forApi(codec: Codec, data: Uint8Array, maxPixels = spec.sizes.max_pixels): Promise<Uint8Array> {
   const info = sniff(data);
-  if (info && info.width * info.height <= maxPixels && data.length <= K.api_max_bytes) return data;
+  const fits = !!info && info.width * info.height <= maxPixels && data.length <= K.api_max_bytes;
+  if (fits && info.ext === ".jpg") return data; // opaque, and within the limits
   let im = await codec.decode(data);
+  // transparent: over white, as PNG while that fits (imaging.for_api)
+  const clear = im.channels === 4;
+  if (fits && !clear) return data;
+  im = clear ? onBackdrop(im, WHITE) : toRgb(im);
   const { width: w, height: h } = im;
   if (w * h > maxPixels) {
     const k = Math.sqrt(maxPixels / (w * h));
-    im = resize(im, Math.max(1, Math.trunc(w * k)), Math.max(1, Math.trunc(h * k)), "lanczos");
+    return codec.encodeJpeg(resize(im, Math.max(1, Math.trunc(w * k)), Math.max(1, Math.trunc(h * k)), "lanczos"), 0.94);
   }
-  if (im.channels !== 4) return codec.encodeJpeg(im, 0.94);
-  const png = await codec.encodePng(im);
-  if (png.length <= K.api_max_bytes) return png;
-  // a noisy transparent image takes about 3 bytes a pixel even as PNG
-  const k = Math.sqrt(K.api_max_bytes / png.length) * 0.97;
-  return codec.encodePng(resize(im, Math.max(1, Math.trunc(im.width * k)), Math.max(1, Math.trunc(im.height * k)), "lanczos"));
+  if (clear) {
+    const png = await codec.encodePng(im);
+    if (png.length <= K.api_max_bytes) return png;
+  }
+  return codec.encodeJpeg(im, 0.94);
 }
 
 export interface Prepared {
@@ -207,65 +221,130 @@ export interface Piece {
   annot: Uint8Array;
 }
 
+/** What one request of an edit sent in parts made on its own: images to put on the original at (x, y). */
+export interface PartMade {
+  raw: Uint8Array;
+  rawAt: [number, number];
+  /** its regions pasted back; null when they can't be */
+  merged: Uint8Array | null;
+  mergedAt: [number, number] | null;
+  note: string;
+}
+
 export interface PartsMerged {
   /** send the whole image as well: a close-up changed all over (the overall request), or can't be pasted back */
   ask?: "overall" | "unusable";
   /** the pasted-back image; null: use the whole image's output as it came (redrawn, or of other proportions) */
   merged?: Uint8Array | null;
   /** the whole output */
-  raw?: Uint8Array;
+  raw?: Uint8Array | null;
   note: string;
+  /** per piece, in the order given */
+  parts?: PartMade[];
 }
 
 // The notes of a version made in parts, weakest first: it shows the strongest
 const PART_NOTES = ["", spec.notes.spill_grown, spec.notes.spill_too_large];
 
 /** Put back the outputs of an edit sent in parts onto the original: brushgraft.imaging.merge_parts. */
-export async function mergeParts(codec: Codec, input: { parent: Uint8Array; pieces: Piece[]; overall: boolean }): Promise<PartsMerged> {
+export async function mergeParts(
+  codec: Codec,
+  input: { parent: Uint8Array; pieces: Piece[]; overall: boolean; askWhole?: boolean },
+): Promise<PartsMerged> {
   const decoded = await codec.decode(input.parent);
   const full = decoded.channels === 4 ? toRgba(decoded) : toRgb(decoded);
-  let whole: { result: Raster; w: PasteWeights } | null = null;
+  // false: the whole image's output can't be pasted back
+  let whole: { result: Raster; w: PasteWeights } | null | false = null;
+  let wholeNote = "";
   const ups: { box: Box; result: Raster; mask: Raster; w: PasteWeights }[] = [];
   let ask: PartsMerged["ask"];
-  // the whole image's output first (a stable sort)
-  for (const p of [...input.pieces].sort((a, b) => Number(a.box !== null) - Number(b.box !== null))) {
+  const parts: { raw: Raster; rawAt: [number, number]; merged: Raster | null; mergedAt: [number, number] | null; note: string }[] = [];
+  for (const p of input.pieces) {
     const original = p.box ? crop(full, ...p.box) : full;
+    const at: [number, number] = p.box ? [p.box[0], p.box[1]] : [0, 0];
     const output = await codec.decode(p.result);
     if (!sameAspect([original.width, original.height], [output.width, output.height])) {
-      if (!p.box) return { merged: null, note: spec.notes.aspect_mismatch };
-      ask ??= "unusable";
+      const raw = inChannels(resize(output, original.width, original.height, "lanczos"), full.channels);
+      parts.push({ raw, rawAt: at, merged: null, mergedAt: null, note: spec.notes.aspect_mismatch });
+      if (!p.box) (whole = false), (wholeNote = spec.notes.aspect_mismatch);
+      else ask ??= "unusable";
       continue;
     }
     const mask = grayOf(await codec.decode(p.mask));
     const result = register(original, output, mask);
-    const w = pasteWeights(original, result, mask, await codec.decode(p.annot), input.overall);
+    let w = pasteWeights(original, result, mask, await codec.decode(p.annot), input.overall);
+    if (p.box) w = fadeInside(w, p.box, [full.width, full.height], original.width, original.height);
+    const part: (typeof parts)[number] = { raw: inChannels(result, full.channels), rawAt: at, merged: null, mergedAt: null, note: w.note };
+    parts.push(part);
+    if (!w.toned) {
+      if (!p.box) (whole = false), (wholeNote = w.note);
+      else ask ??= "unusable";
+      continue;
+    }
+    const pasted = copyRaster(original);
+    blendOnto(pasted, w.toned, w);
     if (!p.box) {
-      if (!w.toned) return { merged: null, note: w.note };
-      whole = { result, w };
-    } else if (!w.toned) {
-      ask ??= "unusable";
+      // the whole image's: only where it changed anything (its weights' box)
+      const box = w.soft ? bbox(w.soft) : null;
+      const [x0, y0, x1, y1] = box ? [w.x0 + box[0], w.y0 + box[1], w.x0 + box[2], w.y0 + box[3]] : [0, 0, 1, 1];
+      part.merged = crop(pasted, x0, y0, x1, y1);
+      part.mergedAt = [x0, y0];
+      whole ??= { result, w };
     } else {
+      part.merged = pasted;
+      part.mergedAt = at;
       if (w.note === spec.notes.overall_change) ask = "overall";
       ups.push({ box: p.box, result, mask, w });
     }
   }
-  if (!whole && ask) return { ask, note: "" };
+  const encoded = async () =>
+    Promise.all(
+      parts.map(async (p) => ({
+        raw: await codec.encodePng(p.raw),
+        rawAt: p.rawAt,
+        merged: p.merged ? await codec.encodePng(p.merged) : null,
+        mergedAt: p.mergedAt,
+        note: p.note,
+      })),
+    );
+  if (whole === false) return { merged: null, raw: null, note: wholeNote, parts: await encoded() };
+  if (!whole && ask && (input.askWhole ?? true)) return { ask, note: "" };
 
   const merged = copyRaster(full);
   if (whole) blendOnto(merged, whole.w.toned!, whole.w);
-  const raw = whole ? inChannels(whole.result, full.channels) : copyRaster(full);
+  // a copy: the whole image's own output is kept as it came, for its request's view
+  const raw = copyRaster(whole ? inChannels(whole.result, full.channels) : full);
   const notes: string[] = [];
   for (const { box, result, mask, w } of ups) {
-    const part = crop(merged, ...box);
-    blendOnto(part, w.toned!, w);
-    paste(merged, part, box[0], box[1]);
     if (!whole) {
+      const part = crop(merged, ...box);
+      blendOnto(part, w.toned!, w);
+      paste(merged, part, box[0], box[1]);
       paste(raw, inChannels(result, full.channels), box[0], box[1]);
     } else {
-      // the close-up's regions, in the whole output's tones
-      const base = crop(raw, ...box);
-      blendOnto(base, matchTone(base, result, mask), w);
-      paste(raw, base, box[0], box[1]);
+      // The whole image's output is there too: the close-up is weighed against what it goes onto,
+      // and adds only what lies near its regions (imaging.merge_parts)
+      const radius = featherRadius(mask.width, mask.height);
+      const near = feather(bitsToGray(dilate(fromGray(mask.data, mask.width, mask.height), K.close_up_near * radius)), radius);
+      for (const base of [merged, raw]) {
+        const part = crop(base, ...box);
+        let onto = pasteWeights(part, result, mask, null, false);
+        let over: Raster;
+        if (!onto.toned) {
+          // the two don't line up: as onto the original
+          over = matchTone(part, result, mask);
+          onto = w;
+        } else {
+          over = onto.toned;
+          onto = fadeInside(onto, box, [full.width, full.height], part.width, part.height);
+        }
+        if (onto.soft) {
+          const { x0, y0 } = onto;
+          onto = { ...onto, soft: darker(onto.soft, crop(near, x0, y0, x0 + onto.soft.width, y0 + onto.soft.height)) };
+        }
+        blendOnto(part, over, onto);
+        paste(base, part, box[0], box[1]);
+      }
     }
     notes.push(w.note);
   }
@@ -277,7 +356,7 @@ export async function mergeParts(codec: Codec, input: { parent: Uint8Array; piec
     if (whole) notes.push(whole.w.note);
     note = notes.filter((n) => n !== spec.notes.overall_change).reduce((a, b) => (PART_NOTES.indexOf(b) > PART_NOTES.indexOf(a) ? b : a), "");
   }
-  return { merged: await codec.encodePng(merged), raw: await codec.encodePng(raw), note };
+  return { merged: await codec.encodePng(merged), raw: await codec.encodePng(raw), note, parts: await encoded() };
 }
 
 /** The outputs of an edit sent in parts put in place as they came, the whole image's first: when pasting back failed. */
@@ -290,6 +369,30 @@ export async function placeParts(codec: Codec, input: { parent: Uint8Array; piec
     paste(image, inChannels(output, image.channels), x0, y0);
   }
   return codec.encodePng(image);
+}
+
+/**
+ * The paste weights of a close-up at ``box`` on an image of ``size`` (the close-up ``width`` x
+ * ``height``), brought down to nothing at its edges within the image, over twice the feather
+ * radius: imaging.fade_inside.
+ */
+function fadeInside(w: PasteWeights, box: Box, size: [number, number], width: number, height: number): PasteWeights {
+  if (!w.soft) return w;
+  const inner = [box[0] > 0, box[1] > 0, box[2] < size[0], box[3] < size[1]];
+  if (!inner.some(Boolean)) return w;
+  const reach = 2 * featherRadius(width, height);
+  const soft = copyRaster(w.soft);
+  for (let y = 0; y < soft.height; y++) {
+    const Y = w.y0 + y;
+    const ty = Math.min(inner[1] ? Y : reach, inner[3] ? height - 1 - Y : reach);
+    for (let x = 0; x < soft.width; x++) {
+      const X = w.x0 + x;
+      const ramp = Math.min(ty, inner[0] ? X : reach, inner[2] ? width - 1 - X : reach, reach);
+      const i = y * soft.width + x;
+      soft.data[i] = Math.floor((2 * soft.data[i] * ramp + reach) / (2 * reach));
+    }
+  }
+  return { ...w, soft };
 }
 
 /** ``im`` in RGB, or RGBA. */

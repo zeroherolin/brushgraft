@@ -193,6 +193,17 @@ class TestTree:
         store.record_attempt(job["id"], ok=False)
         store.delete_node(root["id"])
 
+    def test_images_a_versions_parts_refer_to_are_kept(self, store):
+        p = store.create_project("p")["id"]
+        img = store.put_image(make_png(color=(1, 1, 1)))["sha"]
+        part = store.put_image(make_png(color=(2, 2, 2)))["sha"]
+        record = {"request": 0, "note": "", "usage": None, "raw_image": part, "raw_at": [4, 5],
+                  "merged_image": None, "merged_at": None}
+        node = store.add_node(project_id=p, image=img, parts=[record])
+        assert node["parts"] == [record]
+        assert store.collect_garbage() == 0
+        assert part in store.project_images(p)
+
     def test_switch_between_merged_and_raw(self, store):
         p = store.create_project("p")["id"]
         merged = store.put_image(make_png(color=(1, 1, 1)))["sha"]
@@ -253,7 +264,7 @@ class TestTree:
     def test_a_chain_of_edits_deeper_than_sqlites_trigger_limit_can_be_deleted(self, store):
         # each generation would nest one more cascade trigger; SQLite stops at 1000
         img = store.put_image(make_png())["sha"]
-        for delete in ("node", "project"):
+        for delete in ("node", "project", "job"):
             p = store.create_project("p")["id"]
             parent = root = None
             for _ in range(1100):
@@ -266,6 +277,9 @@ class TestTree:
                 store.delete_node(root)
                 tree = store.project_tree(p)
                 assert tree["nodes"] == [] and len(tree["jobs"]) == 1  # the root's own job
+            elif delete == "job":
+                store.delete_job(store.get_node(root)["job_id"])
+                assert store.project_tree(p) == {"nodes": [], "jobs": []}
             else:
                 store.delete_project(p)
                 assert p not in [q["id"] for q in store.list_projects()]
@@ -365,19 +379,64 @@ class TestJobs:
         assert store.list_assets() == []
         store.close()
 
-    def test_a_version_2_database_gets_job_requests(self, tmp_path):
+    @pytest.mark.parametrize("version", [2, 3])
+    def test_an_older_database_gets_job_requests_and_version_parts(self, tmp_path, version):
         import sqlite3
         store = Store(tmp_path)
-        job = store.create_job(**job_fields(store.create_project("p")["id"]))
+        p = store.create_project("p")["id"]
+        job = store.create_job(**job_fields(p))
+        node = store.add_node(project_id=p, image=store.put_image(make_png())["sha"])
         store.close()
         db = sqlite3.connect(tmp_path / "brushgraft.sqlite3")
-        db.execute("ALTER TABLE jobs DROP COLUMN requests")  # as version 2 made it
-        db.execute("PRAGMA user_version = 2")
+        db.execute("ALTER TABLE nodes DROP COLUMN parts")  # as that version made it
+        if version == 2:
+            db.execute("ALTER TABLE jobs DROP COLUMN requests")
+        db.execute(f"PRAGMA user_version = {version}")
         db.commit()
         db.close()
         store = Store(tmp_path)
         assert store.get_job(job["id"])["requests"] == []
+        assert store.get_node(node["id"])["parts"] == []
         store.close()
+
+    def test_a_migration_cut_short_leaves_the_database_as_it_was(self, tmp_path, monkeypatch):
+        import sqlite3
+        store = Store(tmp_path)
+        store.close()
+        db = sqlite3.connect(tmp_path / "brushgraft.sqlite3")
+        db.execute("ALTER TABLE nodes DROP COLUMN parts")
+        db.execute("ALTER TABLE jobs DROP COLUMN requests")
+        db.execute("PRAGMA user_version = 2")
+        db.commit()
+        db.close()
+        connect = sqlite3.connect
+
+        class Crashing:
+            """A connection whose disk fails as the last column is added."""
+
+            def __init__(self, *a, **kw):
+                object.__setattr__(self, "db", connect(*a, **kw))
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+            def __setattr__(self, name, value):
+                setattr(self.db, name, value)
+
+            def execute(self, sql, *a):
+                if "ADD COLUMN parts" in sql:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self.db.execute(sql, *a)
+
+        monkeypatch.setattr("brushgraft.store.sqlite3.connect", Crashing)
+        with pytest.raises(sqlite3.OperationalError):
+            Store(tmp_path)
+        monkeypatch.undo()
+        db = sqlite3.connect(tmp_path / "brushgraft.sqlite3")
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert "requests" not in [r[1] for r in db.execute("PRAGMA table_info(jobs)")]
+        db.close()
+        Store(tmp_path).close()  # and the next start migrates it
 
     def test_newer_schema_refused(self, tmp_path):
         Store(tmp_path).close()

@@ -57,7 +57,7 @@
       <dd>{job.model}</dd>
       <dt>{t("composer.size")}</dt>
       <dd>{job.size || "—"}</dd>
-      <dt>{t("composer.count")}</dt>
+      <dt>{t("job.progressLabel")}</dt>
       <dd>{t("job.progress", { done: job.done, failed: job.failed, n: job.n })}</dd>
     </dl>
 

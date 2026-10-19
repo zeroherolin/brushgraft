@@ -139,6 +139,23 @@ class TestInstall:
         assert box.calls == []  # same config: nothing to validate or reload
         assert first.exists()  # kept for rollback
 
+    def test_the_live_release_s_hashed_files_are_kept_one_release_on(self, box, tmp_path):
+        # a page opened before the switch still loads the chunks it hasn't yet by their old names
+        def site(name, chunk):
+            path = make_site(tmp_path, name, name)
+            (path / "assets" / chunk).write_text(chunk)
+            return path
+
+        install_mod.install(box, site("a", "a1.js"), DOMAIN)
+        second = install_mod.install(box, site("b", "b1.js"), DOMAIN)
+        assert sorted(p.name for p in (second / "assets").iterdir()) == ["a1.js", "app.js", "b1.js"]
+        assert (second / "assets" / "app.js").read_text() == "1"  # the new build's own copy
+        third = install_mod.install(box, site("c", "c1.js"), DOMAIN)
+        # what the second kept from the first is not passed on again
+        assert sorted(p.name for p in (third / "assets").iterdir()) == ["app.js", "b1.js", "c1.js"]
+        assert install_mod.tree_hash(site("c", "c1.js")) in third.name
+        assert not list(third.glob(".carried*"))  # the list sits beside the release, not in it
+
     def test_the_same_site_again_adds_no_release(self, box, tmp_path):
         # an update with nothing new must not push the previous versions out of rollback's reach
         first = install_mod.install(box, make_site(tmp_path, "a", "one"), DOMAIN)

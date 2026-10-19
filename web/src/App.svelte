@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import X from "@lucide/svelte/icons/x";
   import { app, brushStep, SIDE_DEFAULT, SIDE_MAX, SIDE_MIN, type Layout } from "./lib/app.svelte";
   import { dialogs } from "./lib/dialogs.svelte";
-  import { forControl, typingIn } from "./lib/keys";
+  import { arrowInGroup, forControl, typingIn } from "./lib/keys";
   import { t } from "./lib/i18n.svelte";
   import AssetLibrary from "./components/AssetLibrary.svelte";
   import Canvas from "./components/Canvas.svelte";
@@ -67,7 +68,8 @@
       app.treeOpen = app.sheetOpen = app.queueOpen = false;
       return;
     }
-    if (forControl(e)) return;
+    if (app.sheetOpen) return; // the canvas and the tree are behind it
+    if (arrowInGroup(e) || forControl(e)) return;
     const key = e.key.toLowerCase();
     // the regions are shown and can be changed (Compare hides them)
     const editing = app.mode === "edit" && !!app.selected && !(app.compare && app.parentNode) && !app.viewedJob;
@@ -103,6 +105,8 @@
       app.removeRegion(app.selectedRegion);
     } else if (e.key === "Escape" && app.viewedJob) {
       app.closeJob();
+    } else if (e.key === "Escape" && app.shownPart) {
+      app.partView = null;
     } else if (e.key === "Escape") {
       app.selectedRegion = -1;
     } else if (e.key.startsWith("Arrow") && editing && app.selectedRegion >= 0) {
@@ -165,8 +169,11 @@
     }
   }
 
+  /** a dialog is open: images pasted or dropped aren't for the project behind it */
+  const blocked = () => !!dialogs.current || app.settingsOpen;
+
   function onPaste(e: ClipboardEvent) {
-    if (typingIn(e.target)) return;
+    if (typingIn(e.target) || blocked()) return;
     const files = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith("image/"));
     if (files.length) {
       e.preventDefault();
@@ -210,7 +217,7 @@
   onkeydown={onKeydown}
   onpaste={onPaste}
   ondragenter={(e) => {
-    if (!hasFiles(e)) return;
+    if (!hasFiles(e) || blocked()) return;
     dragDepth++;
     dragging = true;
   }}
@@ -220,7 +227,8 @@
   }}
   ondragover={(e) => {
     if (!hasFiles(e)) return;
-    e.preventDefault();
+    e.preventDefault(); // dropped here, not opened by the browser
+    if (blocked() && e.dataTransfer) e.dataTransfer.dropEffect = "none";
     overLibrary = !!(e.target as Element | null)?.closest?.(".library");
   }}
   ondrop={(e) => {
@@ -229,6 +237,7 @@
     dragging = false;
     if (e.defaultPrevented) return; // the asset library took it
     e.preventDefault();
+    if (blocked()) return;
     void app.upload(e.dataTransfer?.files ?? []);
   }}
 />
@@ -303,17 +312,40 @@
   {#if dragging}
     <div class="dropzone" aria-hidden="true"><span>{overLibrary ? t("app.dropzoneAssets") : t("app.dropzone")}</span></div>
   {/if}
+  <!-- always there, so screen readers announce what is put in it; an error interrupts -->
+  <div class="announce" role="status" aria-live="polite">{app.toast && !app.toast.error ? app.toast.text : ""}</div>
+  <div class="announce" role="alert">{app.toast?.error ? app.toast.text : ""}</div>
   {#if app.toast}
-    <div class="toast" class:error={app.toast.error} class:raised={app.layout === "narrow"} role="status" aria-live="polite">
+    <!-- kept while the pointer or the focus is on it -->
+    <div
+      class="toast"
+      class:error={app.toast.error}
+      class:raised={app.layout === "narrow"}
+      role="presentation"
+      onpointerenter={() => app.holdToast(true)}
+      onpointerleave={() => app.holdToast(false)}
+      onfocusin={() => app.holdToast(true)}
+      onfocusout={() => app.holdToast(false)}
+    >
       <span>{app.toast.text}</span>
       {#if app.toast.action}
         <button class="quiet small" onclick={() => app.toastAction()}>{app.toast.action.label}</button>
       {/if}
+      <button class="quiet icon small dismiss" aria-label={t("common.dismiss")} title={t("common.dismiss")} onclick={() => app.dismissToast()}><X size={14} /></button>
     </div>
   {/if}
 {/if}
 
 <style>
+  .announce {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
   .shell {
     display: flex;
     flex-direction: column;
@@ -477,6 +509,12 @@
     padding: 0 8px;
     color: var(--accent);
     font-weight: 600;
+  }
+
+  .toast .dismiss {
+    margin-right: -8px;
+    padding: 0 4px;
+    color: var(--ink-2);
   }
 
   .toast.raised {

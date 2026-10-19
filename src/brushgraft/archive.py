@@ -21,7 +21,8 @@ from PIL import Image
 import promptbrush as pb
 
 from brushgraft.errors import UserError
-from brushgraft.imaging import MAX_COORD
+from brushgraft.store import part_images
+from brushgraft.imaging import MAX_COORD, MAX_IMAGE_PIXELS
 from brushgraft.prompts import (MAX_FULL_PROMPT, MAX_INSTRUCTION, MAX_PROMPT, MAX_REGIONS,
                                MAX_SHAPES)
 
@@ -56,8 +57,8 @@ def _bad_pack(detail: str) -> UserError:
 # Writing
 # ---------------------------------------------------------------------------
 def node_record(node: dict) -> dict:
-    keys = ("id", "parent_id", "job_id", "image", "raw_image", "merged_image", "note", "label",
-            "starred", "created_at")
+    keys = ("id", "parent_id", "job_id", "image", "raw_image", "merged_image", "note", "parts",
+            "label", "starred", "created_at")
     return {k: node[k] for k in keys}
 
 
@@ -180,17 +181,51 @@ def _job_error(e: Any) -> Any:
 
 def _request(r: Any) -> dict:
     box = r.get("box") if isinstance(r, dict) else 0
-    if box is not None and (not isinstance(box, list) or len(box) != 4):
+    regions = r.get("regions", []) if isinstance(r, dict) else 0  # not in older files
+    if (box is not None and (not isinstance(box, list) or len(box) != 4)) or not isinstance(
+            regions, list) or len(regions) > MAX_REGIONS:
         raise _bad("a request is malformed")
     return {"prompt": _text(r.get("prompt"), "a prompt sent", MAX_FULL_PROMPT),
             "box": None if box is None else [int(_number(v, "a close-up", MAX_COORD)) for v in box],
+            "regions": [int(_number(k, "a region's index", MAX_REGIONS)) for k in regions],
             "size": _text(r.get("size"), "a size", 20, optional=True),
             "annot_image": _sha(r.get("annot_image"), "an annotated image", True)}
+
+
+def _usage(usage: Any) -> dict | None:
+    # NaN would be stored, then break every reply that lists the job
+    return ({k: v for k, v in usage.items() if isinstance(v, (int, float))
+             and not isinstance(v, bool) and abs(v) <= 2 ** 53}
+            if isinstance(usage, dict) else None)
+
+
+def _at(v: Any) -> list[int] | None:
+    if v is None:
+        return None
+    if not isinstance(v, list) or len(v) != 2:
+        raise _bad("a position is malformed")
+    return [int(_number(c, "a position", MAX_COORD)) for c in v]
+
+
+def _part(p: Any) -> dict:
+    if not isinstance(p, dict):
+        raise _bad("a version's part is malformed")
+    request = _number(p.get("request"), "a request's index", MAX_REGIONS + 1)
+    raw, merged = _sha(p.get("raw_image"), "a raw image", True), _sha(
+        p.get("merged_image"), "a merged image", True)
+    usage = p.get("usage")
+    return {"request": int(request), "note": _text(p.get("note"), "a note", 64, optional=True),
+            "usage": _usage(usage),
+            "raw_image": raw, "raw_at": _at(p.get("raw_at")) if raw else None,
+            "merged_image": merged, "merged_at": _at(p.get("merged_at")) if merged else None}
 
 
 def _node(n: Any) -> dict:
     if not isinstance(n, dict):
         raise _bad("a version is malformed")
+    parts = n.get("parts", [])  # not in files from before edits were sent in parts
+    if not isinstance(parts, list) or len(parts) > MAX_REGIONS + 1:
+        raise _bad("a version has too many parts")
     return {
         "id": _id(n.get("id"), "a version id"),
         "parent_id": _opt_id(n.get("parent_id"), "a parent id"),
@@ -199,6 +234,7 @@ def _node(n: Any) -> dict:
         "raw_image": _sha(n.get("raw_image"), "a raw image", True),
         "merged_image": _sha(n.get("merged_image"), "a merged image", True),
         "note": _text(n.get("note"), "a note", 64, optional=True),
+        "parts": [_part(p) for p in parts],
         "label": _text(n.get("label"), "a label", 200, optional=True),
         "starred": n.get("starred") is True,
         "created_at": _number(n.get("created_at"), "a version's time"),
@@ -251,10 +287,7 @@ def _job(j: Any) -> dict:
         "done": min(int(n), max(0, int(_number(j.get("done", 0), "done")))),
         "failed": min(int(n), max(0, int(_number(j.get("failed", 0), "failed")))),
         "errors": [_job_error(e) for e in errors[:50]] if isinstance(errors, list) else [],
-        # NaN would be stored, then break every reply that lists the job
-        "usage": ({k: v for k, v in usage.items() if isinstance(v, (int, float))
-                   and not isinstance(v, bool) and abs(v) <= 2 ** 53}
-                  if isinstance(usage, dict) else None),
+        "usage": _usage(usage),
         "created_at": _number(j.get("created_at"), "a job's time"),
         "finished_at": None if finished is None else _number(finished, "a finish time"),
     }
@@ -309,7 +342,8 @@ def parse_manifest(raw: Any) -> dict:
 def referenced_images(manifest: dict) -> set[str]:
     out = set()
     for n in manifest["nodes"]:
-        out.update(s for s in (n["image"], n["raw_image"], n["merged_image"]) if s)
+        out.update(s for s in (n["image"], n["raw_image"], n["merged_image"], *part_images(n))
+                   if s)
     for j in manifest["jobs"]:
         out.update(s for s in (j["mask_image"], j["annot_image"], *j["ref_images"],
                                *(r["annot_image"] for r in j["requests"])) if s)
@@ -323,10 +357,10 @@ _UNREADABLE = (zipfile.BadZipFile, OSError, zlib.error, RuntimeError, NotImpleme
 
 
 def _opens(data: bytes) -> bool:
-    """Whether the image's header reads, as on upload (Pillow refuses absurdly large ones)."""
+    """Whether the image's header reads, and it isn't too large to be used (as on upload)."""
     try:
-        with Image.open(io.BytesIO(data)):
-            return True
+        with Image.open(io.BytesIO(data)) as im:
+            return im.width * im.height <= MAX_IMAGE_PIXELS
     except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
         return False
 
@@ -398,6 +432,16 @@ def remap_ids(manifest: dict, new_id) -> tuple[list[dict], list[dict]]:
              "refs": [node_map.get(r, r) for r in j["refs"]]}
             for j in manifest["jobs"]]
     return nodes, jobs
+
+
+def check_exportable(sizes: dict[str, int]) -> None:
+    """Refuse to write a file that couldn't be read back (see the limits): {sha: bytes}."""
+    total = sum(sizes.values())
+    if total > MAX_TOTAL_BYTES or any(n > MAX_FILE_BYTES for n in sizes.values()):
+        raise UserError("export_too_large",
+                        f"The project's images take {total / 1024**3:.1f} GB; a project file can "
+                        f"hold at most {MAX_TOTAL_BYTES // 1024**3} GB",
+                        size_gb=round(total / 1024**3, 1), max_gb=MAX_TOTAL_BYTES // 1024**3)
 
 
 def to_bytes(project: dict, nodes: list[dict], jobs: list[dict], images: dict[str, bytes],

@@ -6,7 +6,7 @@
 
 import { Zip, ZipPassThrough, unzipSync } from "fflate";
 import { detectExt, sniff } from "../imaging/formats";
-import type { Job, JobError, Project, Region, SentRequest, ShapeOp, TreeNode } from "../types";
+import type { Job, JobError, NodePart, Project, Region, SentRequest, ShapeOp, TreeNode } from "../types";
 import { ApiError, userError } from "./errors";
 import { charCount } from "./prompts";
 import { spec } from "./spec";
@@ -136,12 +136,43 @@ function jobError(v: unknown): JobError | string {
 /** Check a project.json and return it in the shape the stores take. Throws bad_archive. */
 function sentRequest(r: unknown): SentRequest {
   const box = isObject(r) ? r.box : 0;
-  if (!isObject(r) || (box !== null && (!Array.isArray(box) || box.length !== 4))) throw bad("a request is malformed");
+  const regions = isObject(r) ? (r.regions ?? []) : 0; // not in older files
+  if (!isObject(r) || (box !== null && (!Array.isArray(box) || box.length !== 4)) || !Array.isArray(regions) || regions.length > spec.max_regions) {
+    throw bad("a request is malformed");
+  }
   return {
     prompt: str(r.prompt, "a prompt sent", spec.max_full_prompt),
     box: box === null ? null : (box.map((v) => Math.trunc(num(v, "a close-up", spec.imaging.max_coord))) as SentRequest["box"]),
+    regions: regions.map((k) => Math.trunc(num(k, "a region's index", spec.max_regions))),
     size: str(r.size, "a size", 20, true),
     annot_image: sha(r.annot_image, "an annotated image", true),
+  };
+}
+
+/** usage numbers only: NaN would be stored, then break every reply that lists the job */
+function usageOf(v: unknown): Record<string, number> | null {
+  if (!isObject(v)) return null;
+  return Object.fromEntries(Object.entries(v).filter(([, n]) => typeof n === "number" && Math.abs(n) <= 2 ** 53)) as Record<string, number>;
+}
+
+function at(v: unknown): [number, number] | null {
+  if (v === null || v === undefined) return null;
+  if (!Array.isArray(v) || v.length !== 2) throw bad("a position is malformed");
+  return v.map((c) => Math.trunc(num(c, "a position", spec.imaging.max_coord))) as [number, number];
+}
+
+function nodePart(p: unknown): NodePart {
+  if (!isObject(p)) throw bad("a version's part is malformed");
+  const raw = sha(p.raw_image, "a raw image", true);
+  const merged = sha(p.merged_image, "a merged image", true);
+  return {
+    request: Math.trunc(num(p.request, "a request's index", spec.max_regions + 1)),
+    note: str(p.note, "a note", 64, true),
+    usage: usageOf(p.usage),
+    raw_image: raw,
+    raw_at: raw ? at(p.raw_at) : null,
+    merged_image: merged,
+    merged_at: merged ? at(p.merged_at) : null,
   };
 }
 
@@ -158,6 +189,8 @@ export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
 
   const nodes = raw.nodes.map((n): ArchiveContent["nodes"][number] => {
     if (!isObject(n)) throw bad("a version is malformed");
+    const parts = n.parts ?? []; // not in files from before edits were sent in parts
+    if (!Array.isArray(parts) || parts.length > spec.max_regions + 1) throw bad("a version has too many parts");
     return {
       id: id(n.id, "a version id"),
       parent_id: optId(n.parent_id, "a parent id"),
@@ -166,6 +199,7 @@ export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
       raw_image: sha(n.raw_image, "a raw image", true),
       merged_image: sha(n.merged_image, "a merged image", true),
       note: str(n.note, "a note", 64, true),
+      parts: parts.map(nodePart),
       label: str(n.label, "a label", 200, true),
       starred: n.starred === true,
       created_at: num(n.created_at, "a version's time"),
@@ -185,11 +219,7 @@ export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
     const n = num(j.n, "a job's count");
     if (!Number.isInteger(n) || n < 1 || n > 4) throw bad("a job's count is out of range");
     const errors = Array.isArray(j.errors) ? j.errors.slice(0, 50).map(jobError) : [];
-    let usage: Record<string, number> | null = null;
-    if (isObject(j.usage)) {
-      const kept = Object.entries(j.usage).filter(([, v]) => typeof v === "number" && Math.abs(v) <= 2 ** 53);
-      usage = Object.fromEntries(kept) as Record<string, number>;
-    }
+    const usage = usageOf(j.usage);
     const status = ["queued", "running", "done", "failed"].includes(j.status as string) ? (j.status as Job["status"]) : "failed";
     return {
       id: id(j.id, "a job id"),
@@ -247,7 +277,7 @@ export function parseManifest(raw: unknown): Omit<ArchiveContent, "images"> {
 /** The images every node and job refers to. */
 export function referencedImages(m: Omit<ArchiveContent, "images">): Set<string> {
   const out = new Set<string>();
-  for (const n of m.nodes) for (const s of [n.image, n.raw_image, n.merged_image]) if (s) out.add(s);
+  for (const n of m.nodes) for (const s of [n.image, n.raw_image, n.merged_image, ...n.parts.flatMap((p) => [p.raw_image, p.merged_image])]) if (s) out.add(s);
   for (const j of m.jobs) {
     for (const s of [j.mask_image, j.annot_image, ...j.ref_images, ...j.requests.map((r) => r.annot_image)]) if (s) out.add(s);
   }
@@ -296,7 +326,9 @@ async function readZip<M>(
     const m = /^images\/([0-9a-f]{64})\.\w+$/.exec(entry);
     if (!m) continue;
     if ((await sha256Hex(data)) !== m[1]) throw fail(`${entry} doesn't match its name`);
-    if (!sniff(data)) throw fail(`${entry} is not an image`);
+    const info = sniff(data);
+    // too large to be used, as on upload (a small file can claim a huge size)
+    if (!info || info.width * info.height > spec.imaging.max_image_pixels) throw fail(`${entry} is not an image`);
     images.set(m[1], data);
   }
   for (const s of referenced(manifest)) if (!images.has(s)) throw fail(`the image ${s.slice(0, 8)}… is missing`);

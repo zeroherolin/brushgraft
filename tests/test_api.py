@@ -75,6 +75,31 @@ def image(client, sha) -> Image.Image:
 
 
 class TestSecurity:
+    def test_changes_from_another_site_are_refused_and_headers_are_set(self, client, project):
+        r = client.post("/api/projects", json={"name": "x"},
+                        headers={"sec-fetch-site": "cross-site"})
+        assert (r.status_code, r.json()["code"]) == (403, "cross_site")
+        r = client.post("/api/projects", json={"name": "x"},
+                        headers={"sec-fetch-site": "same-site"})
+        assert r.status_code == 403  # another port of this host is another origin
+        r = client.post("/api/projects", json={"name": "x"},
+                        headers={"origin": "http://evil.example"})
+        assert r.status_code == 403
+        assert client.post("/api/projects", json={"name": "x"},
+                           headers={"sec-fetch-site": "same-origin"}).status_code == 201
+        assert client.get("/api/projects",
+                          headers={"sec-fetch-site": "cross-site"}).status_code == 200
+        r = client.get("/api/config")
+        assert "frame-ancestors 'none'" in r.headers["content-security-policy"]
+        assert r.headers["x-content-type-options"] == "nosniff"
+
+    def test_each_workspace_has_its_own_cookie(self, app):
+        from brushgraft.app import cookie_name
+        with TestClient(app) as c:
+            c.post("/api/session", json={"token": TOKEN})
+            assert cookie_name(TOKEN) in c.cookies
+        assert cookie_name("other") != cookie_name(TOKEN)
+
     def test_foreign_host_rejected(self, app):
         with TestClient(app) as c:
             resp = c.get("/api/config", headers={"host": "evil.example:7788"})
@@ -248,7 +273,7 @@ class TestJobs:
         assert [im.size for im in sent] == [(zoom[2] - zoom[0], zoom[3] - zoom[1])] * 2
         assert call["size"] == imaging.zoom_size(zoom)
         assert job["size"] == pb.fit_size(2400, 1600)  # what the whole image would be sent at
-        assert job["requests"] == [{"prompt": call["prompt"], "box": list(zoom),
+        assert job["requests"] == [{"prompt": call["prompt"], "box": list(zoom), "regions": [0],
                                     "size": call["size"], "annot_image": job["annot_image"]}]
         logs = client.get(f"/api/jobs/{job['id']}/logs").json()
         assert any("a close-up of 941x628" in line["msg"] for line in logs)
@@ -297,6 +322,53 @@ class TestJobs:
                    .json()["nodes"] if n["parent_id"] == root["id"]]
         merged = image(client, node["image"])
         assert merged.getpixel((260, 245)) == merged.getpixel((2060, 1345)) == (255, 255, 255)
+        # what each request made on its own, to be looked at: on the original, at its close-up
+        assert [p["request"] for p in node["parts"]] == [0, 1]
+        original = image(client, root["image"])
+        for part, zoom, (x, y) in zip(node["parts"], zooms, [(260, 245), (2060, 1345)],
+                                      strict=True):
+            assert part["raw_at"] == part["merged_at"] == list(zoom[:2])
+            assert part["usage"] == {"total_tokens": 10}
+            alone = original.copy()
+            alone.paste(image(client, part["merged_image"]), tuple(part["merged_at"]))
+            assert alone.getpixel((x, y)) == (255, 255, 255)
+            assert image(client, part["raw_image"]).size == (zoom[2] - zoom[0], zoom[3] - zoom[1])
+        # the other request's object isn't in this one's result
+        first = original.copy()
+        first.paste(image(client, node["parts"][0]["merged_image"]),
+                    tuple(node["parts"][0]["merged_at"]))
+        assert first.getpixel((2060, 1345)) == original.getpixel((2060, 1345))
+
+    def test_when_one_close_up_fails_the_others_still_make_the_version(
+            self, client, project, fake_api):
+        root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
+        regions = [{"shapes": [{"type": "rect", "x": 200, "y": 200, "w": 120, "h": 90}],
+                    "instruction": "a red teapot"},
+                   {"shapes": [{"type": "rect", "x": 2000, "y": 1300, "w": 120, "h": 90}],
+                    "instruction": "a blue cup"}]
+        boxes = [imaging.region_mask((2400, 1600), r["shapes"]).getbbox() for r in regions]
+        zooms = [z for z, _ in imaging.zoom_parts((2400, 1600), boxes)]
+        draw = drawing_model(
+            zooms, [(210, 210, 310, 280), (2010, 1310, 2110, 1380)],
+            original=Image.open(io.BytesIO(scene_png((2400, 1600), seed=3))).convert("RGB"))
+
+        def respond(call):
+            if "a blue cup" in call["prompt"]:
+                raise pb.ImageAPIError("HTTP 500: upstream error", 500)
+            return draw(call)
+
+        fake_api.respond = respond
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=regions,
+                      model="gpt-image-2.5-flare")
+        job = wait_job(client, project["id"], resp.json()["id"])
+        assert (job["status"], job["done"], [e["code"] for e in job["errors"]]) == \
+            ("done", 1, ["api_error"])
+        (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
+                   .json()["nodes"] if n["parent_id"] == root["id"]]
+        assert node["note"] == "part_failed"
+        merged, original = image(client, node["image"]), image(client, root["image"])
+        assert merged.getpixel((260, 245)) == (255, 255, 255)  # the request that came back
+        assert merged.getpixel((2060, 1345)) == original.getpixel((2060, 1345))  # left as it was
 
     def test_an_overall_request_goes_with_the_close_up(self, client, project, fake_api):
         root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
@@ -331,6 +403,11 @@ class TestJobs:
         assert [r["box"] for r in job["requests"]] == [list(zoom), None]
         logs = client.get(f"/api/jobs/{job['id']}/logs").json()
         assert any("sending the whole image as well" in line["msg"] for line in logs)
+        (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
+                   .json()["nodes"] if n["parent_id"] == root["id"]]
+        close, whole = node["parts"]
+        assert (close["request"], close["note"], whole["request"]) == (0, "overall_change", 1)
+        assert whole["raw_at"] == [0, 0] and image(client, whole["raw_image"]).size == (2400, 1600)
 
         (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
                    .json()["nodes"] if n["parent_id"] == root["id"]]
@@ -751,10 +828,16 @@ class TestArchive:
         client.delete(f"/api/projects/{project['id']}")
         store.collect_garbage()
         new = client.post("/api/projects/import", files={"file": ("p.zip", data)}).json()
-        (job,) = client.get(f"/api/projects/{new['id']}/tree").json()["jobs"]
+        tree = client.get(f"/api/projects/{new['id']}/tree").json()
+        (job,) = tree["jobs"]
         assert job["requests"] == before["requests"] and len(job["requests"]) == 2
         for r in job["requests"]:
             assert client.get(f"/api/images/{r['annot_image']}").status_code == 200
+        (node,) = [n for n in tree["nodes"] if n["job_id"]]
+        assert len(node["parts"]) == 2
+        for p in node["parts"]:
+            for sha in (p["raw_image"], p["merged_image"]):
+                assert client.get(f"/api/images/{sha}").status_code == 200
 
     def test_a_file_from_before_reference_images_still_imports(self, client, project, fake_api):
         import json

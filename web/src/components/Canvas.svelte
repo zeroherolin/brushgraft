@@ -56,6 +56,8 @@
   let image = $state<HTMLImageElement | null>(null);
   let preview = $state<HTMLImageElement | null>(null);
   let parentImage = $state<HTMLImageElement | null>(null);
+  /** a request's image, over the original (see app.partView) */
+  let partImage = $state<HTMLImageElement | null>(null);
   let shownDims = "";
 
   let split = $state(0.5);
@@ -85,7 +87,9 @@
   const node = $derived(app.selected);
   // a job opened from the tree: its parent shows with the job's regions, and nothing is edited
   const viewing = $derived(app.viewedJob);
-  const editing = $derived(app.mode === "edit" && !!node && !viewing);
+  // one request of an edit sent in several, over the original it was made from
+  const part = $derived(viewing ? null : app.shownPart);
+  const editing = $derived(app.mode === "edit" && !!node && !viewing && !part);
   const comparing = $derived(app.compare && !!app.parentNode && !!node && !viewing);
   // When pasted back, the "other" image is the one this version didn't adopt:
   // the pasted result or the model's whole output
@@ -99,7 +103,12 @@
   const dotSize = $derived(Math.round(3 + sliderOf(app.brushSize) / 100));
   const altShort = $derived(usingRaw ? t("canvas.altMergedShort") : t("canvas.altRawShort"));
   const altName = $derived(usingRaw ? t("canvas.altMergedName") : t("canvas.altRawName"));
-  const shownSha = $derived(node ? (app.showAlt && altSha ? altSha : node.image) : null);
+  const shownSha = $derived(node ? (part ? (app.parentNode?.image ?? null) : app.showAlt && altSha ? altSha : node.image) : null);
+  // the frame drawn: the original's while a request is shown over it, else the version's
+  const dims = $derived(part && app.parentNode ? app.parentNode : node);
+  const partSha = $derived(part ? (part.kind === "raw" ? part.part.raw_image : part.part.merged_image) : null);
+  const partAt = $derived(part ? ((part.kind === "raw" ? part.part.raw_at : part.part.merged_at) ?? [0, 0]) : [0, 0]);
+  const partBox = $derived(part && node?.job_id ? (app.jobs[node.job_id]?.requests[part.part.request]?.box ?? null) : null);
   const narrow = $derived(app.layout === "narrow");
   // The regions this version was made with, outlined until a new edit is drawn; for a job on screen,
   // its own regions, drawn on the image it was sent with
@@ -108,7 +117,7 @@
       ? node && viewing.parent_id === node.id
         ? viewing.regions
         : []
-      : app.showMadeWith && !comparing && !app.showAlt && !app.draft.regions.length && !drawing && !poly
+      : app.showMadeWith && !comparing && !app.showAlt && !part && !app.draft.regions.length && !drawing && !poly
         ? app.madeWithRegions
         : [],
   );
@@ -254,7 +263,7 @@
 
   // -- image loading ------------------------------------------------------
   // Reload only when the image or its size changes (starring doesn't flicker)
-  const shownKey = $derived(node && shownSha ? `${shownSha}@${node.width}x${node.height}` : "");
+  const shownKey = $derived(dims && shownSha ? `${shownSha}@${dims.width}x${dims.height}` : "");
   const parentSha = $derived(comparing ? (app.parentNode?.image ?? null) : null);
 
   $effect(() => {
@@ -277,6 +286,18 @@
     loadImage(sha, true).then((img) => !cancelled && !image && (preview = img), () => {});
     loadImage(sha).then(
       (img) => !cancelled && (image = img),
+      (e: Error) => !cancelled && app.notify(e.message, true),
+    );
+    return () => (cancelled = true);
+  });
+
+  $effect(() => {
+    const sha = partSha;
+    partImage = null;
+    if (!sha) return;
+    let cancelled = false;
+    loadImage(sha).then(
+      (img) => !cancelled && (partImage = img),
       (e: Error) => !cancelled && app.notify(e.message, true),
     );
     return () => (cancelled = true);
@@ -308,9 +329,9 @@
    * Photoshop's overscroll): some of it always stays in sight.
    */
   function setView(v: { scale: number; x: number; y: number }) {
-    if (node && width && height) {
-      const w = node.width * v.scale;
-      const h = node.height * v.scale;
+    if (dims && width && height) {
+      const w = dims.width * v.scale;
+      const h = dims.height * v.scale;
       v = { scale: v.scale, x: Math.min(width / 2, Math.max(width / 2 - w, v.x)), y: Math.min(height / 2, Math.max(height / 2 - h, v.y)) };
     }
     view = v;
@@ -332,10 +353,10 @@
   }
 
   function fit() {
-    if (!node || !width || !height) return;
+    if (!dims || !width || !height) return;
     const pad = narrow ? 12 : 28;
-    const scale = Math.min((width - pad * 2) / node.width, (height - pad * 2) / node.height, 4);
-    setView({ scale, x: (width - node.width * scale) / 2, y: (height - node.height * scale) / 2 });
+    const scale = Math.min((width - pad * 2) / dims.width, (height - pad * 2) / dims.height, 4);
+    setView({ scale, x: (width - dims.width * scale) / 2, y: (height - dims.height * scale) / 2 });
   }
 
   function zoomAt(factor: number, sx: number, sy: number) {
@@ -389,7 +410,7 @@
   let frame = 0;
   $effect(() => {
     // Read everything the picture depends on; redraw when any of it changes
-    void [view.scale, view.x, view.y, width, height, image, preview, parentImage, split, hover, drawing, comparing, poly];
+    void [view.scale, view.x, view.y, width, height, image, preview, parentImage, partImage, partBox, split, hover, drawing, comparing, poly];
     void [app.selectedRegion, app.tool, app.brushSize, app.theme, editing, spaceHeld, gesture, madeWith, mods.shift, mods.alt];
     void $state.snapshot(app.draft.regions);
     cancelAnimationFrame(frame);
@@ -639,8 +660,8 @@
     ctx.clearRect(0, 0, width, height);
     if (!node) return;
 
-    const w = node.width * view.scale;
-    const h = node.height * view.scale;
+    const w = dims!.width * view.scale;
+    const h = dims!.height * view.scale;
     const src = image ?? preview;
     ctx.save();
     ctx.shadowColor = "rgb(0 0 0 / 0.22)";
@@ -653,7 +674,25 @@
     ctx.imageSmoothingEnabled = view.scale < 2;
     ctx.imageSmoothingQuality = "high";
     if (src) ctx.drawImage(src, view.x, view.y, w, h);
+    if (part && partImage) {
+      const [px, py] = partAt;
+      ctx.drawImage(partImage, view.x + px * view.scale, view.y + py * view.scale, partImage.naturalWidth * view.scale, partImage.naturalHeight * view.scale);
+    }
     ctx.imageSmoothingEnabled = true;
+    if (part && partBox) {
+      // what the close-up took in
+      const [x0, y0, x1, y1] = partBox;
+      const r = [view.x + x0 * view.scale, view.y + y0 * view.scale, (x1 - x0) * view.scale, (y1 - y0) * view.scale] as const;
+      ctx.save();
+      ctx.lineWidth = 1;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeStyle = "rgb(0 0 0 / 0.6)";
+      ctx.strokeRect(r[0] - 0.5, r[1] - 0.5, r[2] + 1, r[3] + 1);
+      ctx.strokeStyle = "rgb(255 255 255 / 0.9)";
+      ctx.lineDashOffset = 5;
+      ctx.strokeRect(r[0] - 0.5, r[1] - 0.5, r[2] + 1, r[3] + 1);
+      ctx.restore();
+    }
 
     if (comparing) {
       drawCompare(w, h);
@@ -1165,7 +1204,7 @@
       else if (e.key === "PageDown") scrollBy(0, page);
       else {
         const end = e.key === "End";
-        setView({ ...view, x: end ? width - node.width * view.scale : 0, y: end ? height - node.height * view.scale : 0 });
+        setView({ ...view, x: end ? width - dims!.width * view.scale : 0, y: end ? height - dims!.height * view.scale : 0 });
         fitted = false;
       }
       return;
@@ -1223,6 +1262,7 @@
   const tip = $derived.by((): string => {
     if (viewing) return node && madeWith.length ? t(viewing.status === "failed" ? "canvas.jobFailedTip" : "canvas.jobTip") : "";
     if (!node || comparing) return "";
+    if (part) return t("canvas.partTip");
     if (madeWith.length && editing) return t("canvas.madeWithTip");
     if (!editing) return "";
     if (app.tool === "polygon" && (poly || !app.draft.regions.length)) return t(coarse ? "canvas.tipPolygonTouch" : "canvas.tipPolygon");
@@ -1398,7 +1438,10 @@
     {#if altSha && !viewing}
       <button
         aria-pressed={app.showAlt}
-        onclick={() => (app.showAlt = !app.showAlt)}
+        onclick={() => {
+          app.showAlt = !app.showAlt;
+          app.partView = null;
+        }}
         title={usingRaw ? t("canvas.altMergedTitle") : t("canvas.altRawTitle")}
         aria-label={altLabel}
       >
@@ -1544,7 +1587,13 @@
     <footer class="caption">
       <p class="figure">
         <span class="num serif">{fig(version)}</span>
-        <span class="text" title={caption}>{caption}{app.showAlt ? t("canvas.viewingAlt", { alt: altName }) : ""}</span>
+        <span class="text" title={caption}
+          >{caption}{part
+            ? t("canvas.viewingPart", { k: part.part.request + 1, what: part.kind === "raw" ? t("canvas.altRawName") : t("canvas.altMergedName") })
+            : app.showAlt
+              ? t("canvas.viewingAlt", { alt: altName })
+              : ""}</span
+        >
         {#if noteText && !narrow}<span class="footnote" title={noteText}>{t("canvas.notePrefix")}{noteText}</span>{/if}
       </p>
       {#if app.lineage.length > 1 && !narrow}
@@ -1559,6 +1608,9 @@
         </ol>
       {/if}
       <span class="caption-actions">
+        {#if part}
+          <button class="quiet" title={t("canvas.partExitTitle")} onclick={() => (app.partView = null)}>{t("canvas.partExit")}</button>
+        {/if}
         <button
           class="quiet icon"
           class:starred={node.starred}

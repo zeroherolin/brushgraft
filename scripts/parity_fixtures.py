@@ -324,6 +324,41 @@ def paste_cases(out: Path, real: Path | None) -> None:
                       "inside")
     flat.paste((255, 255, 255), mask=Image.fromarray((~shows * 255).astype(np.uint8)))
     record("alpha_sticker", sticker, flat, regions, None)
+    # The object grown past the sticker's edge, with a soft shadow, over the white the model
+    # paints where it is transparent: what it drew there stays, the white goes (keyed)
+    regions = [{"shapes": [{"type": "rect", "x": 470, "y": 300, "w": 140, "h": 150}]}]
+    grown = _fake_edit(sticker.convert("RGB"), imaging.union_mask((640, 480), regions), rng,
+                       "inside")
+    grown.paste((255, 255, 255), mask=Image.fromarray((~shows * 255).astype(np.uint8)))
+    shadow = Image.new("L", (640, 480), 0)
+    ImageDraw.Draw(shadow).ellipse((470, 420, 640, 470), fill=150)
+    grown.paste((40, 40, 40), mask=shadow.filter(ImageFilter.GaussianBlur(8)))
+    ImageDraw.Draw(grown).ellipse((480, 310, 600, 440), fill=(200, 40, 60))
+    record("alpha_backdrop", sticker, grown, regions,
+           imaging.annotate(sticker, [{"shapes": regions[0]["shapes"]}]))
+
+    # Blank paper away from the region: nothing to judge the framing by, so it is aligned (the
+    # model drew the page 3 px to the right, with grain of its own)
+    def paper(word: str, dx: int) -> Image.Image:
+        g = np.random.default_rng(5 + dx).normal(236, 1.2, (900, 640))
+        im = Image.fromarray(np.clip(g, 0, 255).astype(np.uint8)).convert("RGB")
+        ImageDraw.Draw(im).text((260 + dx, 700), word, font=ImageFont.load_default(size=40),
+                                fill=(40, 40, 40))
+        return im
+
+    record("blank_far", paper("2025", 0), paper("2026", 3), [{"shapes": [
+        {"type": "rect", "x": 240, "y": 690, "w": 140, "h": 60}], "instruction": "x"}], None)
+    # Drawn some pixels askew in places, a pattern no scale and shift undoes: fine detail no
+    # longer lines up (correlation 0.45), coarser detail does (0.80)
+    page = scene((900, 600), 31)
+    yy, xx = np.mgrid[0:600, 0:900].astype(np.float64)
+    sx = np.clip(np.rint(xx + 10 * np.sin(yy / 30)), 0, 899).astype(int)
+    sy = np.clip(np.rint(yy + 10 * np.cos(xx / 35)), 0, 599).astype(int)
+    warped = Image.fromarray(np.asarray(page)[sy, sx])
+    regions = [{"shapes": [{"type": "ellipse", "x": 380, "y": 250, "w": 120, "h": 90}],
+                "instruction": "x"}]
+    ImageDraw.Draw(warped).ellipse((385, 255, 495, 335), fill=(30, 90, 200))
+    record("warped", page, warped, regions, None)
 
     for d in sorted(real.iterdir()) if real else []:
         if (d / "output.png").exists():  # as a job's paste-back got it
@@ -347,6 +382,80 @@ def paste_cases(out: Path, real: Path | None) -> None:
         record(f"real_{d.name}", original, result, json.loads((d / "regions.json").read_text()),
                imaging.open_image(annot.read_bytes()) if annot.exists() else None,
                overall=(d / "overall").exists())
+    (out / "cases.json").write_text(json.dumps(cases, indent=1))
+
+
+def parts_cases(out: Path) -> None:
+    """Edits sent in parts (merge_parts): close-ups alone, and with the whole image's output."""
+    out.mkdir(parents=True, exist_ok=True)
+    cases = []
+    rng = np.random.default_rng(23)
+
+    def record(name: str, full: Image.Image, pieces: list[tuple], overall: bool) -> None:
+        d = out / name
+        d.mkdir()
+        full.save(d / "full.png")
+        for k, (_, output, mask, annotated) in enumerate(pieces):
+            output.save(d / f"out{k}.png")
+            mask.save(d / f"mask{k}.png")
+            annotated.save(d / f"annot{k}.png")
+        done = imaging.merge_parts(full, pieces, overall=overall, ask_whole=False)
+        if done["merged"] is not None:
+            done["merged"].save(d / "merged.png")
+            done["raw"].save(d / "raw.png")
+        parts = []
+        for k, p in enumerate(done["parts"]):
+            (rx, ry, *_), raw = p["raw"]
+            raw.save(d / f"part{k}_raw.png")
+            at = None
+            if p["merged"] is not None:
+                (mx, my, *_), merged = p["merged"]
+                merged.save(d / f"part{k}_merged.png")
+                at = [mx, my]
+            parts.append({"raw_at": [rx, ry], "merged_at": at, "note": p["note"]})
+        cases.append({"name": name, "overall": overall, "note": done["note"],
+                      "merged": done["merged"] is not None, "parts": parts,
+                      "boxes": [None if box is None else list(box) for box, *_ in pieces]})
+
+    def close_up(full: Image.Image, regions: list[dict], numbers: list[int],
+                 box: tuple[int, int, int, int], kind: str, glow: bool = False) -> tuple:
+        """A close-up's piece: the model's output at its own size, the mask and annotated copy."""
+        view = full.crop(box)
+        shown = imaging.shift_regions([regions[i] for i in numbers], -box[0], -box[1])
+        mask = imaging.union_mask(view.size, shown)
+        edited = _fake_edit(view, mask, rng, kind)
+        if glow:  # its own take on a change of light, in a corner
+            light = Image.new("L", view.size, 0)
+            w, h = view.size
+            ImageDraw.Draw(light).rectangle((w // 2, h // 2, w, h), fill=120)
+            edited.paste((255, 190, 90), mask=light.filter(ImageFilter.GaussianBlur(20)))
+        size = [int(v) for v in imaging.zoom_size(box).split("x")]
+        return (box, edited.resize(size, Image.Resampling.LANCZOS), mask,
+                imaging.annotate(view, shown, numbers))
+
+    def whole(full: Image.Image, regions: list[dict], kind: str) -> tuple:
+        mask = imaging.union_mask(full.size, regions)
+        out_size = (1536, 1024) if full.width > full.height else (1024, 1536)
+        edited = _fake_edit(full, mask, rng, kind).resize(out_size, Image.Resampling.LANCZOS)
+        return None, edited, mask, imaging.annotate(full, regions)
+
+    full = scene((2400, 1600), 41)
+    small = [{"shapes": [{"type": "rect", "x": 300, "y": 260, "w": 90, "h": 70}]},
+             {"shapes": [{"type": "ellipse", "x": 1900, "y": 1250, "w": 110, "h": 80}]},
+             {"shapes": [{"type": "rect", "x": 20, "y": 1480, "w": 80, "h": 60}]}]
+    plan = imaging.zoom_parts(full.size, [imaging.region_mask(full.size, r["shapes"]).getbbox()
+                                          for r in small])
+    record("close_ups", full, [close_up(full, small, numbers, box, kind) for (box, numbers), kind
+                               in zip(plan, ("inside", "spill", "inside"), strict=True)], False)
+    # a region too large for a close-up: the whole image goes too, with all of them
+    mixed = [small[0], {"shapes": [{"type": "rect", "x": 900, "y": 300, "w": 800, "h": 900}]}]
+    box, _ = imaging.zoom_parts(full.size, [imaging.region_mask(full.size, r["shapes"]).getbbox()
+                                            for r in mixed])[0]
+    record("with_whole", full, [whole(full, mixed, "inside"),
+                                close_up(full, mixed, [0], box, "spill", glow=True)], False)
+    # an overall request: the whole output is used, the close-up put into it near its region
+    record("overall", full, [whole(full, small[:1], "global"),
+                             close_up(full, small, [0], plan[0][0], "global", glow=True)], True)
     (out / "cases.json").write_text(json.dumps(cases, indent=1))
 
 
@@ -508,19 +617,24 @@ def archive_cases(out: Path) -> None:
     project = {"name": "Chairs — ünï", "created_at": 1700000000.5, "updated_at": 1700000100.25}
     nodes = [
         {"id": "aa11", "parent_id": None, "job_id": None, "image": sha[0], "raw_image": None,
-         "merged_image": None, "note": "", "label": "room.png", "starred": True,
+         "merged_image": None, "note": "", "parts": [], "label": "room.png", "starred": True,
          "created_at": 1700000001.0},
         {"id": "bb22", "parent_id": "aa11", "job_id": "j1", "image": sha[1], "raw_image": sha[2],
-         "merged_image": sha[1], "note": "spill_grown", "label": "", "starred": False,
-         "created_at": 1700000050.0},
+         "merged_image": sha[1], "note": "spill_grown",
+         "parts": [{"request": 0, "note": "", "usage": {"total_tokens": 5}, "raw_image": sha[2],
+                    "raw_at": [10, 20], "merged_image": sha[1], "merged_at": [12, 22]},
+                   {"request": 1, "note": "reframed", "usage": None, "raw_image": sha[0],
+                    "raw_at": [0, 0], "merged_image": None, "merged_at": None}],
+         "label": "", "starred": False, "created_at": 1700000050.0},
     ]
     jobs = [{"id": "j1", "parent_id": "aa11", "kind": "edit", "prompt": "", "full_prompt": "x",
              "regions": [region], "refs": ["aa11", "asset:hat1"],
              "ref_images": [sha[0], sha[2]], "model": "gpt-image-2", "size": "1536x1024",
              "n": 1, "composite": True, "mask_image": None, "annot_image": None,
-             "requests": [{"prompt": "x", "box": [10, 20, 30, 40], "size": "1536x1024",
-                           "annot_image": sha[2]},
-                          {"prompt": "x", "box": None, "size": "1536x1024", "annot_image": None}],
+             "requests": [{"prompt": "x", "box": [10, 20, 30, 40], "regions": [0],
+                           "size": "1536x1024", "annot_image": sha[2]},
+                          {"prompt": "x", "box": None, "regions": [0], "size": "1536x1024",
+                           "annot_image": None}],
              "status": "done",
              "done": 1, "failed": 0,
              "errors": [{"code": "network", "detail": "boom", "variant": "1/2"}],
@@ -552,6 +666,7 @@ def main(argv: list[str]) -> int:
     primitives(OUT / "primitives")
     mask_cases(OUT / "masks")
     paste_cases(OUT / "paste", args.real)
+    parts_cases(OUT / "parts")
     rules_cases(OUT / "rules")
     archive_cases(OUT / "archive")
     print(f"wrote {OUT}")

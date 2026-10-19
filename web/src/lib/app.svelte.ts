@@ -194,6 +194,8 @@ class AppState {
   compare = $state(false);
   /** show the version's other image on the canvas (pasted result vs whole output) */
   showAlt = $state(false);
+  /** one request of an edit sent in several, shown on the canvas over the original: its pasted-back result or its output */
+  partView = $state<{ nodeId: string; part: number; kind: "merged" | "raw" } | null>(null);
 
   layout = $state<Layout>("wide");
   treeOpen = $state(false);
@@ -229,6 +231,13 @@ class AppState {
 
   // -- derived --------------------------------------------------------------
   selected = $derived(this.selectedId ? (this.nodes[this.selectedId] ?? null) : null);
+  /** the request shown on the canvas (see partView), while its version is selected */
+  shownPart = $derived.by(() => {
+    const v = this.partView;
+    const node = this.selected;
+    const part = v && node && v.nodeId === node.id ? node.parts[v.part] : null;
+    return part && (v!.kind === "raw" ? part.raw_image : part.merged_image) ? { ...v!, part } : null;
+  });
   /** the job opened from the tree, while it is still there to see (not done, not dismissed) */
   viewedJob = $derived(this.jobId && this.jobs[this.jobId]?.status !== "done" ? (this.jobs[this.jobId] ?? null) : null);
   draftKey = $derived(this.mode === "edit" && this.selectedId ? this.selectedId : NEW_DRAFT);
@@ -389,6 +398,15 @@ class AppState {
   regionColor(index: number): string {
     const colors = this.config?.region_colors ?? ["#ff3b30"];
     return colors[index % colors.length];
+  }
+
+  /** a number's color on a region's color: dark on the light ones (yellow, green), white on the rest */
+  regionInk(index: number): string {
+    const hex = this.regionColor(index);
+    const [r, g, b] = [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16) / 255).map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    // whichever contrasts more: (1.05) / (L + 0.05) for white, (L + 0.05) / 0.05 for near black
+    return 1.05 / (luminance + 0.05) >= (luminance + 0.05) / 0.06 ? "#ffffff" : "#111418";
   }
 
   /** a node's caption: its instructions and request, or the file name of an import */
@@ -640,6 +658,7 @@ class AppState {
     this.selectedId = id;
     this.selectedRegion = -1;
     this.showAlt = false;
+    this.partView = null;
     this.setMode(id ? "edit" : "generate");
     if (this.layout !== "wide") this.treeOpen = false;
   }
@@ -662,6 +681,17 @@ class AppState {
         this.logs[id] = [...stored, ...live].sort((a, b) => a.t - b.t).slice(-LOG_LIMIT);
       })
       .catch(() => {});
+  }
+
+  /** Show (or stop showing) one request's pasted-back result or output on the canvas. */
+  showPart(node: TreeNode, part: number, kind: "merged" | "raw"): void {
+    const v = this.partView;
+    this.partView = v && v.nodeId === node.id && v.part === part && v.kind === kind ? null : { nodeId: node.id, part, kind };
+    if (this.partView) {
+      this.showAlt = false;
+      this.compare = false;
+      if (this.layout === "narrow") this.sheetOpen = false; // the canvas is under the sheet
+    }
   }
 
   /** back from a job to the version it was made from (or to nothing) */
@@ -1188,21 +1218,24 @@ class AppState {
 
   /** Images become versions of the current project; a .zip (an exported project) is imported as a new one. */
   async upload(files: Iterable<File>): Promise<void> {
-    if (!this.projectId) return;
+    // the images go to the project they were dropped on, even if another opens meanwhile (an
+    // archive dropped with them, or a click while they upload)
+    const projectId = this.projectId;
+    if (!projectId) return;
     const all = [...files];
-    const archives = all.filter((f) => /\.zip$/i.test(f.name) || f.type === "application/zip");
-    if (archives.length) await this.importProjects(archives);
+    const images = all.filter((f) => f.type.startsWith("image/"));
     let last: TreeNode | null = null;
-    for (const file of all) {
-      if (!file.type.startsWith("image/")) continue;
+    for (const file of images) {
       try {
-        last = await backend.upload(this.projectId, file);
-        this.nodes[last.id] = last;
+        last = await backend.upload(projectId, file);
+        if (this.projectId === projectId) this.nodes[last.id] = last;
       } catch (e) {
         this.notify(t("toast.uploadFailed", { name: file.name || t("toast.image"), error: errorText(e) }), true);
       }
     }
-    if (last) this.select(last.id);
+    if (last && this.projectId === projectId) this.select(last.id);
+    const archives = all.filter((f) => /\.zip$/i.test(f.name) || f.type === "application/zip");
+    if (archives.length) await this.importProjects(archives);
   }
 
   async deleteNode(node: TreeNode): Promise<void> {
@@ -1237,6 +1270,8 @@ class AppState {
       await backend.deleteJob(job.id);
       delete this.jobs[job.id];
       if (this.jobId === job.id) this.jobId = null;
+      // what it asked for goes with it: it can still be loaded to send again
+      this.notify(t("toast.jobRemoved"), false, { label: t("info.reuse"), run: () => void this.reuseJob(job) });
     } catch (e) {
       if (e instanceof ApiError && e.code === "not_found") delete this.jobs[job.id]; // gone already
       else this.notify(errorText(e), true);
@@ -1249,14 +1284,30 @@ class AppState {
       const updated = await backend.patchNode(node.id, { use_raw: useRaw });
       this.nodes[node.id] = updated;
       this.showAlt = false;
+      this.partView = null;
       // Regions are in image pixels; they no longer fit a different size (nor does their undo
       // history). What was typed for the whole image, and the references, still apply
       const draft = this.drafts[node.id];
       if (draft && (updated.width !== node.width || updated.height !== node.height)) {
+        const [regions, stack] = [draft.regions, this.#stacks[node.id]];
         draft.regions = [];
         this.selectedRegion = -1;
         delete this.#stacks[node.id];
         this.#historyTick++;
+        if (regions.length) {
+          // switching back brings them back: they fit the image they were drawn on
+          this.notify(t("toast.regionsCleared", { n: regions.length }), false, {
+            label: t("toast.undo"),
+            run: () =>
+              void this.useRaw(updated, !useRaw).then(() => {
+                if (this.nodes[node.id]?.image !== node.image) return;
+                (this.drafts[node.id] ??= emptyDraft()).regions = regions;
+                if (stack) this.#stacks[node.id] = stack;
+                this.#historyTick++;
+                this.saveDrafts();
+              }),
+          });
+        }
       }
     } catch (e) {
       this.notify(errorText(e), true);
@@ -1294,19 +1345,38 @@ class AppState {
 
   notify(text: string, error = false, action?: { label: string; run: () => void }): void {
     this.toast = { text, error, action };
+    this.#toastHeld = false;
+    this.#timeToast();
+  }
+
+  #toastHeld = false;
+
+  #timeToast(): void {
     clearTimeout(this.#toastTimer);
-    this.#toastTimer = window.setTimeout(() => {
-      this.toast = null;
-      const next = this.#queued;
-      this.#queued = null;
-      next?.();
-    }, error || action ? 7000 : 3000);
+    if (!this.toast || this.#toastHeld) return;
+    this.#toastTimer = window.setTimeout(() => this.dismissToast(), this.toast.error || this.toast.action ? 7000 : 3000);
+  }
+
+  /** keep the toast while the pointer or the focus is on it (WCAG 2.2.1), and time it again after */
+  holdToast(held: boolean): void {
+    this.#toastHeld = held;
+    this.#timeToast();
+  }
+
+  dismissToast(): void {
+    clearTimeout(this.#toastTimer);
+    this.#toastHeld = false;
+    this.toast = null;
+    const next = this.#queued;
+    this.#queued = null;
+    next?.();
   }
 
   /** run the toast's action and dismiss it */
   toastAction(): void {
-    this.toast?.action?.run();
-    this.toast = null;
+    const run = this.toast?.action?.run;
+    this.dismissToast();
+    run?.();
   }
 }
 

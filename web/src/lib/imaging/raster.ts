@@ -376,6 +376,19 @@ export function toRgba(im: Raster): Raster {
   return out;
 }
 
+/** ``im`` as RGB, over ``backdrop`` where it is transparent (as is when opaque): imaging.on_backdrop. */
+export function onBackdrop(im: Raster, backdrop: readonly [number, number, number]): Raster {
+  if (im.channels !== 4) return toRgb(im);
+  const out = newRaster(im.width, im.height, 3);
+  for (let i = 0, j = 0; j < out.data.length; i += 4, j += 3) {
+    const a = im.data[i + 3];
+    for (let c = 0; c < 3; c++) out.data[j + c] = Math.floor((im.data[i + c] * a + backdrop[c] * (255 - a) + 127) / 255);
+  }
+  return out;
+}
+
+export const WHITE = [255, 255, 255] as const;
+
 /** ``Image.composite(top, bottom, mask)``: Pillow's 8-bit blend, per sample. */
 export function composite(top: Raster, bottom: Raster, mask: Raster): Raster {
   const out = copyRaster(bottom);

@@ -41,12 +41,34 @@ describe("images", () => {
   });
 
   it("removes unreferenced images on collection and keeps referenced ones", async () => {
+    store = new BrowserStore(new IDBFactory(), "t", 0);
     const p = await store.createProject("a");
     const kept = await store.putImage(PNG(1));
     await store.putImage(PNG(2));
     await store.addNode({ projectId: p.id, image: kept.sha });
     expect(await store.collectGarbage()).toBe(1);
     expect((await store.getImage(kept.sha)).width).toBe(11);
+  });
+
+  it("keeps images a version's parts refer to, recent ones, and everything while a job runs", async () => {
+    // what a result being saved stored a moment ago isn't referred to yet: another tab mustn't take it
+    expect(await store.collectGarbage()).toBe(0);
+    await store.putImage(PNG(6));
+    expect(await store.collectGarbage()).toBe(0);
+    store = new BrowserStore(new IDBFactory(), "t", 0);
+    const p = await store.createProject("a");
+    const [img, part] = [await store.putImage(PNG(1)), await store.putImage(PNG(2))];
+    await store.addNode({
+      projectId: p.id, image: img.sha,
+      parts: [{ request: 0, note: "", usage: null, raw_image: part.sha, raw_at: [0, 0], merged_image: null, merged_at: null }],
+    });
+    const orphan = await store.putImage(PNG(3));
+    const job = await store.createJob(jobFor(p.id));
+    expect(await store.collectGarbage()).toBe(0); // a job is under way
+    await store.recordAttempt(job.id, { ok: false });
+    expect(await store.collectGarbage()).toBe(1);
+    expect(await code(store.getImage(orphan.sha))).toBe("not_found");
+    expect((await store.getImage(part.sha)).sha).toBe(part.sha);
   });
 });
 
@@ -203,6 +225,7 @@ describe("the asset library", () => {
   });
 
   it("keeps the image of a deleted asset while a job used it", async () => {
+    store = new BrowserStore(new IDBFactory(), "t", 0);
     const p = await store.createProject("p");
     const a = await store.putImage(PNG(3));
     const hat = await store.addAsset(a.sha, "hat");
