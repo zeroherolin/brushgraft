@@ -2,7 +2,7 @@
 
 import { ApiError } from "../backend/errors";
 import type { Region } from "../types";
-import type { Merged, PartsMerged, Piece, Prepared } from "./ops";
+import type { Merged, PartsMerged, Piece, Prepared, PrepareOptions } from "./ops";
 import type { WorkerReply, WorkerRequest } from "./worker";
 
 type Distribute<T> = T extends unknown ? Omit<T, "id"> : never;
@@ -10,7 +10,9 @@ type Distribute<T> = T extends unknown ? Omit<T, "id"> : never;
 /** What the backend needs done to images; ImageWorker does it off-thread, tests do it in place. */
 export interface ImageOps {
   normalize(data: Uint8Array): Promise<Uint8Array>;
-  prepare(parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], zoom?: boolean): Promise<Prepared>;
+  prepare(parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], options?: PrepareOptions): Promise<Prepared>;
+  /** the overall request's output put on the original's grid, or null with the note (ops.firstBase) */
+  firstBase(parent: Uint8Array, result: Uint8Array, mask: Uint8Array): Promise<Merged>;
   merge(parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean): Promise<Merged>;
   /** ``askWhole`` false: the whole image's request failed, so the close-ups are put back as they can be */
   mergeParts(parent: Uint8Array, pieces: Piece[], overall: boolean, askWhole?: boolean): Promise<PartsMerged>;
@@ -47,8 +49,9 @@ export class ImageWorker implements ImageOps {
   }
 
   normalize = (data: Uint8Array) => this.#send<Uint8Array>({ op: "normalize", data });
-  prepare = (parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], zoom?: boolean) =>
-    this.#send<Prepared>({ op: "prepare", parent, regions, refs, zoom });
+  prepare = (parent: Uint8Array | undefined, regions: Region[], refs: Uint8Array[], options?: PrepareOptions) =>
+    this.#send<Prepared>({ op: "prepare", parent, regions, refs, options });
+  firstBase = (parent: Uint8Array, result: Uint8Array, mask: Uint8Array) => this.#send<Merged>({ op: "firstBase", parent, result, mask });
   merge = (parent: Uint8Array, result: Uint8Array, mask: Uint8Array, annot?: Uint8Array, overall?: boolean) =>
     this.#send<Merged>({ op: "merge", parent, result, mask, annot, overall });
   mergeParts = (parent: Uint8Array, pieces: Piece[], overall: boolean, askWhole?: boolean) =>

@@ -5,13 +5,13 @@
 import { sniff } from "../../imaging/formats";
 import type { ImageOps } from "../../imaging/client";
 import { sameAspect } from "../../imaging/pasteback";
-import type { PartsMerged, PreparedPart } from "../../imaging/ops";
+import type { Merged, PartsMerged, PreparedPart } from "../../imaging/ops";
 import { zoomSize } from "../../imaging/zoom";
 import {
   ASSET_REF, type Job, type JobError, type LogLine, type NodePart, type Region, type SentRequest, type ServerEvent, type Shape, type TreeNode,
 } from "../../types";
 import { ApiError, userError } from "../errors";
-import { charCount, compilePrompt } from "../prompts";
+import { charCount, compilePrompt, overallAppliesToWhole } from "../prompts";
 import { checkSize, fitSize, SIZE_PATTERN } from "../sizes";
 import { spec } from "../spec";
 import type { JobRequest } from "../types";
@@ -38,7 +38,7 @@ const ERROR_LOG: Record<string, string> = {
 };
 const NOTE_LOG: Record<string, string> = {
   [spec.notes.paste_failed]: "Pasting back failed; kept the model's whole output",
-  [spec.notes.overall_change]: "The overall request changed the whole image; using the model's whole output (the pasted-back version is kept)",
+  [spec.notes.overall_change]: "Using the model's whole output, for the overall request (the pasted-back version is kept)",
   [spec.notes.reframed]: "The model redrew the scene (different framing); not pasted back",
   [spec.notes.spill_grown]: "New content went past the region; grew the paste-back area",
   [spec.notes.spill_too_large]: "New content spread too far; pasted back the region only",
@@ -46,7 +46,6 @@ const NOTE_LOG: Record<string, string> = {
   [spec.notes.too_large]: "Too large to paste back in this browser; kept the model's whole output",
 };
 const ASK_LOG: Record<string, string> = {
-  overall: "The overall request changed the whole close-up; sending the whole image as well",
   unusable: "A close-up couldn't be pasted back; sending the whole image as well",
 };
 
@@ -77,7 +76,7 @@ interface Prepared {
   mask?: Uint8Array;
   /** the annotated copy as sent */
   annot?: Uint8Array;
-  /** the user wrote an overall request besides the regions */
+  /** an overall request about the whole image (see overallAppliesToWhole) */
   overall: boolean;
   /**
    * A small edit of a large image goes in parts instead (each variant sends them all): the regions
@@ -86,6 +85,15 @@ interface Prepared {
    */
   parts?: Part[];
   whole?: () => Promise<Part>;
+  /**
+   * With an overall request about the whole image, it goes first, alone, on the whole image, and
+   * ``then`` the regions with instructions, in parts of its output (see #runFirst); with what they need
+   */
+  first?: { prompt: string; images: Uint8Array[] };
+  then?: number[];
+  regions: Region[];
+  refs: Uint8Array[];
+  lang: "en" | "zh";
 }
 
 export interface RunnerDeps {
@@ -231,6 +239,13 @@ export class JobRunner {
     }
     if (!SIZE_PATTERN.test(size)) throw userError("size_format", `Size must look like 1536x1024 or auto, not '${size}'`, { size });
     checkSize(model, size);
+    // the image edited and its annotated copy count too (a close-up's are as many): promptbrush.check_images
+    const own = (parent ? 1 : 0) + (parent && body.regions.length ? 1 : 0);
+    const limit = spec.models.find((m) => m.name === model)?.images;
+    if (limit !== undefined && own + refImages.length > limit) {
+      const most = Math.max(0, limit - own);
+      throw userError("too_many_refs", `${model} takes at most ${most} reference images in this edit`, { model, max: most });
+    }
 
     const regions: Region[] = parent ? body.regions : [];
     const parentBytes = parent ? new Uint8Array((await store.getImage(parent.image)).data) : undefined;
@@ -240,7 +255,8 @@ export class JobRunner {
     // output is wanted, nor for an image too large to paste back in this browser
     const aligned = spec.models.find((m) => m.name === model)?.aligned ?? true;
     const zoom = body.composite && regions.length > 0 && aligned && !!parent && parent.width * parent.height <= MAX_PASTE_PIXELS;
-    const prepared = await this.deps.images.prepare(parentBytes, regions, refBytes, zoom);
+    const overall = overallAppliesToWhole(body.prompt, regions);
+    const prepared = await this.deps.images.prepare(parentBytes, regions, refBytes, { zoom, first: overall });
     const maskSha = prepared.mask ? (await store.putImage(prepared.mask)).sha : null;
     let annotSha = prepared.annot ? (await store.putImage(prepared.annot)).sha : null;
     const parts: Part[] = [];
@@ -256,6 +272,8 @@ export class JobRunner {
       });
     }
     if (parts.length) annotSha = parts[0].annotSha;
+    // the overall request first, alone (no annotated copy), then the regions with instructions
+    const first = prepared.first ? { prompt: compilePrompt(body.prompt, [], { hasParent: true, refCount: refImages.length, lang: body.lang }), images: prepared.images } : undefined;
 
     const job = await store.createJob({
       project_id: body.project_id,
@@ -272,17 +290,22 @@ export class JobRunner {
       composite: body.composite && body.regions.length > 0,
       mask_image: maskSha,
       annot_image: annotSha,
-      requests: parts.map(record),
+      requests: first ? [{ prompt: first.prompt, box: null, regions: [], size, annot_image: null }] : parts.map(record),
       owner: this.deps.owner,
     }, parent?.image);
     let whole: Promise<Part> | null = parts[0]?.box === null ? Promise.resolve(parts[0]) : null;
     const req: Prepared = {
       jobId: job.id, n: body.n, prompt: fullPrompt, model, size, images: prepared.images, apiKey, baseUrl,
       parent: parentBytes, mask: job.composite ? prepared.mask : undefined, annot: prepared.annot,
-      overall: !!job.prompt,
+      overall,
       parts: parts.length ? parts : undefined,
       // the whole image, with every region, as an edit not sent in parts; made once
       whole: () => (whole ??= this.#wholePart(parentBytes!, regions, refBytes, fullPrompt, size)),
+      first,
+      then: first ? regions.flatMap((r, i) => (r.instruction?.trim() ? [i] : [])) : undefined,
+      regions,
+      refs: refBytes,
+      lang: body.lang,
     };
     this.#logs.set(job.id, []);
     this.deps.publish({ type: "job", job });
@@ -292,9 +315,24 @@ export class JobRunner {
   }
 
   async #wholePart(parent: Uint8Array, regions: Region[], refs: Uint8Array[], prompt: string, size: string): Promise<Part> {
-    const p = await this.deps.images.prepare(parent, regions, refs, false);
+    const p = await this.deps.images.prepare(parent, regions, refs);
     const annotSha = (await this.deps.store.putImage(p.annot!)).sha;
     return { box: null, regions: regions.map((_, i) => i), images: p.images, mask: p.mask!, annot: p.annot!, prompt, size, annotSha };
+  }
+
+  /** The requests for the regions ``req.then`` on ``base`` (the overall request's output): close-ups, or with ``wholeOnly`` the whole of it. */
+  async #regionParts(req: Prepared, base: Uint8Array, wholeOnly = false): Promise<Part[]> {
+    const p = await this.deps.images.prepare(base, req.regions, req.refs, { zoom: !wholeOnly, only: req.then });
+    const parts: Part[] = [];
+    for (const part of p.parts ?? []) {
+      parts.push({
+        ...part,
+        prompt: compilePrompt("", part.regions.map((i) => req.regions[i]), { hasParent: true, refCount: req.refs.length, lang: req.lang, numbers: part.regions }),
+        size: part.box ? zoomSize(part.box) : req.size,
+        annotSha: (await this.deps.store.putImage(part.annot)).sha,
+      });
+    }
+    return parts;
   }
 
   #setPending(n: number): void {
@@ -336,7 +374,11 @@ export class JobRunner {
     const log: LogFn = (level, msg) => this.#log(req.jobId, level, tag + msg);
 
     const started = Date.now();
-    const { nodes, err, usage } = req.parts ? await this.#runParts(req, req.parts, variant, log) : await this.#runWhole(req, variant, log);
+    const { nodes, err, usage } = req.first
+      ? await this.#runFirst(req, variant, log)
+      : req.parts
+        ? await this.#runParts(req, req.parts, variant, log)
+        : await this.#runWhole(req, variant, log);
     if (err) log("error", `${ERROR_LOG[err.code]}${err.detail ? `: ${err.detail}` : ""}`);
     else log("ok", `Done in ${((Date.now() - started) / 1000).toFixed(0)}s`);
 
@@ -427,17 +469,79 @@ export class JobRunner {
     return store.addNode({ image: final, rawImage: raw, note: merged.note, ...common });
   }
 
-  /** The parts of an edit, all at once (and the whole image after them if a close-up calls for it), put back together into one version. */
+  /**
+   * The overall request alone on the whole image, then the regions with instructions in close-ups of
+   * its output, pasted back onto it: one version (jobs._run_first). Its output takes the regions only
+   * if it keeps the original's framing; if not, or if none of the regions come back, it is the
+   * version as it is.
+   */
+  async #runFirst(req: Prepared, variant: string, log: LogFn): Promise<{ nodes: TreeNode[]; err: JobError | null; usage: Record<string, number> | null }> {
+    const { store, images } = this.deps;
+    const sent = await this.#sendParts(req, [{ box: null, regions: [], images: req.first!.images, mask: req.mask!, annot: new Uint8Array(), prompt: req.first!.prompt, size: req.size, annotSha: "" }], variant, log);
+    const data = sent.outputs[0];
+    const usage0 = sumUsage(sent.usages);
+    if (!data) return { nodes: [], err: sent.err, usage: usage0 };
+    let based: Merged;
+    try {
+      based = await images.firstBase(req.parent!, data, req.mask!);
+    } catch (e) {
+      // the image is paid for: kept as it came
+      log("warn", `${NOTE_LOG[spec.notes.paste_failed]} (${e instanceof Error ? `${e.name}: ${e.message}` : e})`);
+      based = { image: null, note: spec.notes.paste_failed };
+    }
+    if (!based.image) {
+      const why = NOTE_LOG[based.note] ?? "The output has a different aspect ratio from the original";
+      log("warn", `${why}; the regions can't be put on it, so it is used as it is`);
+      try {
+        return { nodes: [await this.#addNode(req, { image: (await store.putImage(data)).sha, note: based.note })], err: null, usage: usage0 };
+      } catch (e) {
+        return { nodes: [], err: this.#saveError(e, variant), usage: usage0 };
+      }
+    }
+    const base = based.image;
+    let baseSha: string;
+    let parts: Part[];
+    const numbers: number[] = [];
+    try {
+      baseSha = (await store.putImage(base)).sha;
+      log("info", "Sending the regions with instructions, on the overall request's output");
+      parts = await this.#regionParts(req, base);
+      // gone: the project was deleted meanwhile
+      for (const part of parts) numbers.push(await store.addJobRequest(req.jobId, record(part)).catch(() => numbers.length + 1));
+    } catch (e) {
+      return { nodes: [], err: this.#saveError(e, variant), usage: usage0 };
+    }
+    const firstMade: NodePart = { request: 0, note: "", usage: usage0, raw_image: baseSha, raw_at: [0, 0], merged_image: baseSha, merged_at: [0, 0] };
+    let whole: Promise<Part> | null = null;
+    const then: Prepared = { ...req, parent: base, overall: false, parts, first: undefined, whole: () => (whole ??= this.#regionParts(req, base, true).then((p) => p[0])) };
+    const done = await this.#runParts(then, parts, variant, log, numbers, firstMade);
+    const usage = addUsage(usage0, done.usage);
+    if (done.nodes.length) return { ...done, usage };
+    // none of the regions came back: the overall request's output as it is
+    log("warn", NOTE_LOG[spec.notes.part_failed]);
+    try {
+      return { nodes: [await this.#addNode(req, { image: baseSha, note: spec.notes.part_failed })], err: done.err, usage };
+    } catch (e) {
+      return { nodes: [], err: this.#saveError(e, variant), usage };
+    }
+  }
+
+  /**
+   * The parts of an edit, all at once (and the whole image after them if a close-up calls for it), put back together into one version.
+   * ``numbers``: each part's place in the job's requests (by default, from 0); ``first``: what the overall request made, before them.
+   */
   async #runParts(
     req: Prepared,
     planned: Part[],
     variant: string,
     log: LogFn,
+    placed?: number[],
+    first?: NodePart,
   ): Promise<{ nodes: TreeNode[]; err: JobError | null; usage: Record<string, number> | null }> {
     const { store, images } = this.deps;
     let parts = planned;
     // each part's place in the job's requests
-    let numbers = planned.map((_, i) => i);
+    let numbers = placed ?? planned.map((_, i) => i);
     const sent = await this.#sendParts(req, parts, variant, log);
     let { outputs, usages, err } = sent;
     let usage = sumUsage(usages);
@@ -475,7 +579,7 @@ export class JobRunner {
     if (err) done.note = spec.notes.part_failed;
     try {
       const kept = back();
-      const made = await this.#partRecords(done, kept.map((i) => numbers[i]), kept.map((i) => usages[i]));
+      const made = await this.#partRecords(done, kept.map((i) => numbers[i]), kept.map((i) => usages[i]), first);
       return { nodes: [await this.#saveParts(req, done, kept.map((i) => parts[i]), kept.map((i) => outputs[i]!), made, log)], err, usage };
     } catch (e) {
       return { nodes: [], err: this.#saveError(e, variant), usage };
@@ -517,12 +621,12 @@ export class JobRunner {
     return { outputs, usages, err };
   }
 
-  /** What each request made on its own, as a version records it (none for a single request). */
-  async #partRecords(done: PartsMerged, numbers: number[], usages: (Record<string, number> | null)[]): Promise<NodePart[]> {
+  /** What each request made on its own, as a version records it (none for a single request); ``first`` before them. */
+  async #partRecords(done: PartsMerged, numbers: number[], usages: (Record<string, number> | null)[], first?: NodePart): Promise<NodePart[]> {
     const made = done.parts ?? [];
-    if (made.length < 2) return [];
+    if (made.length + (first ? 1 : 0) < 2) return [];
     const { store } = this.deps;
-    const out: NodePart[] = [];
+    const out: NodePart[] = first ? [first] : [];
     for (const [i, p] of made.entries()) {
       out.push({
         request: numbers[i],

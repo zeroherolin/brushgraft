@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import requests
 from PIL import Image
@@ -18,7 +18,7 @@ from brushgraft import imaging
 from brushgraft.config import Settings
 from brushgraft.errors import NotFound, UserError
 from brushgraft.events import EventBus
-from brushgraft.prompts import Lang, compile_prompt
+from brushgraft.prompts import Lang, compile_prompt, overall_applies_to_whole
 from brushgraft.store import (ASSET_REF, NOTE_ASPECT_MISMATCH, NOTE_OVERALL, NOTE_PART_FAILED,
                               NOTE_PASTE_FAILED, NOTE_REFRAMED, NOTE_SPILL_GROWN,
                               NOTE_SPILL_TOO_LARGE, Store, add_usage)
@@ -29,15 +29,15 @@ LOG_LINES_PER_JOB = 200
 @dataclass(frozen=True)
 class _Part:
     """One request of an edit sent in parts: a close-up of some regions, or the whole image
-    with all of them."""
+    with all of them (or, first, with the overall request alone: no regions, no annotated copy)."""
     box: tuple[int, int, int, int] | None  # the close-up; None for the whole image
     regions: tuple[int, ...]       # the regions it shows, by index
     prompt: str
     size: str
     images: tuple[bytes, ...]      # sent in order: what is edited, annotated, references...
     mask: bytes                    # its regions' mask on what is edited (PNG)
-    annot: bytes                   # the annotated image as sent
-    annot_image: str               # ... as stored
+    annot: bytes | None            # the annotated image as sent
+    annot_image: str | None        # ... as stored
 
     def record(self) -> dict:
         """As jobs.requests lists it."""
@@ -75,12 +75,19 @@ class _Request:
     parent: bytes | None           # the original, for pasting back
     mask: bytes | None             # region mask (PNG), for pasting back
     annot: bytes | None            # annotated image as sent, to spot copied marks
-    overall: bool                  # the user wrote an overall request besides the regions
+    overall: bool                  # an overall request about the whole image (see prompts)
     # A small edit of a large image goes in parts instead (each variant sends them all): the
     # regions in close-ups, and the whole image with every region when some are too large for
     # one. ``whole`` makes that part; a close-up may call for it too (see imaging.merge_parts)
     parts: tuple[_Part, ...] = ()
     whole: _Once | None = None
+    # With an overall request about the whole image, ``parts`` is that request alone, on the
+    # whole image, and ``then`` the regions with instructions, sent in parts of its output once
+    # it is back (see _run_first); with what they need
+    then: tuple[int, ...] = ()
+    regions: tuple[dict, ...] = ()
+    refs: tuple[bytes, ...] = ()
+    lang: Lang = "en"
 
 
 # English log lines for job errors and paste-back notes (the UI shows the codes
@@ -96,8 +103,8 @@ _ERROR_LOG = {
     "internal": "Internal error",
 }
 _NOTE_LOG = {
-    NOTE_OVERALL: ("The overall request changed the whole image; using the model's whole "
-                   "output (the pasted-back version is kept)"),
+    NOTE_OVERALL: ("Using the model's whole output, for the overall request (the pasted-back "
+                   "version is kept)"),
     NOTE_PASTE_FAILED: "Pasting back failed; kept the model's whole output",
     NOTE_REFRAMED: "The model redrew the scene (different framing); not pasted back",
     NOTE_SPILL_GROWN: "New content went past the region; grew the paste-back area",
@@ -105,7 +112,6 @@ _NOTE_LOG = {
     NOTE_PART_FAILED: "Some requests failed; their regions are left as they were",
 }
 _ASK_LOG = {
-    "overall": "The overall request changed the whole close-up; sending the whole image as well",
     "unusable": "A close-up couldn't be pasted back; sending the whole image as well",
 }
 
@@ -218,11 +224,21 @@ class JobRunner:
         except ValueError as exc:
             raise UserError("size_invalid", str(exc), detail=str(exc), model=model,
                             size=size) from None
+        # The image edited and its annotated copy count too (a close-up's are as many)
+        own = (1 if parent else 0) + (1 if parent and regions else 0)
+        try:
+            pb.check_images(model, own + len(ref_images))
+        except ValueError:
+            most = pb.MODELS[model].images - own
+            raise UserError("too_many_refs", f"{model} takes at most {most} reference images "
+                            "in this edit", model=model, max=max(0, most)) from None
 
         images: list[bytes] = []
         parent_bytes = mask_bytes = annot_bytes = None
         mask_sha = annot_sha = whole = None
         parts: list[_Part] = []
+        then: tuple[int, ...] = ()
+        overall = overall_applies_to_whole(prompt, regions)
         refs_api = [imaging.for_api(self.store.read_image(sha), imaging.REF_MAX_PIXELS)
                     for sha in ref_images]
         if parent:
@@ -243,7 +259,20 @@ class JobRunner:
                 boxes = [imaging.region_mask(original.size, r["shapes"]).getbbox()
                          for r in regions]
                 plan = imaging.zoom_parts(original.size, boxes)
-            if plan:
+            if plan and overall:
+                # The overall request is about the whole image, which a close-up doesn't show:
+                # it goes first, alone, on the whole image (given the region instructions too, a
+                # model was seen to repeat them on everything that looks the same, and to put them
+                # in the wrong places); then the regions with instructions, in close-ups of its
+                # output (see _run_first)
+                parts.append(_Part(
+                    box=None, regions=(), size=size, mask=mask_bytes, annot=None,
+                    annot_image=None, images=(imaging.for_api(parent_bytes), *refs_api),
+                    prompt=compile_prompt(prompt, [], has_parent=True,
+                                          ref_count=len(ref_images), lang=lang)))
+                then = tuple(i for i, r in enumerate(regions)
+                             if r.get("instruction", "").strip())
+            elif plan:
                 whole = _Once(lambda: self._whole_part(original, regions, full_prompt, size,
                                                        parent_bytes, mask_bytes, refs_api))
                 shown = {i for _, numbers in plan for i in numbers}
@@ -273,8 +302,9 @@ class JobRunner:
                        size=size, images=tuple(images), api_key=api_key,
                        base_url=self.settings.base_url, parent=parent_bytes,
                        mask=mask_bytes if job["composite"] else None,
-                       annot=annot_bytes, overall=bool(job["prompt"]),
-                       parts=tuple(parts), whole=whole)
+                       annot=annot_bytes, overall=overall,
+                       parts=tuple(parts), whole=whole, then=then, regions=tuple(regions),
+                       refs=tuple(refs_api), lang=lang)
         with self._lock:
             self._logs[job["id"]] = deque(maxlen=LOG_LINES_PER_JOB)
         self.bus.publish({"type": "job", "job": job})
@@ -310,6 +340,32 @@ class JobRunner:
                      mask=mask_bytes, annot=annot,
                      annot_image=self.store.put_image(annot)["sha"])
 
+    def _regions_whole(self, base: Image.Image, req: _Request) -> _Part:
+        """The request for the whole of ``base`` with the regions ``req.then``, keeping their
+        numbers and colors: after the overall request, for a region too large for a close-up."""
+        some = [req.regions[i] for i in req.then]
+        annot = imaging.png_bytes(imaging.annotate(base, some, req.then))
+        return _Part(box=None, regions=req.then, size=req.size,
+                     prompt=compile_prompt("", some, has_parent=True, ref_count=len(req.refs),
+                                           lang=req.lang, numbers=req.then),
+                     images=(imaging.for_api(imaging.png_bytes(base)), imaging.for_api(annot),
+                             *req.refs),
+                     mask=imaging.png_bytes(imaging.union_mask(base.size, some)), annot=annot,
+                     annot_image=self.store.put_image(annot)["sha"])
+
+    def _region_parts(self, base: Image.Image, req: _Request) -> list[_Part]:
+        """The requests for the regions ``req.then`` on ``base``: close-ups, and the whole of it
+        for those too large for one."""
+        boxes = [imaging.region_mask(base.size, r["shapes"]).getbbox() if i in req.then
+                 else None for i, r in enumerate(req.regions)]
+        plan = imaging.zoom_parts(base.size, boxes)
+        shown = {i for _, numbers in plan for i in numbers}
+        parts = []
+        if any(b is not None and i not in shown for i, b in enumerate(boxes)):
+            parts.append(self._regions_whole(base, req))
+        return parts + [self._close_up(base, list(req.regions), box, numbers, "", len(req.refs),
+                                       req.lang, list(req.refs)) for box, numbers in plan]
+
     # -- run ----------------------------------------------------------------
     def _run_one(self, req: _Request, k: int) -> None:
         with self._lock:
@@ -331,7 +387,8 @@ class JobRunner:
 
         started = time.monotonic()
         with pb.log_sink(sink):
-            run = self._run_parts if req.parts else self._run_whole
+            run = (self._run_first if req.then else self._run_parts if req.parts
+                   else self._run_whole)
             try:
                 nodes, error, usage = run(req, variant, sink)
             except Exception as exc:  # a bug, or the disk: the job must still settle
@@ -423,13 +480,70 @@ class JobRunner:
         return self.store.add_node(image=final, raw_image=raw, note=note,
                                    **common)
 
-    def _run_parts(self, req: _Request, variant: str, sink: Callable[[str, str], None]
+    def _run_first(self, req: _Request, variant: str, sink: Callable[[str, str], None]
+                   ) -> tuple[list[dict], dict | None, dict | None]:
+        """The overall request alone on the whole image, then the regions with instructions in
+        close-ups of its output (see _region_parts), pasted back onto it: one version. Its
+        output takes the regions where they are on the original: it needn't keep the original's
+        framing to the pixel (a restyle moves things a little), only its proportions. Of
+        another shape, or when none of the regions come back, it is the version as it is."""
+        (first,) = req.parts
+        outputs, usages, error = self._send_parts(req, [first], variant, sink)
+        usage = _total(usages)
+        if outputs[0] is None:
+            return [], error, usage
+        job = self.store.get_job(req.job_id)
+        common = {"project_id": job["project_id"], "parent_id": job["parent_id"],
+                  "job_id": job["id"]}
+        data = outputs[0]
+        try:
+            original = imaging.open_image(req.parent)
+            output = imaging.open_image(data)
+            mask = imaging.open_image(req.mask)
+            note, base = NOTE_ASPECT_MISMATCH, None
+            if imaging.same_aspect(original.size, output.size):
+                base, note = imaging.register(original, output.convert("RGB"), mask), ""
+        except Exception as exc:  # the image is paid for: kept as it came
+            pb.log("warn", f"{_NOTE_LOG[NOTE_PASTE_FAILED]} ({type(exc).__name__}: {exc})")
+            note, base = NOTE_PASTE_FAILED, None
+        if note:
+            why = _NOTE_LOG.get(note, "The output has a different aspect ratio from the original")
+            pb.log("warn", f"{why}; the regions can't be put on it, so it is used as it is")
+            return [self.store.add_node(image=self.store.put_image(data)["sha"], note=note,
+                                        **common)], None, usage
+        base_bytes = imaging.png_bytes(base)
+        base_sha = self.store.put_image(base_bytes)["sha"]
+        first_made = {"request": 0, "note": "", "usage": _total(usages), "raw_image": base_sha,
+                      "raw_at": [0, 0], "merged_image": base_sha, "merged_at": [0, 0]}
+        pb.log("info", "Sending the regions with instructions, on the overall request's output")
+        parts = self._region_parts(base, req)
+        numbers = []
+        for part in parts:
+            try:
+                numbers.append(self.store.add_job_request(req.job_id, part.record()))
+            except NotFound:  # the project was deleted meanwhile
+                numbers.append(len(numbers) + 1)
+        some = [req.regions[i] for i in req.then]
+        then = replace(req, parent=base_bytes, overall=False, parts=tuple(parts),
+                       mask=imaging.png_bytes(imaging.union_mask(base.size, some)), then=(),
+                       whole=_Once(lambda: self._regions_whole(base, req)))
+        nodes, error, more = self._run_parts(then, variant, sink, numbers, first_made)
+        usage = add_usage(usage, more)
+        if not nodes:  # none of the regions came back: the overall request's output as it is
+            pb.log("warn", _NOTE_LOG[NOTE_PART_FAILED])
+            nodes = [self.store.add_node(image=base_sha, note=NOTE_PART_FAILED, **common)]
+        return nodes, error, usage
+
+    def _run_parts(self, req: _Request, variant: str, sink: Callable[[str, str], None],
+                   numbers: Sequence[int] | None = None, first: dict | None = None
                    ) -> tuple[list[dict], dict | None, dict | None]:
         """The parts of an edit, all at once (and the whole image after them if a close-up
         calls for it), put back together into one version. When some fail, the others (paid
-        for) still make the version, with their regions only, and the error is recorded."""
+        for) still make the version, with their regions only, and the error is recorded.
+        ``numbers``: each part's place in jobs.requests (by default, from 0); ``first``: what
+        the overall request made, before them (see _run_first), as nodes.parts records it."""
         parts = list(req.parts)
-        numbers = list(range(len(parts)))  # each part's place in jobs.requests
+        numbers = list(numbers) if numbers is not None else list(range(len(parts)))
         outputs, usages, error = self._send_parts(req, parts, variant, sink)
         usage = _total(usages)
         if not any(outputs):
@@ -461,7 +575,8 @@ class JobRunner:
         if error:
             done["note"] = NOTE_PART_FAILED
         try:
-            return [self._save_parts(req, done, parts, outputs, numbers, usages)], error, usage
+            node = self._save_parts(req, done, parts, outputs, numbers, usages, first)
+            return [node], error, usage
         except Exception as exc:
             return [], _error("save_failed", f"{type(exc).__name__}: {exc}", variant), usage
 
@@ -501,7 +616,7 @@ class JobRunner:
 
     def _save_parts(self, req: _Request, done: dict, parts: Sequence[_Part],
                     outputs: Sequence[bytes | None], numbers: Sequence[int],
-                    usages: Sequence[dict | None]) -> dict:
+                    usages: Sequence[dict | None], first: dict | None = None) -> dict:
         # the parts that came back, as merge_parts saw them
         back = [i for i, o in enumerate(outputs) if o is not None]
         parts, outputs = [parts[i] for i in back], [outputs[i] for i in back]
@@ -509,7 +624,7 @@ class JobRunner:
         job = self.store.get_job(req.job_id)
         common = {"project_id": job["project_id"], "parent_id": job["parent_id"],
                   "job_id": job["id"],
-                  "parts": self._part_records(done["parts"], numbers, usages)}
+                  "parts": self._part_records(done["parts"], numbers, usages, first)}
         note = done["note"]
         if done["merged"] is None:  # the whole image's output can't be pasted back: use it
             data = next(o for p, o in zip(parts, outputs, strict=True) if p.box is None)
@@ -530,9 +645,10 @@ class JobRunner:
         return self.store.add_node(image=final, raw_image=raw, note=note, **common)
 
     def _part_records(self, made: Sequence[dict], numbers: Sequence[int],
-                      usages: Sequence[dict | None]) -> list[dict]:
-        """What each request made on its own, as nodes.parts records it (see Store.add_node)."""
-        if len(made) < 2:  # one request: the version is what it made
+                      usages: Sequence[dict | None], first: dict | None = None) -> list[dict]:
+        """What each request made on its own, as nodes.parts records it (see Store.add_node);
+        ``first`` before them."""
+        if len(made) + bool(first) < 2:  # one request: the version is what it made
             return []
 
         def stored(placed: tuple | None) -> tuple:
@@ -541,7 +657,7 @@ class JobRunner:
             (x0, y0, *_), im = placed
             return self.store.put_image(imaging.png_bytes(im))["sha"], [x0, y0]
 
-        records = []
+        records = [first] if first else []
         for k, part, usage in zip(numbers, made, usages, strict=True):
             raw, raw_at = stored(part["raw"])
             merged, merged_at = stored(part["merged"])

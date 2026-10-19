@@ -350,9 +350,17 @@ class AppState {
   }
 
   /** why the current draft can't be sent yet; the button and the shortcut share this */
-  blocker = $derived.by((): "model" | "empty" | "instruction" | "tooLong" | null => {
+  /** the reference images the model in use takes with this draft (the image edited and its annotated copy count too) */
+  maxRefs = $derived.by(() => {
+    const limit = this.modelInfo(this.model)?.images ?? Infinity;
+    const editing = this.mode === "edit" && !!this.selected;
+    return Math.max(0, limit - (editing ? 1 : 0) - (editing && this.draft.regions.length ? 1 : 0));
+  });
+
+  blocker = $derived.by((): "model" | "empty" | "instruction" | "tooLong" | "refs" | null => {
     const d = this.draft;
     if (!this.model.trim()) return "model";
+    if (d.refs.length > this.maxRefs) return "refs";
     if (!d.prompt.trim() && !d.regions.length) return "empty";
     if (!d.prompt.trim() && d.regions.some((r) => !r.instruction.trim())) return "instruction";
     if (charCount(d.prompt.trim()) > spec.max_prompt || d.regions.some((r) => charCount(r.instruction.trim()) > spec.max_instruction)) {

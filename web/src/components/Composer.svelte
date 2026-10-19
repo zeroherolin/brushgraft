@@ -41,7 +41,9 @@
           ? t("composer.hintInstruction")
           : app.blocker === "tooLong"
             ? t("composer.hintTooLong")
-            : "",
+            : app.blocker === "refs"
+              ? t("composer.hintRefs", { model: app.model, max: app.maxRefs })
+              : "",
   );
 
   // A field's length against its limit: shown from 80% on (nobody needs a counter for a sentence),

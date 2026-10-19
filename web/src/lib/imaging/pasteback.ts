@@ -741,7 +741,8 @@ function growArea(
 /**
  * Whether ``result`` keeps the original's framing: detail away from the region still lines up,
  * fine or a few times coarser (a model's few pixels askew in places pass, a reframed output
- * doesn't). Only grain away from the region: nothing to judge by, aligned. imaging.aligned.
+ * doesn't), either sign (light turned dark). Only grain away from the region: nothing to judge
+ * by, aligned. imaging.aligned.
  */
 export function aligned(original: Raster, result: Raster, mask: Raster): boolean {
   const scale = scaleFor(original.width, original.height);
@@ -767,7 +768,7 @@ export function aligned(original: Raster, result: Raster, mask: Raster): boolean
       bb += b[i] * b[i];
     }
     const norm = Math.sqrt(aa * bb);
-    return norm === 0 ? 1 : ab / norm;
+    return norm === 0 ? 1 : Math.abs(ab) / norm; // light turned dark (a dark theme): edges in place, sign turned
   };
   const a = detail(g[0], 0, 3);
   let energy = 0;
@@ -970,20 +971,6 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
   const scale = scaleFor(width, height);
   const seed = smallBits(mask, scale);
   const { w, h } = seed;
-  // An overall request that changed much of the image far from the regions (a new sky): the
-  // whole output is what was asked for. Judged before the tone drift is undone: a change of
-  // light or color (a winter day, dusk) is mostly such a shift
-  let changedOverall = false;
-  if (overall) {
-    const far = farFrom(original, seed, scale);
-    const nFar = count(far);
-    if (nFar >= 0.05 * far.d.length) {
-      const asIs = changeMap(original, result, scale);
-      let changed = 0;
-      for (let i = 0; i < asIs.length; i++) if (far.d[i] && asIs[i] > K.overall_delta) changed++;
-      changedOverall = changed / nFar > K.overall_share;
-    }
-  }
   const toned = matchTone(original, result, mask);
   // Where the original is transparent the model painted a backdrop: compared over it, only what it
   // drew there counts as change
@@ -1043,7 +1030,8 @@ export function pasteWeights(original: Raster, result: Raster, mask: Raster, ann
 
   const res = backdrop ? keyed(original, toned, backdrop) : original.channels === 4 ? toRgba(toned) : toRgb(toned);
   const box = bbox(areaImg);
-  const note = changedOverall ? NOTE.overall_change : grown.note;
+  // an overall request about the whole image: its whole output is what was asked for (imaging.paste_back)
+  const note = overall ? NOTE.overall_change : grown.note;
   if (!box) return { toned: res, soft: null, x0: 0, y0: 0, note };
   // Blurs reach a bounded distance, so work on the box around the area plus that much (and the
   // whole pieces' box): the result is the same as blurring the whole image, at a fraction of the cost

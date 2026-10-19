@@ -359,6 +359,18 @@ def paste_cases(out: Path, real: Path | None) -> None:
                 "instruction": "x"}]
     ImageDraw.Draw(warped).ellipse((385, 255, 495, 335), fill=(30, 90, 200))
     record("warped", page, warped, regions, None)
+    # Identical cells 18 px apart, the model's output drawn 3 px right and 2 px up: a copy one
+    # cell off matches as well as the right place (_repeats)
+    cells = Image.new("RGB", (1200, 800), (245, 245, 240))
+    d = ImageDraw.Draw(cells)
+    for y in range(0, 800, 18):
+        for x in range(0, 1200, 18):
+            d.rounded_rectangle((x + 3, y + 3, x + 15, y + 15), 4, fill=(160, 210, 150),
+                                outline=(60, 120, 60), width=2)
+    moved = Image.fromarray(np.roll(np.roll(np.asarray(cells), -2, 0), 3, 1))
+    ImageDraw.Draw(moved).rectangle((597, 394, 621, 418), fill=(200, 40, 40))
+    record("repeated_cells", cells, moved, [{"shapes": [
+        {"type": "rect", "x": 594, "y": 396, "w": 24, "h": 24}], "instruction": "x"}], None)
 
     for d in sorted(real.iterdir()) if real else []:
         if (d / "output.png").exists():  # as a job's paste-back got it

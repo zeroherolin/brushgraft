@@ -29,6 +29,13 @@ function checked(full: string): string {
   return full;
 }
 
+/**
+ * Whether the overall request is about the whole image: when some region has an instruction of its
+ * own. When none has, it is what the regions are to become (prompts.overall_applies_to_whole).
+ */
+export const overallAppliesToWhole = (prompt: string, regions: Pick<Region, "instruction">[]): boolean =>
+  !!prompt.trim() && regions.some((r) => !!(r.instruction ?? "").trim());
+
 export function compilePrompt(
   promptIn: string,
   regions: Pick<Region, "instruction">[],
@@ -36,9 +43,9 @@ export function compilePrompt(
   // close-up): it keeps its number and color, as in annotate
   opts: { hasParent: boolean; refCount?: number; lang?: "en" | "zh"; numbers?: number[] },
 ): string {
-  const prompt = promptIn.trim();
+  let prompt = promptIn.trim();
   const refCount = opts.refCount ?? 0;
-  const instructions = regions.map((r) => (r.instruction ?? "").trim());
+  let instructions = regions.map((r) => (r.instruction ?? "").trim());
   const max = spec.max_regions;
   if (regions.length && !opts.hasParent) {
     throw userError("regions_need_parent", "Regions can only be used when editing an existing image");
@@ -64,14 +71,20 @@ export function compilePrompt(
   });
 
   const text = spec.prompt.text[opts.lang ?? "en"];
-  const refs = Array.from({ length: refCount }, (_, k) => fill(text.ref, { k: k + 1 })).join(text.sep);
-  if (!opts.hasParent) return refCount ? `${fill(text.gen_refs, { refs })}\n${prompt}` : prompt;
-  if (!regions.length) return refCount ? `${fill(text.edit_refs, { refs })}\n${prompt}` : prompt;
+  /** which image each reference is, the first being image ``first`` */
+  const refs = (first: number) => Array.from({ length: refCount }, (_, k) => fill(text.ref, { n: first + k, k: k + 1 })).join(text.sep);
+  if (!opts.hasParent) return refCount ? `${fill(text.gen_refs, { refs: refs(1) })}\n${prompt}` : prompt;
+  if (!regions.length) return refCount ? `${fill(text.edit_refs, { refs: refs(2) })}\n${prompt}` : prompt;
 
   const lines = [text.intro];
-  if (refCount) lines.push(fill(text.region_refs, { refs }));
+  if (refCount) lines.push(fill(text.region_refs, { refs: refs(3) }));
   lines.push(text.lead);
   const colors = spec.prompt.colors[opts.lang ?? "en"];
+  if (!instructions.some(Boolean)) {
+    // the overall request is what the regions are to become
+    instructions = instructions.map(() => prompt);
+    prompt = "";
+  }
   instructions.forEach((instruction, i) => {
     const k = opts.numbers ? opts.numbers[i] : i;
     lines.push(

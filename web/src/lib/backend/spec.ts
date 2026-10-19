@@ -113,8 +113,6 @@ export interface Spec {
     tone_keep: number;
     api_max_bytes: number;
     ref_max_pixels: number;
-    overall_delta: number;
-    overall_share: number;
     register_coarse: number;
     register_reach: number;
     register_tile: number;
@@ -122,6 +120,9 @@ export interface Spec {
     register_min_shift: number;
     register_max_spread: number;
     register_near: number;
+    /** a patch of a repeated pattern tells nothing along the axis it repeats: see imaging._repeats */
+    repeat_min_step: number;
+    repeat_dip: number;
     piece_blur: number;
     piece_weak: number;
     piece_core: number;

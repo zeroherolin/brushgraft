@@ -67,16 +67,17 @@ export function registerFit(original: Raster, result: Raster, mask: Raster): [[n
   let ys: Reading[] = [];
   const center = (coarseTile * q) / 2;
   const coarse = ssdSearch(ac, bc, tiles, coarseTile, null, reach);
+  const coarseOwn = ssdSearch(ac, ac, tiles, coarseTile, null, reach);
   tiles.forEach(([x, y], i) => {
-    for (const [axis, offset] of readings(coarse[i], reach, coarseTile, false)) {
+    for (const [axis, offset] of readings(coarse[i], reach, coarseTile, false, coarseOwn[i])) {
       const at: Point = [x * q + center, y * q + center];
       (axis === 0 ? xs : ys).push({ at, coord: (axis === 0 ? x : y) * q + center, offset: offset * q });
     }
   });
-  // (whole steps of q pixels: they scatter by up to q around the fit)
-  const fx = lineFit(xs, w, q);
-  const fy = lineFit(ys, h, q);
-  if (!fx || !fy) return null;
+  // (whole steps of q pixels: they scatter by up to q around the fit). An axis this can't tell (a
+  // pattern repeated all over) is searched at full size around no offset: models draw a few pixels off
+  const fx = lineFit(xs, w, q) ?? [0, 0];
+  const fy = lineFit(ys, h, q) ?? [0, 0];
 
   // 2. At full size, lightly blurred, around that, to a fraction of a pixel
   const af = gaussianBlur(a, 1);
@@ -87,10 +88,11 @@ export function registerFit(original: Raster, result: Raster, mask: Raster): [[n
   const half = tile / 2;
   const guesses = tiles.map(([x, y]) => [round(fx[0] * (x + half) + fx[1]), round(fy[0] * (y + half) + fy[1])] as Point);
   const fine = ssdSearch(af, bf, tiles, tile, guesses, reach);
+  const fineOwn = ssdSearch(af, af, tiles, tile, null, reach);
   xs = [];
   ys = [];
   tiles.forEach(([x, y], i) => {
-    for (const [axis, offset] of readings(fine[i], reach, tile, true)) {
+    for (const [axis, offset] of readings(fine[i], reach, tile, true, fineOwn[i])) {
       (axis === 0 ? xs : ys).push({ at: [x + half, y + half], coord: (axis === 0 ? x : y) + half, offset: guesses[i][axis] + offset });
     }
   });
@@ -181,8 +183,11 @@ function ssdSearch(a: Raster, b: Raster, tiles: Point[], tile: number, guesses: 
   });
 }
 
-/** The offsets a tile's search tells, as [axis, offset] (imaging._readings). */
-function readings(ssd: Float64Array | null, reach: number, tile: number, subpixel: boolean): [0 | 1, number][] {
+/**
+ * The offsets a tile's search tells, as [axis, offset] (imaging._readings); none along an axis
+ * where the tile repeats (``own``: its search against the original itself, see repeats).
+ */
+function readings(ssd: Float64Array | null, reach: number, tile: number, subpixel: boolean, own: Float64Array | null = null): [0 | 1, number][] {
   if (!ssd) return [];
   const span = 2 * reach + 1;
   let best = 0;
@@ -190,14 +195,40 @@ function readings(ssd: Float64Array | null, reach: number, tile: number, subpixe
   const dy = Math.floor(best / span);
   const dx = best - dy * span;
   const s0 = ssd[best];
+  const repeated = own ? repeats(own, reach, 2 * s0 + 4 * tile * tile) : [false, false];
   const out: [0 | 1, number][] = [];
   for (const [axis, at] of [[0, dx], [1, dy]] as const) {
+    if (repeated[axis]) continue; // a copy one period off matches about as well
     if (!(at > 0 && at < span - 1)) continue; // the best match is at the edge of the search
     const minus = axis === 0 ? ssd[dy * span + dx - 1] : ssd[(dy - 1) * span + dx];
     const plus = axis === 0 ? ssd[dy * span + dx + 1] : ssd[(dy + 1) * span + dx];
     const curve = minus - 2 * s0 + plus;
     if (curve < 4 * tile * tile) continue; // flat along this axis
     out.push([axis, at - reach + (subpixel ? (0.5 * (minus - plus)) / curve : 0)]);
+  }
+  return out;
+}
+
+/**
+ * Along which axes [x, y] a tile matches itself repeat_min_step steps off or more, at a dip of
+ * ``own`` (lower than all eight around it, inside the search) about as well as it matches: within
+ * ``limit``, or repeat_dip of its middle value (imaging._repeats).
+ */
+function repeats(own: Float64Array, reach: number, limit: number): [boolean, boolean] {
+  const span = 2 * reach + 1;
+  const middle = own.slice().sort()[own.length >> 1];
+  const out: [boolean, boolean] = [false, false];
+  for (let y = 1; y < span - 1; y++) {
+    for (let x = 1; x < span - 1; x++) {
+      if (Math.max(Math.abs(x - reach), Math.abs(y - reach)) < K.repeat_min_step) continue;
+      const v = own[y * span + x];
+      if (!(v <= limit || v <= K.repeat_dip * middle)) continue;
+      let dip = true;
+      for (let j = -1; j <= 1 && dip; j++) for (let i = -1; i <= 1; i++) if ((i || j) && own[(y + j) * span + x + i] <= v) dip = false;
+      if (!dip) continue;
+      if (x !== reach) out[0] = true;
+      if (y !== reach) out[1] = true;
+    }
   }
   return out;
 }

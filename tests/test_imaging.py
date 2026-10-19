@@ -617,6 +617,24 @@ class TestRegister:
         assert imaging.registration_box(page, page.copy(), mask) is None
         assert imaging.register(page, page.copy(), mask).tobytes() == page.tobytes()
 
+    def test_a_repeated_pattern_is_not_matched_a_period_off(self):
+        # identical cells 18 px apart (a diagram, a table): a copy one cell off matches as well
+        # as the right place, and on the coarse search's steps often better. Measured before:
+        # an output not off at all was put 18 px up and left
+        size, period = (1200, 800), 18
+        base = Image.new("RGB", size, (245, 245, 240))
+        d = ImageDraw.Draw(base)
+        for y in range(0, size[1], period):
+            for x in range(0, size[0], period):
+                d.rounded_rectangle((x + 3, y + 3, x + period - 3, y + period - 3), 4,
+                                    fill=(160, 210, 150), outline=(60, 120, 60), width=2)
+        mask = imaging.region_mask(size, [{"type": "rect", "x": 600, "y": 400, "w": 18, "h": 18}])
+        for dx, dy in ((3, -2), (0, 0), (-2, 1)):
+            out = Image.fromarray(np.roll(np.roll(np.asarray(base), dy, 0), dx, 1))
+            (kx, tx), (ky, ty) = imaging._register_fit(base, out, mask)
+            assert abs(kx) < 1e-4 and abs(ky) < 1e-4
+            assert (round(tx, 1), round(ty, 1)) == (dx, dy)
+
     def test_an_unrelated_output_is_only_resized(self):
         page = text_page()
         mask = imaging.union_mask(page.size, self.REGION)

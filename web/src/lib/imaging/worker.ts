@@ -2,12 +2,13 @@
 // sent to the model and pasting the result back take a second or two on large images.
 
 import { browserCodec } from "./browser-codec";
-import { forApi, merge, mergeParts, normalizeUpload, placeParts, prepare, thumbnail, type Piece } from "./ops";
+import { firstBase, forApi, merge, mergeParts, normalizeUpload, placeParts, prepare, thumbnail, type Piece, type PrepareOptions } from "./ops";
 import type { Region } from "../types";
 
 export type WorkerRequest =
   | { id: number; op: "normalize"; data: Uint8Array }
-  | { id: number; op: "prepare"; parent?: Uint8Array; regions: Region[]; refs: Uint8Array[]; zoom?: boolean }
+  | { id: number; op: "prepare"; parent?: Uint8Array; regions: Region[]; refs: Uint8Array[]; options?: PrepareOptions }
+  | { id: number; op: "firstBase"; parent: Uint8Array; result: Uint8Array; mask: Uint8Array }
   | { id: number; op: "merge"; parent: Uint8Array; result: Uint8Array; mask: Uint8Array; annot?: Uint8Array; overall?: boolean }
   | { id: number; op: "mergeParts"; parent: Uint8Array; pieces: Piece[]; overall: boolean; askWhole?: boolean }
   | { id: number; op: "placeParts"; parent: Uint8Array; pieces: Pick<Piece, "box" | "result">[] }
@@ -25,8 +26,12 @@ async function run(req: WorkerRequest): Promise<{ value: unknown; transfer: Arra
       return { value: bytes, transfer: [bytes.buffer as ArrayBuffer] };
     }
     case "prepare": {
-      const out = await prepare(browserCodec, { parent: req.parent, regions: req.regions, refs: req.refs, zoom: req.zoom });
+      const out = await prepare(browserCodec, { parent: req.parent, regions: req.regions, refs: req.refs, ...req.options });
       return { value: out, transfer: [] };
+    }
+    case "firstBase": {
+      const out = await firstBase(browserCodec, req);
+      return { value: out, transfer: out.image ? [out.image.buffer as ArrayBuffer] : [] };
     }
     case "merge": {
       const out = await merge(browserCodec, req);

@@ -370,59 +370,97 @@ class TestJobs:
         assert merged.getpixel((260, 245)) == (255, 255, 255)  # the request that came back
         assert merged.getpixel((2060, 1345)) == original.getpixel((2060, 1345))  # left as it was
 
-    def test_an_overall_request_goes_with_the_close_up(self, client, project, fake_api):
-        root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
-        region = {"shapes": [{"type": "rect", "x": 1800, "y": 300, "w": 120, "h": 90}],
-                  "instruction": "a red teapot"}
-        zoom = imaging.zoom_box((2400, 1600), imaging.union_mask((2400, 1600), [region]).getbbox())
-        fake_api.respond = drawing_model([zoom], [(1810, 310, 1910, 380)])
-        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
-                      prompt="keep the lighting", model="gpt-image-2.5-flare")
-        job = wait_job(client, project["id"], resp.json()["id"])
-        (call,) = fake_api.calls  # it changed nothing beyond the region: one request is enough
-        assert Image.open(io.BytesIO(call["images"][0])).size == (941, 628)
-        assert "Overall: keep the lighting" in call["prompt"]
-        (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
-                   .json()["nodes"] if n["parent_id"] == root["id"]]
-        assert node["note"] != "overall_change" and len(job["requests"]) == 1
-
-    def test_an_overall_change_in_a_close_up_sends_the_whole_image_as_well(
+    def test_an_overall_request_goes_first_then_the_regions_in_close_ups_of_its_output(
             self, client, project, fake_api):
+        # "make the sky overcast" is about the whole image: it goes alone, then the region's
+        # instruction in a close-up of what came back, put onto it
         root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
         region = {"shapes": [{"type": "rect", "x": 1800, "y": 300, "w": 120, "h": 90}],
                   "instruction": "a red teapot"}
         zoom = imaging.zoom_box((2400, 1600), imaging.union_mask((2400, 1600), [region]).getbbox())
-        fake_api.respond = drawing_model([zoom], [(1810, 310, 1910, 380)], overcast=True)
+        overcast = drawing_model([], [], overcast=True)
+        teapot = drawing_model([zoom], [(1810, 310, 1910, 380)])
+        fake_api.respond = lambda call: (teapot if call["prompt"] != "make the sky overcast"
+                                         else overcast)(call)
         resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
                       prompt="make the sky overcast", model="gpt-image-2.5-flare")
         job = wait_job(client, project["id"], resp.json()["id"])
         assert (job["status"], job["usage"]) == ("done", {"total_tokens": 20}), job["errors"]
-        close_up, whole = fake_api.calls
-        assert Image.open(io.BytesIO(whole["images"][0])).size == (2400, 1600)
-        assert whole["prompt"] == close_up["prompt"] == job["full_prompt"]
-        assert [r["box"] for r in job["requests"]] == [list(zoom), None]
-        logs = client.get(f"/api/jobs/{job['id']}/logs").json()
-        assert any("sending the whole image as well" in line["msg"] for line in logs)
+        first, close_up = fake_api.calls  # one after the other
+        assert len(first["images"]) == 1  # no annotated copy: no regions
+        assert Image.open(io.BytesIO(first["images"][0])).size == (2400, 1600)
+        assert "Area 1 (red): a red teapot" in close_up["prompt"]
+        assert "Overall" not in close_up["prompt"]
+        # the close-up is cut from the first output: grey-blue already
+        sent = Image.open(io.BytesIO(close_up["images"][0])).convert("RGB")
+        assert sent.size == (941, 628) and abs(sent.getpixel((20, 20))[2]
+                                               - sent.getpixel((20, 20))[0]) > 20
+        assert [(r["box"], r["regions"], r["annot_image"] is None) for r in job["requests"]] \
+            == [(None, [], True), (list(zoom), [0], False)]
         (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
                    .json()["nodes"] if n["parent_id"] == root["id"]]
-        close, whole = node["parts"]
-        assert (close["request"], close["note"], whole["request"]) == (0, "overall_change", 1)
-        assert whole["raw_at"] == [0, 0] and image(client, whole["raw_image"]).size == (2400, 1600)
+        assert node["note"] == ""
+        assert [(p["request"], p["raw_at"]) for p in node["parts"]] == [(0, [0, 0]),
+                                                                       (1, list(zoom[:2]))]
+        made, original = image(client, node["image"]), image(client, root["image"])
+        far = (300, 1400)
+        assert sum(abs(a - b) for a, b in zip(made.getpixel(far), original.getpixel(far),
+                                              strict=True)) > 60  # overcast everywhere
+        assert min(made.getpixel((1860, 345))) > 230  # with the region's object
+        assert made.getpixel(far) == image(client, node["parts"][0]["raw_image"]).getpixel(far)
 
+    def test_an_overall_request_answered_in_another_shape_is_the_version_as_it_is(
+            self, client, project, fake_api):
+        # a square for a 3:2 image: the regions can't be put on it, so they aren't sent
+        root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
+        region = {"shapes": [{"type": "rect", "x": 1800, "y": 300, "w": 120, "h": 90}],
+                  "instruction": "a red teapot"}
+        fake_api.respond = lambda call: pb.Generation([noise_png((1024, 1024), seed=5)], None, 1)
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
+                      prompt="make the sky overcast", model="gpt-image-2.5-flare")
+        job = wait_job(client, project["id"], resp.json()["id"])
+        assert job["status"] == "done" and len(fake_api.calls) == 1
+        (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
+                   .json()["nodes"] if n["parent_id"] == root["id"]]
+        assert node["note"] == "aspect_mismatch" and (node["width"], node["height"]) == (1024, 1024)
+        logs = client.get(f"/api/jobs/{job['id']}/logs").json()
+        assert any("the regions can't be put on it" in line["msg"] for line in logs)
+
+    def test_without_region_instructions_the_overall_request_is_the_regions(
+            self, client, project, fake_api):
+        # regions marked and only an overall request: it is what they are to become
+        root = upload(client, project["id"], scene_png((2400, 1600), seed=3))
+        region = {"shapes": [{"type": "rect", "x": 1800, "y": 300, "w": 120, "h": 90}]}
+        zoom = imaging.zoom_box((2400, 1600), imaging.union_mask((2400, 1600), [region]).getbbox())
+        fake_api.respond = drawing_model([zoom], [(1810, 310, 1910, 380)])
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
+                      prompt="a red teapot", model="gpt-image-2.5-flare")
+        job = wait_job(client, project["id"], resp.json()["id"])
+        (call,) = fake_api.calls
+        assert "Area 1 (red): a red teapot" in call["prompt"] and "Overall" not in call["prompt"]
+        (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
+                   .json()["nodes"] if n["parent_id"] == root["id"]]
+        assert node["note"] == "" and len(job["requests"]) == 1
+        made, original = image(client, node["image"]), image(client, root["image"])
+        assert made.getpixel((300, 1400)) == original.getpixel((300, 1400))
+        assert min(made.getpixel((1860, 345))) > 230
+
+    def test_an_overall_request_on_a_small_image_uses_the_whole_output(
+            self, client, project, fake_api):
+        # one request with both; the pasted-back version is kept beside it
+        root = upload(client, project["id"], scene_png((640, 480), seed=3))
+        region = {"shapes": [{"type": "rect", "x": 300, "y": 200, "w": 120, "h": 90}],
+                  "instruction": "a red teapot"}
+        fake_api.respond = drawing_model([], [(310, 210, 410, 280)])
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
+                      prompt="keep the lighting", model="gpt-image-2.5-flare")
+        wait_job(client, project["id"], resp.json()["id"])
+        (call,) = fake_api.calls
+        assert "Overall: keep the lighting" in call["prompt"]
         (node,) = [n for n in client.get(f"/api/projects/{project['id']}/tree")
                    .json()["nodes"] if n["parent_id"] == root["id"]]
         assert node["note"] == "overall_change"
         assert node["image"] == node["raw_image"] and node["merged_image"]
-        adopted, merged = image(client, node["image"]), image(client, node["merged_image"])
-        original = image(client, root["image"])
-        # the whole image changed, with the region's object from the close-up in it...
-        assert min(adopted.getpixel((1860, 345))) > 230
-        far = (300, 1400)
-        assert sum(abs(a - b) for a, b in zip(adopted.getpixel(far), original.getpixel(far),
-                                              strict=True)) > 60
-        # ...and the pasted-back version changed the region only
-        assert merged.getpixel(far) == original.getpixel(far)
-        assert min(merged.getpixel((1860, 345))) > 230  # with the tone drift undone
 
     def test_a_close_up_that_cant_be_pasted_back_sends_the_whole_image_as_well(
             self, client, project, fake_api):
@@ -509,7 +547,7 @@ class TestJobs:
         back = client.patch(f"/api/nodes/{node['id']}", json={"use_raw": False}).json()
         assert back["image"] == node["merged_image"]  # one switch away
         logs = client.get(f"/api/jobs/{job['id']}/logs").json()
-        assert any("overall request changed the whole image" in line["msg"] for line in logs)
+        assert any("whole output, for the overall request" in line["msg"] for line in logs)
 
     def test_the_same_change_without_an_overall_request_is_pasted_back(
             self, client, project, fake_api):
@@ -574,6 +612,24 @@ class TestJobs:
                    .json()["nodes"] if n["parent_id"]]
         assert node["raw_image"] is None and node["note"] == "aspect_mismatch"
 
+    def test_more_reference_images_than_the_model_handles_are_refused(self, client, project,
+                                                                      fake_api):
+        # gpt-image-1.5 takes 4 images: the original, the annotated copy and 2 references
+        root = upload(client, project["id"])
+        region = {"shapes": [{"type": "rect", "x": 10, "y": 10, "w": 20, "h": 20}],
+                  "instruction": "a hat"}
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
+                      refs=[root["id"]] * 3, model="gpt-image-1.5")
+        assert resp.status_code == 400
+        assert (resp.json()["code"], resp.json()["params"]) == (
+            "too_many_refs", {"model": "gpt-image-1.5", "max": 2})
+        assert fake_api.calls == []
+        resp = submit(client, project_id=project["id"], parent_id=root["id"], regions=[region],
+                      refs=[root["id"]] * 3, model="gpt-image-2")
+        assert resp.status_code == 202
+        wait_job(client, project["id"], resp.json()["id"])
+        assert len(fake_api.calls[0]["images"]) == 5
+
     def test_edit_with_refs_and_no_regions(self, client, project, fake_api):
         root = upload(client, project["id"])
         ref = upload(client, project["id"], make_png())
@@ -584,7 +640,7 @@ class TestJobs:
         call = fake_api.calls[0]
         assert len(call["images"]) == 2
         assert call["prompt"].startswith(
-            "Image 1 is the image to edit; the other images are, in order, reference image 1.")
+            "Image 1 is the image to edit; image 2 is reference image 1.")
 
     def test_failures_recorded(self, client, project, fake_api):
         def respond(call):
@@ -831,8 +887,10 @@ class TestArchive:
         tree = client.get(f"/api/projects/{new['id']}/tree").json()
         (job,) = tree["jobs"]
         assert job["requests"] == before["requests"] and len(job["requests"]) == 2
-        for r in job["requests"]:
-            assert client.get(f"/api/images/{r['annot_image']}").status_code == 200
+        for r in job["requests"]:  # (the overall request went alone: no annotated copy)
+            if r["annot_image"]:
+                assert client.get(f"/api/images/{r['annot_image']}").status_code == 200
+        assert [r["annot_image"] is None for r in job["requests"]] == [True, False]
         (node,) = [n for n in tree["nodes"] if n["job_id"]]
         assert len(node["parts"]) == 2
         for p in node["parts"]:

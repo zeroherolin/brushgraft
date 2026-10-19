@@ -26,6 +26,8 @@ export interface ModelInfo {
   aligned: boolean;
   mask: boolean;
   note: string;
+  /** input images it handles, the image edited and its annotated copy included */
+  images: number;
 }
 
 export interface Settings {

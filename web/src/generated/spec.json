@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "promptbrush_version": "0.1.1",
+  "promptbrush_version": "0.1.2",
   "models": [
     {
       "name": "gpt-image-2.5-sunburst",
@@ -8,7 +8,8 @@
       "size": "exact",
       "aligned": true,
       "mask": false,
-      "note": "best quality; keeps the most of the original in edits"
+      "note": "best quality; keeps the most of the original in edits",
+      "images": 10
     },
     {
       "name": "gpt-image-2.5-flare",
@@ -16,7 +17,8 @@
       "size": "exact",
       "aligned": true,
       "mask": false,
-      "note": "the default"
+      "note": "the default",
+      "images": 10
     },
     {
       "name": "gpt-image-2",
@@ -24,7 +26,8 @@
       "size": "aspect",
       "aligned": true,
       "mask": false,
-      "note": "~1.57 MP; most lenient moderation"
+      "note": "~1.57 MP; most lenient moderation",
+      "images": 10
     },
     {
       "name": "gpt-image-2-vip",
@@ -32,7 +35,8 @@
       "size": "exact",
       "aligned": true,
       "mask": true,
-      "note": "most sizes rendered exactly; up to 4K"
+      "note": "most sizes rendered exactly; up to 4K",
+      "images": 10
     },
     {
       "name": "gpt-image-1.5",
@@ -40,7 +44,8 @@
       "size": "aspect",
       "aligned": true,
       "mask": false,
-      "note": "~1.57 MP"
+      "note": "~1.57 MP; up to 4 input images",
+      "images": 4
     },
     {
       "name": "gemini-nano-banana-2.1",
@@ -48,7 +53,8 @@
       "size": "fixed",
       "aligned": false,
       "mask": false,
-      "note": ""
+      "note": "",
+      "images": 10
     },
     {
       "name": "gemini-3-pro-image",
@@ -56,7 +62,8 @@
       "size": "fixed",
       "aligned": false,
       "mask": false,
-      "note": "also known as Nano Banana Pro"
+      "note": "also known as Nano Banana Pro",
+      "images": 10
     },
     {
       "name": "gemini-3.1-flash-image",
@@ -64,7 +71,8 @@
       "size": "fixed",
       "aligned": false,
       "mask": false,
-      "note": "fastest"
+      "note": "fastest",
+      "images": 10
     },
     {
       "name": "jimeng-4.5",
@@ -72,7 +80,8 @@
       "size": "aspect",
       "aligned": true,
       "mask": false,
-      "note": "~4.15 MP; adds an \"AI\" watermark in a corner"
+      "note": "~4.15 MP; adds an \"AI\" watermark in a corner; up to 4 input images",
+      "images": 4
     }
   ],
   "default_model": "gpt-image-2.5-flare",
@@ -160,32 +169,32 @@
     "circled": "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳",
     "text": {
       "en": {
-        "ref": "reference image {k}",
-        "sep": ", ",
-        "gen_refs": "The attached images are, in order, {refs}.",
-        "edit_refs": "Image 1 is the image to edit; the other images are, in order, {refs}.",
+        "ref": "image {n} is reference image {k}",
+        "sep": "; ",
+        "gen_refs": "Of the attached images, {refs}.",
+        "edit_refs": "Image 1 is the image to edit; {refs}.",
         "intro": "Image 1 is the image to edit. Image 2 is the same image with colored, numbered outlines drawn around the areas to change; the outlines only mark where to make changes.",
-        "region_refs": "Images 3 onward are, in order, {refs}.",
+        "region_refs": "Of the other images, {refs}.",
         "lead": "Make the following changes to image 1:",
         "region": "Area {k} ({color}): {text}",
         "region_default": "follow the overall request",
         "overall": "Overall: {text}",
-        "outro": "Change only the outlined areas and keep everything else exactly as it is. The output must not contain any outlines, numbers or other annotations.",
-        "outro_overall": "Apart from the overall request, change only the outlined areas and keep everything else exactly as it is. The output must not contain any outlines, numbers or other annotations."
+        "outro": "Change only the outlined areas, not other parts of the image that look the same, and keep everything else exactly as it is. The output must not contain any outlines, numbers or other annotations.",
+        "outro_overall": "Apart from the overall request, change only the outlined areas, not other parts of the image that look the same, and keep everything else exactly as it is. The output must not contain any outlines, numbers or other annotations."
       },
       "zh": {
-        "ref": "参考图 {k}",
-        "sep": "、",
-        "gen_refs": "以下几张图依次是{refs}。",
-        "edit_refs": "第 1 张图是要修改的原图，其余依次是{refs}。",
+        "ref": "第 {n} 张图是参考图 {k}",
+        "sep": "；",
+        "gen_refs": "{refs}。",
+        "edit_refs": "第 1 张图是要修改的原图；{refs}。",
         "intro": "第 1 张图是要修改的原图；第 2 张图是在原图上用彩色线条圈出、并标了编号的修改位置，线条仅用于指示位置。",
-        "region_refs": "第 3 张图起依次是{refs}。",
+        "region_refs": "{refs}。",
         "lead": "请在第 1 张图的基础上完成以下修改：",
         "region": "{circled} 号圈（{color}）内：{text}",
         "region_default": "按整体要求修改",
         "overall": "整体要求：{text}",
-        "outro": "只修改圈出的区域，其余内容保持不变；输出的图片中不要出现任何线条、编号或标注。",
-        "outro_overall": "除整体要求外，只修改圈出的区域，其余内容保持不变；输出的图片中不要出现任何线条、编号或标注。"
+        "outro": "只修改圈出的区域，图中其他位置相同或相似的内容不要跟着改，其余内容保持不变；输出的图片中不要出现任何线条、编号或标注。",
+        "outro_overall": "除整体要求外，只修改圈出的区域，图中其他位置相同或相似的内容不要跟着改，其余内容保持不变；输出的图片中不要出现任何线条、编号或标注。"
       }
     },
     "colors": {
@@ -248,7 +257,7 @@
     "spill_note_growth": 0.1,
     "align_margin": 120,
     "align_min_corr": 0.5,
-    "align_coarse_corr": 0.75,
+    "align_coarse_corr": 0.7,
     "align_min_detail": 1.0,
     "backdrop_share": 0.9,
     "backdrop_tolerance": 24,
@@ -265,8 +274,6 @@
     "api_max_bytes": 8388608,
     "max_image_pixels": 100000000,
     "ref_max_pixels": 2359296,
-    "overall_delta": 20.0,
-    "overall_share": 0.2,
     "register_coarse": 384,
     "register_reach": 0.02,
     "register_tile": 32,
@@ -274,6 +281,8 @@
     "register_min_shift": 0.5,
     "register_max_spread": 0.75,
     "register_near": 256,
+    "repeat_min_step": 3,
+    "repeat_dip": 0.5,
     "piece_blur": 1.5,
     "piece_weak": 24,
     "piece_core": 96,

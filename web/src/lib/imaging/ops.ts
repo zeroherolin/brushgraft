@@ -120,6 +120,20 @@ export interface Prepared {
   annot?: Uint8Array;
   /** an edit sent in parts instead (see zoomParts): the close-ups, after the whole image when it is needed */
   parts?: PreparedPart[];
+  /** ``images`` are the whole image alone (and the references), for the overall request first: see PrepareOptions */
+  first?: boolean;
+}
+
+export interface PrepareOptions {
+  /** a small edit of a large image goes in parts: close-ups (see zoom.ts), and the whole image for regions too large for one */
+  zoom?: boolean;
+  /**
+   * there is an overall request about the whole image: when the regions would go in parts, the
+   * whole image goes first, alone, and the regions then in parts of what came back (see jobs.ts)
+   */
+  first?: boolean;
+  /** the regions to send, by index (the others are left out; they keep their numbers): always in parts */
+  only?: number[];
 }
 
 export interface PreparedPart {
@@ -135,14 +149,10 @@ export interface PreparedPart {
   annot: Uint8Array;
 }
 
-/**
- * The images of an edit or generation: what to send, and the mask and annotated copy to keep.
- * With ``zoom``, a small edit of a large image goes in parts: close-ups (see zoom.ts), and the
- * whole image as well when some regions are too large for one.
- */
+/** The images of an edit or generation: what to send, and the mask and annotated copy to keep (see PrepareOptions). */
 export async function prepare(
   codec: Codec,
-  input: { parent?: Uint8Array; regions: Region[]; refs: Uint8Array[]; zoom?: boolean },
+  input: { parent?: Uint8Array; regions: Region[]; refs: Uint8Array[] } & PrepareOptions,
 ): Promise<Prepared> {
   const out: Prepared = { images: [] };
   const { parent, regions } = input;
@@ -155,20 +165,28 @@ export async function prepare(
     const mask = unionMask(width, height, regions);
     if (bbox(mask) === null) throw userError("empty_region", "The region is empty; draw it again");
     out.mask = await codec.encodePng(mask);
-    const boxes = input.zoom ? regions.map((r) => bbox(regionMask(width, height, r.shapes))) : [];
+    const sent = input.only ?? regions.map((_, i) => i);
+    const boxes = input.zoom ? regions.map((r, i) => (sent.includes(i) ? bbox(regionMask(width, height, r.shapes)) : null)) : [];
     const plan = input.zoom ? zoomParts(width, height, boxes) : [];
+    if (plan.length && input.first) {
+      // the overall request first, alone, on the whole image
+      out.images.push(await forApi(codec, parent), ...refs);
+      out.first = true;
+      return out;
+    }
     const whole = async () => {
-      out.annot = await codec.encodePng(await annotate(codec, original, regions));
+      out.annot = await codec.encodePng(await annotate(codec, original, sent.map((i) => regions[i]), input.only));
       return [await forApi(codec, parent), await forApi(codec, out.annot)];
     };
-    if (!plan.length) {
+    if (!plan.length && !input.only) {
       out.images.push(...(await whole()));
     } else {
       out.parts = [];
       const shown = new Set(plan.flatMap(([, numbers]) => numbers));
-      if (boxes.some((b, i) => b && !shown.has(i))) {
+      if (!input.zoom || boxes.some((b, i) => b && !shown.has(i))) {
         const images = await whole();
-        out.parts.push({ box: null, regions: regions.map((_, i) => i), images: [...images, ...refs], mask: out.mask, annot: out.annot! });
+        const mask = input.only ? await codec.encodePng(unionMask(width, height, sent.map((i) => regions[i]))) : out.mask;
+        out.parts.push({ box: null, regions: sent, images: [...images, ...refs], mask, annot: out.annot! });
       }
       for (const [box, numbers] of plan) {
         const view = crop(original, ...box);
@@ -187,6 +205,20 @@ export async function prepare(
   }
   out.images.push(...refs);
   return out;
+}
+
+/**
+ * The overall request's output on the original's pixel grid, to take the regions (see
+ * PrepareOptions.first; it needn't keep the framing to the pixel, a restyle moves things a little);
+ * null, with the note, when it can't: of another shape.
+ */
+export async function firstBase(codec: Codec, input: { parent: Uint8Array; result: Uint8Array; mask: Uint8Array }): Promise<Merged> {
+  const original = await codec.decode(input.parent);
+  const output = await codec.decode(input.result);
+  if (!sameAspect([original.width, original.height], [output.width, output.height])) return { image: null, note: spec.notes.aspect_mismatch };
+  const gray = grayOf((await codec.decode(input.mask)) as Raster);
+  const base = register(original, toRgb(output), gray);
+  return { image: await codec.encodePng(toRgb(base)), note: "" };
 }
 
 export interface Merged {
@@ -233,7 +265,7 @@ export interface PartMade {
 
 export interface PartsMerged {
   /** send the whole image as well: a close-up changed all over (the overall request), or can't be pasted back */
-  ask?: "overall" | "unusable";
+  ask?: "unusable";
   /** the pasted-back image; null: use the whole image's output as it came (redrawn, or of other proportions) */
   merged?: Uint8Array | null;
   /** the whole output */
@@ -272,7 +304,8 @@ export async function mergeParts(
     }
     const mask = grayOf(await codec.decode(p.mask));
     const result = register(original, output, mask);
-    let w = pasteWeights(original, result, mask, await codec.decode(p.annot), input.overall);
+    // the overall request bears on the whole image's output only: a close-up shows a part
+    let w = pasteWeights(original, result, mask, await codec.decode(p.annot), input.overall && !p.box);
     if (p.box) w = fadeInside(w, p.box, [full.width, full.height], original.width, original.height);
     const part: (typeof parts)[number] = { raw: inChannels(result, full.channels), rawAt: at, merged: null, mergedAt: null, note: w.note };
     parts.push(part);
@@ -293,7 +326,6 @@ export async function mergeParts(
     } else {
       part.merged = pasted;
       part.mergedAt = at;
-      if (w.note === spec.notes.overall_change) ask = "overall";
       ups.push({ box: p.box, result, mask, w });
     }
   }
@@ -352,9 +384,8 @@ export async function mergeParts(
   if (whole?.w.note === spec.notes.overall_change) {
     note = spec.notes.overall_change;
   } else {
-    // a close-up's own overall change is drift when the whole image's output has none
     if (whole) notes.push(whole.w.note);
-    note = notes.filter((n) => n !== spec.notes.overall_change).reduce((a, b) => (PART_NOTES.indexOf(b) > PART_NOTES.indexOf(a) ? b : a), "");
+    note = notes.reduce((a, b) => (PART_NOTES.indexOf(b) > PART_NOTES.indexOf(a) ? b : a), "");
   }
   return { merged: await codec.encodePng(merged), raw: await codec.encodePng(raw), note, parts: await encoded() };
 }

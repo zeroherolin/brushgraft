@@ -1,7 +1,7 @@
 import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ImageOps } from "../../imaging/client";
-import { merge, mergeParts, normalizeUpload, placeParts, prepare, thumbnail } from "../../imaging/ops";
+import { firstBase, merge, mergeParts, normalizeUpload, placeParts, prepare, thumbnail } from "../../imaging/ops";
 import { describeJobError } from "../../joberror";
 import type { Job, JobError, ServerEvent, TreeNode } from "../../types";
 import { makePng, scenePng, b64, jsonResponse } from "../../../test/images";
@@ -18,7 +18,8 @@ import type { JobRequest } from "../types";
 
 const ops: ImageOps = {
   normalize: (d) => normalizeUpload(testCodec, d),
-  prepare: (parent, regions, refs, zoom) => prepare(testCodec, { parent, regions, refs, zoom }),
+  prepare: (parent, regions, refs, options) => prepare(testCodec, { parent, regions, refs, ...options }),
+  firstBase: (parent, result, mask) => firstBase(testCodec, { parent, result, mask }),
   merge: (parent, result, mask, annot, overall) => merge(testCodec, { parent, result, mask, annot, overall }),
   mergeParts: (parent, pieces, overall, askWhole) => mergeParts(testCodec, { parent, pieces, overall, askWhole }),
   placeParts: (parent, pieces) => placeParts(testCodec, { parent, pieces }),
@@ -223,7 +224,7 @@ describe("editing", () => {
     expect(s.calls[0].url).toBe("https://api.example/v1/images/edits");
     expect(form.getAll("image[]")).toHaveLength(3);
     expect(String(form.get("prompt"))).toContain("Area 1 (red): a red patch");
-    expect(String(form.get("prompt"))).toContain("Images 3 onward are, in order, reference image 1.");
+    expect(String(form.get("prompt"))).toContain("Of the other images, image 3 is reference image 1.");
   });
 
   it("pastes the edited region back onto the original, undoing the model's tone drift", async () => {
@@ -348,7 +349,7 @@ describe("editing", () => {
     expect(at(merged, 1430, 975)).toEqual(at(o, 1430, 975));
   }, 30_000);
 
-  it("sends the whole image as well when the overall request changed all of a close-up", async () => {
+  it("sends an overall request first, alone, then the regions in close-ups of its output (jobs._run_first)", async () => {
     const [W, H] = [1600, 1100];
     const original = scenePng(W, H);
     const parent = await root(original);
@@ -356,30 +357,33 @@ describe("editing", () => {
     const region = { instruction: "a red teapot", shapes: [{ type: "rect" as const, x: 1200, y: 200, w: 60, h: 50 }] };
     const zoom = zoomBox(W, H, bbox(unionMask(W, H, [region]))!)!;
     const sent: Sent[] = [];
-    const objects: Box[] = [[1205, 205, 1255, 245]];
-    s.replies.push(drawing(o, [zoom], objects, sent, true), drawing(o, [zoom], objects, sent, true));
+    s.replies.push(drawing(o, [], [], sent, true), drawing(o, [zoom], [[1205, 205, 1255, 245]], sent));
     const job = await s.runner.submit(
       base(projectId, { parent_id: parent.id, prompt: "make the sky overcast", regions: [region], size: null, model: "gpt-image-2.5-flare" }),
     );
     const done = await waitDone(s, job.id);
     expect([done.status, done.usage]).toEqual(["done", { total_tokens: 14 }]);
-    expect(sent.map((c) => [c.images[0].width, c.images[0].height])).toEqual([[zoom[2] - zoom[0], zoom[3] - zoom[1]], [W, H]]);
-    expect(sent[1].prompt).toBe(done.full_prompt);
-    expect(done.requests.map((r) => r.box)).toEqual([zoom, null]);
-    expect(s.runner.logs(job.id).some((l) => l.msg.includes("sending the whole image as well"))).toBe(true);
+    // the overall request alone, on the whole image (no annotated copy); then the region, on what came back
+    expect([sent[0].prompt, sent[0].images.length, sent[0].images[0].width]).toEqual(["make the sky overcast", 1, W]);
+    expect([sent[1].images[0].width, sent[1].images[0].height]).toEqual([zoom[2] - zoom[0], zoom[3] - zoom[1]]);
+    expect(sent[1].prompt).toContain("Area 1 (red): a red teapot");
+    expect(sent[1].prompt).not.toContain("Overall");
+    const px = sent[1].images[0].data;
+    expect(px[2] - px[0]).toBeGreaterThan(20); // cut from the overcast output
+    expect(done.requests.map((r) => [r.box, r.regions, r.annot_image === null])).toEqual([[null, [], true], [zoom, [0], false]]);
     const node = (await s.store.projectTree(projectId)).nodes.find((n) => n.job_id === job.id)!;
-    expect(node.note).toBe("overall_change");
-    expect(node.image).toBe(node.raw_image);
-    const adopted = decodePng(Buffer.from((await s.store.getImage(node.image)).data), "RGB");
-    const merged = decodePng(Buffer.from((await s.store.getImage(node.merged_image!)).data), "RGB");
+    expect(node.note).toBe("");
+    expect(node.parts.map((p) => [p.request, p.raw_at])).toEqual([[0, [0, 0]], [1, zoom.slice(0, 2)]]);
+    const made = decodePng(Buffer.from((await s.store.getImage(node.image)).data), "RGB");
     const at = (im: Raster, x: number, y: number) => Array.from(im.data.subarray((y * W + x) * 3, (y * W + x) * 3 + 3));
-    // the whole image changed, with the region's object from the close-up in it; the pasted-back one changed the region only
-    expect(Math.min(...at(adopted, 1230, 225))).toBeGreaterThan(230);
-    expect(at(adopted, 200, 900)).not.toEqual(at(o, 200, 900));
-    expect(at(merged, 200, 900)).toEqual(at(o, 200, 900));
+    expect(Math.min(...at(made, 1230, 225))).toBeGreaterThan(230); // the region's object
+    // elsewhere, the overcast output as it came back
+    const first = decodePng(Buffer.from((await s.store.getImage(node.parts[0].raw_image!)).data), "RGB");
+    expect(at(made, 200, 900)).toEqual(at(first, 200, 900));
+    expect(at(made, 200, 900)).not.toEqual(at(o, 200, 900));
   }, 30_000);
 
-  it("adopts the whole output when the overall request changed the whole image, keeping the pasted one", async () => {
+  it("adopts the whole output for an overall request, keeping the pasted one", async () => {
     const [W, H] = [720, 480];
     const original = scenePng(W, H);
     const parent = await root(original);
@@ -474,6 +478,19 @@ describe("refusing before any request is made", () => {
     expect(await codeOf(s.runner.submit(body(projectId)))).toBe(code);
     expect(s.calls).toHaveLength(0);
     expect((await s.store.projectTree(projectId)).jobs).toHaveLength(0);
+  });
+
+  it("more reference images than the model handles, the image edited and its annotated copy counted", async () => {
+    const parent = await root();
+    const refs = [parent.id, parent.id, parent.id];
+    const body = (model: string) => base(projectId, { parent_id: parent.id, regions: [REGION], refs, size: null, model });
+    // gpt-image-1.5 takes 4 images: the original, the annotated copy and 2 references
+    const e = await s.runner.submit(body("gpt-image-1.5")).then(() => null, (x) => x as ApiError);
+    expect([e?.code, e?.params]).toEqual(["too_many_refs", { model: "gpt-image-1.5", max: 2 }]);
+    expect(s.calls).toHaveLength(0);
+    s.replies.push(ok(scenePng(64, 48)));
+    await waitDone(s, (await s.runner.submit(body("gpt-image-2"))).id); // 5 of 10: sent
+    expect(s.calls).toHaveLength(1);
   });
 
   it("an empty region, and an image from another project", async () => {

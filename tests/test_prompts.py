@@ -19,14 +19,16 @@ def test_plain_generation_and_edit_pass_prompt_through():
             "make it night"
 
 
-def test_refs_are_named_in_order():
+def test_refs_are_named_image_by_image():
+    # given only "images 3 onward are reference images 1 to 8", a model took image 9 for 8
     gen = compile_prompt("a lighthouse in this style", [], has_parent=False, ref_count=2)
     assert gen.startswith(
-        "The attached images are, in order, reference image 1, reference image 2.")
+        "Of the attached images, image 1 is reference image 1; image 2 is reference image 2.")
     edit = compile_prompt("use the hat from reference image 1", [], has_parent=True,
                           ref_count=1)
-    assert edit.startswith(
-        "Image 1 is the image to edit; the other images are, in order, reference image 1.")
+    assert edit.startswith("Image 1 is the image to edit; image 2 is reference image 1.")
+    zh = compile_prompt("x", [region("y")], has_parent=True, ref_count=3, lang="zh")
+    assert zh.splitlines()[1] == "第 3 张图是参考图 1；第 4 张图是参考图 2；第 5 张图是参考图 3。"
 
 
 def test_regions_numbered_with_overall_request():
@@ -34,7 +36,7 @@ def test_regions_numbered_with_overall_request():
                           has_parent=True, ref_count=1)
     lines = text.splitlines()
     assert "Image 2 is the same image with colored, numbered outlines" in lines[0]
-    assert lines[1] == "Images 3 onward are, in order, reference image 1."
+    assert lines[1] == "Of the other images, image 3 is reference image 1."
     assert "Area 1 (red): a red teapot" in lines
     assert "Area 2 (blue): follow the overall request" in lines
     assert "Overall: warmer tones" in lines
@@ -48,11 +50,18 @@ def test_chinese_wrapper():
                           has_parent=True, ref_count=1, lang="zh")
     lines = text.splitlines()
     assert "第 2 张图是在原图上用彩色线条圈出、并标了编号的修改位置" in lines[0]
-    assert lines[1] == "第 3 张图起依次是参考图 1。"
+    assert lines[1] == "第 3 张图是参考图 1。"
     assert "① 号圈（红色）内：换成红色茶壶" in lines
     assert "② 号圈（蓝色）内：按整体要求修改" in lines
     assert "整体要求：整体偏暖色" in lines
     assert lines[-1].startswith("除整体要求外，只修改圈出的区域")
+
+
+def test_an_overall_request_without_region_instructions_is_the_regions_instruction():
+    text = compile_prompt("a red teapot", [region(), region()], has_parent=True)
+    assert "Area 1 (red): a red teapot" in text and "Area 2 (blue): a red teapot" in text
+    assert "Overall" not in text
+    assert text.splitlines()[-1].startswith("Change only the outlined areas")
 
 
 def test_without_an_overall_request_only_the_boxes_may_change():

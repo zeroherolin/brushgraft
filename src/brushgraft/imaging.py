@@ -53,7 +53,9 @@ SPILL_NOTE_GROWTH = 0.1    # only report growth beyond 10% of the region
 # Judging the output against the original takes the area this far from the region
 ALIGN_MARGIN = 120         # px
 ALIGN_MIN_CORR = 0.5       # fine-detail correlation below this, and
-ALIGN_COARSE_CORR = 0.75   # coarser detail's below this: the output was reframed (see aligned)
+ALIGN_COARSE_CORR = 0.7    # coarser detail's below this: the output was reframed (see aligned).
+#                            Measured: outputs zoomed 6% or more stay under 0.35; a light
+#                            diagram a model turned dark reached 0.74 (either sign counts)
 ALIGN_MIN_DETAIL = 1.0     # levels: fine detail weaker than this (RMS) is grain, nothing to go by
 # Transparent originals: models paint a backdrop where the original is transparent (mostly white).
 # It counts as one where, away from the regions, this share of those pixels lies this close to
@@ -74,6 +76,12 @@ REGISTER_MAX_TILES = 400   # patches measured at most, spread over the image
 REGISTER_MIN_SHIFT = 0.5   # px: an output nowhere further off than this is left as it is
 REGISTER_MAX_SPREAD = 0.75  # px: patches must agree with the fitted offsets to within this
 REGISTER_NEAR = 256        # px: patches this close to the regions settle what is left near them
+# A patch of a repeated pattern (the cells of a table or a diagram, a row of icons, a brick wall)
+# matches a copy of itself one period off: the best match may be that copy. Along an axis where a
+# patch matches itself this many steps off or more, at a dip of its own search, nearly as well as
+# that (this share of its middle mismatch, or as well as the output matches it), it tells nothing
+REPEAT_MIN_STEP = 3
+REPEAT_DIP = 0.5
 # Whole pieces in the feathered edge (whole_pieces): where the output differs from the original
 # near the area (a letter rewritten or only redrawn, an object redrawn), blending the two shows both
 PIECE_BLUR = 1.5           # px: smooths away the edge jitter of text the model only redrew
@@ -89,12 +97,6 @@ PIECE_FLAT = 12            # levels: a pixel this far from its column's middle v
 PIECE_SPACE = 0.15         # a word space is at least this share of its line's height wide (the gap
 #                            between two letters is less)
 PIECE_LINE = 10            # feather radii: a line of text cut at a word space is at most this high
-# An overall request that changed the whole image (a new sky): far from the regions, more than
-# this share changed by more than this much. Measured on 397 edits with regions only, models
-# changed at most 18% of the far field that much on their own; a requested overcast sky, 30%.
-# Read before the tone drift is undone: a change of light or color is mostly a shift of tones
-OVERALL_DELTA = 20.0       # Lab distance
-OVERALL_SHARE = 0.2
 # Undoing the model's overall tone drift
 TONE_MAX_GAIN = 0.15       # never scales a channel by more than 15%
 TONE_MAX_OFFSET = 30.0     # or shifts it by more than this many levels
@@ -1084,16 +1086,16 @@ def _register_fit(original: Image.Image, result: Image.Image, mask: Image.Image
     reach = max(2, math.ceil(REGISTER_REACH * max(w, h) / q))
     xs, ys = [], []
     center = coarse_tile * q / 2
-    for (x, y), ssd in zip(tiles, _ssd_search(ac, bc, tiles, coarse_tile, None, reach),
-                           strict=True):
-        for axis, offset in _readings(ssd, reach, coarse_tile):
+    for (x, y), ssd, own in zip(tiles, _ssd_search(ac, bc, tiles, coarse_tile, None, reach),
+                                _ssd_search(ac, ac, tiles, coarse_tile, None, reach), strict=True):
+        for axis, offset in _readings(ssd, reach, coarse_tile, own=own):
             (xs if axis == 0 else ys).append(((x * q + center, y * q + center),
                                               (x, y)[axis] * q + center, offset * q))
-    # (whole steps of q pixels: they scatter by up to q around the fit)
-    fx = _line_fit([(c, d) for _, c, d in xs], w, q)
-    fy = _line_fit([(c, d) for _, c, d in ys], h, q)
-    if fx is None or fy is None:
-        return None
+    # (whole steps of q pixels: they scatter by up to q around the fit). An axis this can't tell
+    # (a pattern repeated all over, say) is searched at full size around no offset: models draw
+    # a few pixels off, not a period; the search there reaches only a few pixels either way
+    fx = _line_fit([(c, d) for _, c, d in xs], w, q) or (0.0, 0.0)
+    fy = _line_fit([(c, d) for _, c, d in ys], h, q) or (0.0, 0.0)
 
     # 2. At full size (lightly blurred: a one-pixel line then gives a smooth minimum), around
     # that, to a fraction of a pixel by a parabola through the minimum
@@ -1106,9 +1108,10 @@ def _register_fit(original: Image.Image, result: Image.Image, mask: Image.Image
     guesses = [(_round(fx[0] * (x + half) + fx[1]), _round(fy[0] * (y + half) + fy[1]))
                for x, y in tiles]
     xs, ys = [], []
-    for (x, y), guess, ssd in zip(tiles, guesses, _ssd_search(af, bf, tiles, tile, guesses,
-                                                              reach), strict=True):
-        for axis, offset in _readings(ssd, reach, tile, subpixel=True):
+    for (x, y), guess, ssd, own in zip(tiles, guesses,
+                                       _ssd_search(af, bf, tiles, tile, guesses, reach),
+                                       _ssd_search(af, af, tiles, tile, None, reach), strict=True):
+        for axis, offset in _readings(ssd, reach, tile, subpixel=True, own=own):
             (xs if axis == 0 else ys).append(((x + half, y + half), (x, y)[axis] + half,
                                               guess[axis] + offset))
     whole = (_line_fit([(c, d) for _, c, d in xs], w, REGISTER_MAX_SPREAD),
@@ -1133,18 +1136,24 @@ def _register_fit(original: Image.Image, result: Image.Image, mask: Image.Image
     return out[0], out[1]
 
 
-def _readings(ssd: np.ndarray | None, reach: int, tile: int, subpixel: bool = False
-              ) -> list[tuple[int, float]]:
+def _readings(ssd: np.ndarray | None, reach: int, tile: int, subpixel: bool = False,
+              own: np.ndarray | None = None) -> list[tuple[int, float]]:
     """The offsets a tile's search tells, as (axis, offset): along an axis only where the best
-    match stands clear of its neighbours that way (a horizontal line tells nothing about x) and
-    isn't at the edge of the search. With ``subpixel``, refined by a parabola through it."""
+    match stands clear of its neighbours that way (a horizontal line tells nothing about x),
+    isn't at the edge of the search, and where the tile doesn't repeat (``own``: its search
+    against the original itself, see _repeats). With ``subpixel``, refined by a parabola
+    through it."""
     if ssd is None:
         return []
     span = 2 * reach + 1
     dy, dx = divmod(int(np.argmin(ssd)), span)
     s0 = int(ssd[dy, dx])
+    repeats = (_repeats(own, reach, 2 * s0 + 4 * tile * tile) if own is not None
+               else (False, False))
     out = []
     for axis, at in ((0, dx), (1, dy)):
+        if repeats[axis]:
+            continue  # a copy one period off matches about as well
         if not 0 < at < span - 1:
             continue  # the best match is at the edge of the search: no clear match
         minus = int(ssd[dy, dx - 1] if axis == 0 else ssd[dy - 1, dx])
@@ -1154,6 +1163,24 @@ def _readings(ssd: np.ndarray | None, reach: int, tile: int, subpixel: bool = Fa
             continue  # flat along this axis (a line along it)
         out.append((axis, at - reach + (0.5 * (minus - plus) / curve if subpixel else 0)))
     return out
+
+
+def _repeats(own: np.ndarray, reach: int, limit: int) -> tuple[bool, bool]:
+    """Along which axes (x, y) a tile matches itself REPEAT_MIN_STEP steps off or more, at a dip
+    of ``own`` (its search against itself, [dy, dx]: lower than all eight around it, inside the
+    search; a low value at its edge may be a slope, as along a line) about as well as it
+    matches: within ``limit``, or REPEAT_DIP of its middle value."""
+    span = 2 * reach + 1
+    padded = np.pad(own, 1, constant_values=np.iinfo(np.int64).max)
+    lowest = np.min([padded[1 + j:1 + j + span, 1 + i:1 + i + span]
+                     for j in (-1, 0, 1) for i in (-1, 0, 1) if i or j], axis=0)
+    ys, xs = np.mgrid[0:span, 0:span]
+    far = np.maximum(np.abs(xs - reach), np.abs(ys - reach)) >= REPEAT_MIN_STEP
+    inside = (xs > 0) & (xs < span - 1) & (ys > 0) & (ys < span - 1)
+    middle = int(np.sort(own, axis=None)[own.size // 2])
+    dips = (far & inside & (own < lowest)
+            & ((own <= limit) | (own <= REPEAT_DIP * middle)))
+    return bool((dips & (xs != reach)).any()), bool((dips & (ys != reach)).any())
 
 
 def _round(v: float) -> int:
@@ -1272,7 +1299,9 @@ def aligned(original: Image.Image, result: Image.Image, mask: Image.Image) -> bo
     scale and shift undo, so register leaves it), which pastes back well. Detail a few
     times coarser isn't disturbed by that, while an output zoomed or shifted by several
     percent matches at neither scale. Where the original has only grain away from the
-    region (blank paper, a flat backdrop), there is nothing to judge by: aligned.
+    region (blank paper, a flat backdrop), there is nothing to judge by: aligned. A request
+    that turned light into dark (a dark theme) leaves every edge in place with its sign
+    turned: the correlation counts either way.
     """
     scale = _scale_for(original.size)
     far = _far(original, np.asarray(_small(mask, scale)) > 0, scale)
@@ -1288,7 +1317,7 @@ def aligned(original: Image.Image, result: Image.Image, mask: Image.Image) -> bo
 
     def corr(a: np.ndarray, b: np.ndarray) -> float:
         norm = float(np.sqrt((a * a).sum() * (b * b).sum()))
-        return 1.0 if norm == 0 else float((a * b).sum()) / norm
+        return 1.0 if norm == 0 else abs(float((a * b).sum())) / norm
 
     a = detail(small[0], 0, 3)
     if float(np.sqrt((a * a).sum() / a.size)) < ALIGN_MIN_DETAIL:
@@ -1425,12 +1454,12 @@ def paste_back(original: Image.Image, result: Image.Image, mask: Image.Image,
     ``result`` must already have the original's size. The image is None, with
     the note NOTE_REFRAMED, when the model redrew the scene instead of
     editing it (see aligned); use its whole output then. With ``overall`` (the
-    user also wrote an overall request) and the model changing much of the
-    image far from the regions, the note is NOTE_OVERALL: the request asked
-    for that change (a new sky, say), so the whole output should be adopted;
-    the image returned is the pasted-back alternative. That is judged on the
-    output as it is, before the tone drift is undone, since a change of light
-    is mostly a shift of tones. Otherwise:
+    user wrote an overall request, about the whole image) the note is
+    NOTE_OVERALL: the whole output is what was asked for, and the image
+    returned is the pasted-back alternative. Judged from the output instead, a
+    requested change came out too much like the drift models make anyway, or
+    too little: a white background turned light blue changes 7% of the image
+    by 20 Lab, while a model's drift alone has changed 18%. Otherwise:
 
     - the model's overall tone drift is undone first (match_tone), so the
       patch doesn't show as a lighter or darker square;
@@ -1467,13 +1496,6 @@ def paste_weights(original: Image.Image, result: Image.Image, mask: Image.Image,
         return None, None, NOTE_REFRAMED
     scale = _scale_for(size)
     seed = np.asarray(_small(mask, scale)) > 0
-    changed_overall = False
-    if overall:
-        # before match_tone: a requested change of light or color (a winter day, dusk) is mostly
-        # such a shift, which undoing the drift would take away
-        far = _far(original, seed, scale)
-        changed_overall = (far.sum() >= 0.05 * far.size and float(
-            (change_map(original, result, scale)[far] > OVERALL_DELTA).mean()) > OVERALL_SHARE)
     result = match_tone(original, result, mask)
     # Where the original is transparent the model painted a backdrop: compared over it, only what
     # it drew there counts as change
@@ -1524,7 +1546,7 @@ def paste_weights(original: Image.Image, result: Image.Image, mask: Image.Image,
         soft = pieces(soft)
     if backdrop:
         result = keyed(original, result, backdrop)
-    return result, soft, NOTE_OVERALL if changed_overall else note
+    return result, soft, NOTE_OVERALL if overall else note
 
 
 def blend(base: Image.Image, top: Image.Image, weights: Image.Image) -> Image.Image:
@@ -1543,11 +1565,11 @@ def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = Fals
     paste_back does, the close-ups last: they show their regions in more detail than the whole
     image's output.
 
-    A close-up shows only part of the image. When the overall request changed all of one (a
-    change of light, say) or one can't be pasted back, the whole image must be sent as well:
-    without its output, this returns {"ask": "overall" or "unusable"}; unless ``ask_whole`` is
-    false (the whole image's request failed): the close-ups that can be are pasted back. Otherwise
-    it returns
+    When a close-up can't be pasted back, the whole image must be sent as well: without its
+    output, this returns {"ask": "unusable"}; unless ``ask_whole`` is false (the whole image's
+    request failed): the close-ups that can be are pasted back. ``overall`` (an overall request
+    about the whole image) bears on the whole image's output only: a close-up shows a part.
+    Otherwise it returns
     {"merged": the pasted-back image, "raw": the whole output, "note", "parts"}, the whole
     output being the whole image's output with the close-ups pasted in, or else the original
     with each close-up's output put in its place. When the whole image's output can't be
@@ -1577,7 +1599,8 @@ def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = Fals
                 ask = ask or "unusable"
             continue
         result = register(original, output, mask)
-        toned, weights, note = paste_weights(original, result, mask, annotated, overall)
+        toned, weights, note = paste_weights(original, result, mask, annotated,
+                                             overall and box is None)
         if box is not None and weights is not None:
             weights = fade_inside(weights, box, full.size)
         part = {"raw": (at, result.convert(mode)), "merged": None, "note": note}
@@ -1596,8 +1619,6 @@ def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = Fals
                 whole = result, toned, weights, note
         else:
             part["merged"] = (box, pasted)
-            if note == NOTE_OVERALL:
-                ask = "overall"
             ups.append((box, result, mask, toned, weights, note))
     if whole is False:  # the whole image's output can't be pasted back: it is used as it came
         bad = next(p for p, piece in zip(parts, pieces, strict=True) if piece[0] is None)
@@ -1632,9 +1653,8 @@ def merge_parts(full: Image.Image, pieces: Sequence[tuple], overall: bool = Fals
     if whole and whole[3] == NOTE_OVERALL:
         note = NOTE_OVERALL
     else:
-        # a close-up's own overall change is drift when the whole image's output has none
         notes += [whole[3]] if whole else []
-        note = max((n for n in notes if n != NOTE_OVERALL), key=_PART_NOTES.index, default="")
+        note = max(notes, key=_PART_NOTES.index, default="")
     return {"merged": merged, "raw": raw, "note": note, "parts": parts}
 
 

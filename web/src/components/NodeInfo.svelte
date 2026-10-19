@@ -88,7 +88,7 @@
     <details class="sent">
       <summary>{job.requests.length > 1 ? t("info.sentRequests", { n: job.requests.length }) : t("info.sent")}</summary>
       {#if job.requests.length}
-        <!-- an edit sent in parts: close-ups of its regions, and the whole image when needed -->
+        <!-- an edit sent in parts: close-ups of its regions, the whole image when needed, or first the overall request alone -->
         <ol class="requests">
           {#each job.requests as r, i (i)}
             {@const made = parts.get(i)}
@@ -98,7 +98,9 @@
                 <span
                   >{r.box
                     ? t("info.closeUp", { w: r.box[2] - r.box[0], h: r.box[3] - r.box[1], x: r.box[0], y: r.box[1] })
-                    : t("info.wholeImage")}{#if r.regions?.length}{t("info.ofRegions", { list: regionList(r.regions), n: r.regions.length })}{/if}</span
+                    : r.regions && !r.regions.length
+                      ? t("info.overallOnly")
+                      : t("info.wholeImage")}{#if r.regions?.length}{t("info.ofRegions", { list: regionList(r.regions), n: r.regions.length })}{/if}</span
                 >
               </p>
               <pre>{r.prompt}</pre>
