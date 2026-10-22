@@ -106,6 +106,8 @@ def configure(path=LOCAL, given=None, ask=None):
             settings[key] = value
     check(settings, path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.resolve() == LOCAL.parent.resolve():
+        path.parent.chmod(0o700)  # local/ holds only private settings
     text = json.dumps(settings, ensure_ascii=False, indent=2) + '\n'
     install.atomic_write(path, text, mode=0o600)
     return settings

@@ -182,6 +182,17 @@ class TestInstall:
         assert len(names) == install_mod.KEEP_RELEASES
         assert live.name in names
 
+    def test_one_change_runs_at_a_time(self, box, tmp_path):
+        site = make_site(tmp_path)
+        with install_mod.deploy_lock(box.root):
+            for change in (lambda: install_mod.install(box, site, DOMAIN),
+                           lambda: install_mod.rollback(box), lambda: install_mod.uninstall(box)):
+                with pytest.raises(ValueError, match="Another publish"):
+                    change()
+        assert not (box.root / "current").exists() and box.calls == []
+        install_mod.install(box, site, DOMAIN)  # free again once the other one has finished
+        assert (box.root / "current" / "index.html").exists()
+
     def test_the_copy_is_renamed_into_place_and_a_stale_one_is_cleared(self, box, tmp_path):
         stale = box.root / "releases" / ".tmp-20260101T000000-aaaaaaaa"
         stale.mkdir(parents=True)

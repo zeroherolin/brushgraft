@@ -7,6 +7,7 @@ file, and nothing else:
 
     /srv/brushgraft/releases/<id>/   every published version of the site
     /srv/brushgraft/current          a symlink to the live release (the switch is atomic)
+    /srv/brushgraft/.lock            held while one install, rollback or uninstall runs
     /etc/caddy/sites-enabled/brushgraft.caddy
 
 It does not manage the main Caddyfile. It checks that the main Caddyfile imports
@@ -19,6 +20,7 @@ a file whose first line says another tool manages it is left alone, with instruc
 """
 
 import argparse
+import functools
 import hashlib
 import os
 import re
@@ -29,7 +31,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+
+try:
+    import fcntl
+except ImportError:  # Windows: the installer runs on Linux, but its helpers are tested everywhere
+    fcntl = None
 
 ROOT = Path('/srv/brushgraft')
 MAIN = Path('/etc/caddy/Caddyfile')
@@ -207,6 +215,33 @@ def run(args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, text=True, **kwargs)
 
 
+@contextmanager
+def deploy_lock(root):
+    """Held for one install, rollback or uninstall: each reads the live state that it then
+    changes, so two at once could switch the link or the Caddy file under each other."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / '.lock'
+    if lock.is_symlink():
+        raise ValueError(f'{lock} must not be a symbolic link')
+    with lock.open('a') as handle:
+        if fcntl:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('Another publish, rollback or uninstall is running; '
+                                 'try again when it has finished') from None
+        yield
+
+
+def serialized(action):
+    @functools.wraps(action)
+    def locked_action(server, *args, **kwargs):
+        with deploy_lock(server.root):
+            return action(server, *args, **kwargs)
+    return locked_action
+
+
 class Server:
     """What this installer does to the machine; tests substitute paths and commands."""
 
@@ -225,6 +260,7 @@ class Server:
             run(['caddy', 'reload', '--config', str(self.main), '--adapter', 'caddyfile'])
 
 
+@serialized
 def install(server, src, domain):
     """Put the site in ``src`` live at ``domain``; returns the release. Failures are undone."""
     src = Path(src)
@@ -298,6 +334,7 @@ def install(server, src, domain):
     return release
 
 
+@serialized
 def rollback(server):
     """Make the release before the live one live again. Returns it."""
     live = live_release(server.root)
@@ -308,6 +345,7 @@ def rollback(server):
     return older[-1]
 
 
+@serialized
 def uninstall(server, purge=False):
     """Take the site down: remove its Caddy file (and the import line this installer added)."""
     server.site_file.unlink(missing_ok=True)

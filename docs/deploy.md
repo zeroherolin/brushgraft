@@ -39,7 +39,7 @@ It builds the site into `web/dist` (installing the build tools in `web/node_modu
 3. makes sure `/etc/caddy/Caddyfile` imports `sites-enabled/*.caddy` (or this file), adding `import /etc/caddy/sites-enabled/brushgraft.caddy` if it has neither;
 4. validates the configuration, switches `/srv/brushgraft/current` to the new release in one atomic step, and reloads Caddy.
 
-If validation or the reload fails, the previous configuration and release are put back and the command exits with Caddy's message. Publishing again with the same domain and the same headers only adds a release and switches the link; Caddy is reloaded only when its configuration changed.
+If validation or the reload fails, the previous configuration and release are put back and the command exits with Caddy's message. One publish, rollback or uninstall runs at a time: a second one, started meanwhile, stops at once and says so (the lock is `/srv/brushgraft/.lock`). Publishing again with the same domain and the same headers only adds a release and switches the link; Caddy is reloaded only when its configuration changed.
 
 Last, it checks that `https://<domain>/` serves the new page (`--no-verify` skips that). `--dry-run` builds and stages the site in a temporary folder, without root, and publishes nothing.
 
