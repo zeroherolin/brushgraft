@@ -869,9 +869,11 @@
   // -- the context menu ---------------------------------------------------------------
   /** where the canvas's menu is open, in the window; null: closed */
   let menuAt = $state<{ x: number; y: number } | null>(null);
-  // another version, or a job opened, closes it
+  // another version, or a job opened, closes it. The id, not the node: the server sends the same
+  // version again (its upload's event, a star, a tree reload) as a new object, and that is no change.
+  const nodeId = $derived(node?.id);
   $effect(() => {
-    void node?.id;
+    void nodeId;
     void viewing;
     menuAt = null;
   });

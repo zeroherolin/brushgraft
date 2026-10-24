@@ -225,3 +225,32 @@ test("server mode: the canvas's menu copies the image from the server", async ({
   });
   expect(size).toEqual([1200, 800]);
 });
+
+test("server mode: the same version sent again by the server leaves the canvas's menu open", async ({ page }) => {
+  // The upload's own event can arrive after the menu opens, and a star or a tree reload sends the
+  // version again too: a new object for the same version, which must not close the menu.
+  await open(page);
+  // a project of its own: the menu opens on the version just uploaded, not an earlier test's
+  await page.locator("header .picker").click();
+  await page.getByRole("menuitem", { name: /New project/ }).click();
+  await page.locator("dialog[open] input").fill("same version");
+  await page.locator("dialog[open] button[type=submit]").click();
+  await page.locator("input[type=file][accept*='image']").first().setInputFiles({ name: "room.png", mimeType: "image/png", buffer: photo() });
+  await expect(page.locator(".tree .row")).toHaveCount(1);
+  const vp = (await page.locator(".viewport").boundingBox())!;
+  await page.mouse.click(vp.x + vp.width / 2, vp.y + vp.height / 2, { button: "right" });
+  const menu = page.getByRole("menu", { name: "Canvas menu" });
+  await expect(menu).toBeVisible();
+  const event = page.waitForResponse((r) => r.url().includes("/api/nodes/") && r.request().method() === "PATCH");
+  await page.evaluate(async () => {
+    const project = JSON.parse(localStorage.getItem("brushgraft.project")!);
+    const [node] = (await (await fetch(`/api/projects/${project}/tree`)).json()).nodes;
+    await fetch(`/api/nodes/${node.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: "{}" });
+  });
+  await event;
+  await page.waitForTimeout(500); // the stream delivers the node event
+  await expect(menu).toBeVisible();
+  await menu.getByRole("menuitem", { name: "Copy image" }).focus();
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
+});
